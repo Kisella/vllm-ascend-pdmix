@@ -44,13 +44,9 @@ def init_ascend_model_parallel(
     if model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
-    if parallel_config.enable_edge_cloud:
-        # Edge-cloud mode does not use the standard uniform rank layout
-        # (DP * PP * PCP * TP). Skip MC2 / P_TP / DYNAMIC_EPLB init.
-        return
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
-    global_tp_size = parallel_config.tensor_parallel_size
+    global_tp_size = 1 if parallel_config.enable_edge_cloud else parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
     global_pcp_size = parallel_config.prefill_context_parallel_size
@@ -108,7 +104,19 @@ def init_ascend_model_parallel(
     group_ranks = [x.tolist() for x in group_ranks]
 
     global _MC2
-    _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+    if parallel_config.enable_edge_cloud:
+        edge_ranks = list(range(parallel_config.edge_npu_count))
+        cloud_ranks = list(range(parallel_config.edge_npu_count, world_size))
+        _MC2 = init_model_parallel_group(
+            [edge_ranks, cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="mc2",
+        )
+    else:
+        _MC2 = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend, group_name="mc2"
+        )
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
@@ -121,9 +129,6 @@ def init_ascend_model_parallel(
         _FC3_QUANT_X = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="fc3_quant_x"
         )
-
-    if parallel_config.enable_edge_cloud:
-        return
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
