@@ -9,7 +9,12 @@ import vllm.v1.executor.multiproc_executor
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
-from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
+from vllm.utils.network_utils import (
+    get_distributed_init_method,
+    get_ip,
+    get_loopback_ip,
+    get_open_port,
+)
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.abstract import FailureCallback
 from vllm.v1.executor.multiproc_executor import (
@@ -49,7 +54,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         scheduler_output_handle: Handle | None = None
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
-        if self.parallel_config.node_rank_within_dp == 0:
+        if self._is_executor_leader_node():
             # For leader node within each dp rank,
             # each dp will have its own leader multiproc executor.
             max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -57,7 +62,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                 self.world_size,
                 self.local_world_size,
                 max_chunk_bytes=max_chunk_bytes,
-                connect_ip=self.parallel_config.master_addr,
+                connect_ip=get_ip(),
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
@@ -110,10 +115,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
             self.response_mqs = []
             # Only leader node have remote response mqs
-            if self.parallel_config.node_rank_within_dp == 0 and (
-                not self.parallel_config.enable_edge_cloud
-                or self.parallel_config.is_edge_node
-            ):
+            if self._is_executor_leader_node():
                 for rank in range(self.world_size):
                     local_idx = rank - global_start_rank
                     if 0 <= local_idx < self.local_world_size:
@@ -166,6 +168,11 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
     def _post_init_executor(self) -> None:
         pass
+
+    def _is_executor_leader_node(self) -> bool:
+        if self.parallel_config.enable_edge_cloud:
+            return self.parallel_config.is_edge_node
+        return self.parallel_config.node_rank_within_dp == 0
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.enable_edge_cloud:
