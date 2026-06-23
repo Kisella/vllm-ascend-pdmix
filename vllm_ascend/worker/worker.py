@@ -530,6 +530,17 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge head segment (PF/DF): segment_a -> isend -> suspend -> return EMPTY."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        logger.info(
+            "[PARAMS-HEAD] batch_type=%s total_tokens=%d head_token=%s "
+            "num_scheduled=%s new_reqs=%s cached_reqs=%s",
+            scheduler_output.batch_type,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.head_token,
+            scheduler_output.num_scheduled_tokens,
+            [(r.req_id, r.sampling_params.sampling_type if r.sampling_params else None)
+             for r in scheduler_output.scheduled_new_reqs],
+            scheduler_output.scheduled_cached_reqs.req_ids if scheduler_output.scheduled_cached_reqs else [],
+        )
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors=None,
             layer_slice_info=layer_slice_info,
@@ -569,6 +580,17 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        logger.info(
+            "[PARAMS-TAIL] batch_type=%s total_tokens=%d head_token=%s "
+            "num_scheduled=%s new_reqs=%s cached_reqs=%s",
+            scheduler_output.batch_type,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.head_token,
+            scheduler_output.num_scheduled_tokens,
+            [(r.req_id, r.sampling_params.sampling_type if r.sampling_params else None)
+             for r in scheduler_output.scheduled_new_reqs],
+            scheduler_output.scheduled_cached_reqs.req_ids if scheduler_output.scheduled_cached_reqs else [],
+        )
         channel = self._hidden_channel_for(scheduler_output)
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
             channel=channel
@@ -609,6 +631,18 @@ class NPUWorker(WorkerBase):
                 if layer_slice_info is not None
                 else ""
             )
+        )
+        logger.info(
+            "[PARAMS-CLOUD] batch_type=%s total_tokens=%d head_token=%s "
+            "num_scheduled=%s new_reqs=%s cached_reqs=%s layer_slice=%s",
+            scheduler_output.batch_type,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.head_token,
+            scheduler_output.num_scheduled_tokens,
+            [(r.req_id, r.sampling_params.sampling_type if r.sampling_params else None)
+             for r in scheduler_output.scheduled_new_reqs],
+            scheduler_output.scheduled_cached_reqs.req_ids if scheduler_output.scheduled_cached_reqs else [],
+            f"[{layer_slice_info.start_layer},{layer_slice_info.end_layer})" if layer_slice_info else None,
         )
         intermediate_tensors = None
         is_first_slice = (
