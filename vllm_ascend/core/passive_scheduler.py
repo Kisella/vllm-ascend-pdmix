@@ -22,7 +22,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import BatchType, SchedulerOutput
 
@@ -31,19 +30,6 @@ if TYPE_CHECKING:
     from vllm.v1.engine.core import PPSchedulerZmqSubscriber
 
 logger = init_logger(__name__)
-
-
-class DispatchPolicy(enum.Enum):
-    """Order in which phase queues are drained inside :meth:`PassiveScheduler.schedule`.
-
-    The three phase queues — PURE_PREFILL, PD_MIX, PURE_DECODE — are polled
-    in the order encoded by the policy. One SchedulerOutput is picked per
-    non-empty queue per call.
-    """
-    EXPECT_ALTERNATION = "expect_alternation"  # Phase7 EEP/EED state machine.
-    PREFILL_FIRST = "prefill_first"   # P  → PD-mix → D
-    DECODE_FIRST = "decode_first"     # D  → PD-mix → P
-    PDMIX_FIRST = "pdmix_first"       # PD-mix → P → D
 
 
 class CloudSchedulingState(enum.Enum):
@@ -119,11 +105,9 @@ class PassiveScheduler:
         self,
         vllm_config: "VllmConfig",
         pp_subscriber: "PPSchedulerZmqSubscriber",
-        dispatch_policy: DispatchPolicy = DispatchPolicy.EXPECT_ALTERNATION,
         run_subscriber_thread: bool = True,
     ) -> None:
         self.pp_subscriber = pp_subscriber
-        self.dispatch_policy = dispatch_policy
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_PREFILL
 
         self.ready_prefills: deque[SchedulerOutput] = deque()
@@ -451,21 +435,6 @@ class PassiveScheduler:
     # ------------------------------------------------------------------ #
     # Dispatch                                                           #
     # ------------------------------------------------------------------ #
-    _POLICY_ORDER: dict[DispatchPolicy, tuple[str, str, str]] = {
-        DispatchPolicy.EXPECT_ALTERNATION: (
-            "ready_prefills", "ready_decodes", "ready_pdmixes",
-        ),
-        DispatchPolicy.PREFILL_FIRST: (
-            "ready_prefills", "ready_pdmixes", "ready_decodes",
-        ),
-        DispatchPolicy.DECODE_FIRST: (
-            "ready_decodes", "ready_pdmixes", "ready_prefills",
-        ),
-        DispatchPolicy.PDMIX_FIRST: (
-            "ready_pdmixes", "ready_prefills", "ready_decodes",
-        ),
-    }
-
     def _start_prefill_middle_throttle(self) -> None:
         self._prefill_middle_throttle_started_at = time.monotonic()
         logger.info(
@@ -505,19 +474,11 @@ class PassiveScheduler:
     def schedule(self) -> ScheduledBatch:
         """Pick the next SchedulerOutput to dispatch.
 
-        ``EXPECT_ALTERNATION`` implements the Phase7 cloud-side EEP/EED state
-        machine.  Sliced prefill-like batches are dispatched one slice per call
+        The cloud side always uses the Phase7 EEP/EED expect-alternation state
+        machine. Sliced prefill-like batches are dispatched one slice per call
         so decode batches can be interleaved between the remaining slices.
         """
-        if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
-            return self._schedule_expect_alternation()
-
-        for queue_name in self._POLICY_ORDER[self.dispatch_policy]:
-            batch = self._schedule_from_queue(queue_name)
-            if not batch.is_empty():
-                return batch
-
-        return ScheduledBatch.empty()
+        return self._schedule_expect_alternation()
 
     @staticmethod
     def _compute_slice_boundaries(
@@ -590,19 +551,6 @@ class PassiveScheduler:
             return self._build_batch(self.ready_pdmixes.popleft())
         return ScheduledBatch.empty()
 
-    def _schedule_from_queue(self, queue_name: str) -> ScheduledBatch:
-        if self._active_prefill_slices:
-            if queue_name == "ready_decodes" and self.ready_decodes:
-                return self._build_batch(self.ready_decodes.popleft())
-            if queue_name in ("ready_prefills", "ready_pdmixes"):
-                return self._build_active_prefill_slice_batch()
-            return ScheduledBatch.empty()
-
-        q: deque[SchedulerOutput] = getattr(self, queue_name)
-        if q:
-            return self._build_batch(q.popleft())
-        return ScheduledBatch.empty()
-
     def _build_batch(self, so: SchedulerOutput) -> ScheduledBatch:
         slices = self._slice_for(so)
         if len(slices) <= 1:
@@ -635,10 +583,9 @@ class PassiveScheduler:
     def _log_picked_batch(self, batch: ScheduledBatch) -> None:
         so = batch.scheduler_output
         logger.debug(
-            "PassiveScheduler.schedule[%s] picked batch_type=%s slices=%d; "
-            "pending=(prefills=%d, active_prefill_slices=%d, "
-            "pdmixes=%d, decodes=%d)",
-            self.dispatch_policy.value,
+            "PassiveScheduler.schedule[expect_alternation] picked "
+            "batch_type=%s slices=%d; pending=(prefills=%d, "
+            "active_prefill_slices=%d, pdmixes=%d, decodes=%d)",
             so.batch_type.value if so.batch_type is not None else "<none>",
             len(batch.slices),
             len(self.ready_prefills),

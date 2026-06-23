@@ -44,11 +44,6 @@ class PDSeparationConfig:
     # Default port: 5559
     post_out_port: int = 5559
 
-    # Dispatch policy for PassiveScheduler on the cloud side.
-    # Valid options: "expect_alternation", "prefill_first", "decode_first", "pdmix_first"
-    # Default: "expect_alternation" - implements EEP/EED PD-covering state machine
-    dispatch_policy: str = "expect_alternation"
-
     @classmethod
     def from_env(cls) -> "PDSeparationConfig":
         """
@@ -57,7 +52,6 @@ class PDSeparationConfig:
         Environment variables:
             VLLM_PP_PRE_OUT_ZMQ_PORT: PRE_OUT channel port (default: 5558)
             VLLM_PP_POST_OUT_ZMQ_PORT: POST_OUT channel port (default: 5559)
-            VLLM_PP_PASSIVE_DISPATCH_POLICY: PassiveScheduler dispatch policy
 
         Returns:
             PDSeparationConfig: Loaded configuration
@@ -67,9 +61,6 @@ class PDSeparationConfig:
             post_out_port=int(os.getenv(
                 "VLLM_PP_POST_OUT_ZMQ_PORT", cls.post_out_port
             )),
-            dispatch_policy=os.getenv(
-                "VLLM_PP_PASSIVE_DISPATCH_POLICY", cls.dispatch_policy
-            ),
         )
 
     def get_pre_out_bind_addr(self) -> str:
