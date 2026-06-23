@@ -219,6 +219,27 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
 
 class AscendWorkerProc(WorkerProc):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        input_shm_handle: Handle,
+        shared_worker_lock: LockType,
+        is_driver_worker: bool,
+    ):
+        self.local_rank = local_rank
+        super().__init__(
+            vllm_config=vllm_config,
+            local_rank=local_rank,
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            input_shm_handle=input_shm_handle,
+            shared_worker_lock=shared_worker_lock,
+            is_driver_worker=is_driver_worker,
+        )
+
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
