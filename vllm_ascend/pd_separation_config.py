@@ -22,8 +22,12 @@ ZMQ channels used in PD-separation deployments. Configuration is loaded
 from environment variables with sensible defaults.
 """
 
-import os
 from dataclasses import dataclass
+from importlib import import_module
+
+
+EDGE_TO_CLOUD_ZMQ_PORT_ENV = "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT"
+CLOUD_TO_EDGE_ZMQ_PORT_ENV = "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT"
 
 
 @dataclass
@@ -50,17 +54,20 @@ class PDSeparationConfig:
         Load PD-separation configuration from environment variables.
 
         Environment variables:
-            VLLM_PP_PRE_OUT_ZMQ_PORT: PRE_OUT channel port (default: 5558)
-            VLLM_PP_POST_OUT_ZMQ_PORT: POST_OUT channel port (default: 5559)
+            VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT: PRE_OUT
+                channel port (default: 5558)
+            VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT: POST_OUT
+                channel port (default: 5559)
+            VLLM_PP_PRE_OUT_ZMQ_PORT: legacy PRE_OUT channel port
+            VLLM_PP_POST_OUT_ZMQ_PORT: legacy POST_OUT channel port
 
         Returns:
             PDSeparationConfig: Loaded configuration
         """
+        envs = import_module("vllm_ascend.envs")
         return cls(
-            pre_out_port=int(os.getenv("VLLM_PP_PRE_OUT_ZMQ_PORT", cls.pre_out_port)),
-            post_out_port=int(os.getenv(
-                "VLLM_PP_POST_OUT_ZMQ_PORT", cls.post_out_port
-            )),
+            pre_out_port=getattr(envs, EDGE_TO_CLOUD_ZMQ_PORT_ENV),
+            post_out_port=getattr(envs, CLOUD_TO_EDGE_ZMQ_PORT_ENV),
         )
 
     def get_pre_out_bind_addr(self) -> str:
