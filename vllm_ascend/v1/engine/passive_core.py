@@ -33,7 +33,6 @@ the upstream ``vllm/v1/engine/core.py`` stays untouched.
 """
 from __future__ import annotations
 
-import os
 import pickle
 import queue
 import signal
@@ -42,7 +41,6 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import zmq
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
@@ -523,11 +521,13 @@ class PassiveEngineCoreProc:
 
         maybe_register_config_serialize_by_value()
 
-        # Mark this process as a non-leader PP rank running with passive
+        # Mark this config as a non-leader PP rank running with passive
         # EngineCore, so that AscendMultiprocExecutor and AscendWorkerProc
         # set up dual message queues (local + cross-node).
-        os.environ["VLLM_PP_NON_LEADER_ENGINE_CORE"] = "1"
-        envs.disable_envs_cache()
+        from vllm_ascend.passive_engine_core_state import (
+            mark_ascend_non_leader_passive_engine_core,
+        )
+        mark_ascend_non_leader_passive_engine_core(vllm_config)
 
         set_process_title("PassiveEngineCore")
         maybe_init_worker_tracer(

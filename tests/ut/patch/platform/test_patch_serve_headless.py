@@ -14,6 +14,13 @@ _PATCH_PATH = (
     / "platform"
     / "patch_serve_headless.py"
 )
+_PASSIVE_CORE_PATH = (
+    Path(__file__).parents[4]
+    / "vllm_ascend"
+    / "v1"
+    / "engine"
+    / "passive_core.py"
+)
 
 
 class FakeVllmEnvs(ModuleType):
@@ -169,6 +176,16 @@ def _load_patch_module():
     return module
 
 
+def _load_passive_core_module():
+    spec = importlib.util.spec_from_file_location(
+        "test_passive_core", _PASSIVE_CORE_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_serve_patch_launches_passive_engine_core_for_non_leader_rank(monkeypatch):
     context = FakeContext(response={"status": "READY"})
     fake_serve, fake_envs, fake_engine_core = _install_fake_modules(monkeypatch, context)
@@ -186,6 +203,13 @@ def test_serve_patch_launches_passive_engine_core_for_non_leader_rank(monkeypatc
     assert proc.name == "PassiveEngineCore"
     assert proc.target.__name__ == "_run_passive_engine_core_with_ascend_shims"
     assert proc.kwargs["ready_pipe"] is context.writer
+    from vllm_ascend.passive_engine_core_state import (
+        is_ascend_non_leader_passive_engine_core,
+    )
+
+    assert is_ascend_non_leader_passive_engine_core(
+        proc.kwargs["vllm_config"]
+    ) is True
     assert proc.started is True
     assert context.writer.closed is True
     assert context.reader.closed is True
