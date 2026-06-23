@@ -29,27 +29,11 @@ def test_pd_separation_config_reads_scheduler_zmq_ports(monkeypatch):
     assert config.get_post_out_connect_addr("10.0.0.2") == "tcp://10.0.0.2:6009"
 
 
-def test_pd_separation_config_falls_back_to_legacy_zmq_ports(monkeypatch):
+def test_pd_separation_config_ignores_legacy_zmq_ports(monkeypatch):
     monkeypatch.setenv("VLLM_PP_PRE_OUT_ZMQ_PORT", "6018")
     monkeypatch.setenv("VLLM_PP_POST_OUT_ZMQ_PORT", "6019")
 
     config = PDSeparationConfig.from_env()
 
-    assert config.pre_out_port == 6018
-    assert config.post_out_port == 6019
-
-
-def test_pd_separation_config_prefers_new_zmq_ports(monkeypatch):
-    monkeypatch.setenv("VLLM_PP_PRE_OUT_ZMQ_PORT", "6018")
-    monkeypatch.setenv("VLLM_PP_POST_OUT_ZMQ_PORT", "6019")
-    monkeypatch.setenv(
-        "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT", "6028"
-    )
-    monkeypatch.setenv(
-        "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT", "6029"
-    )
-
-    config = PDSeparationConfig.from_env()
-
-    assert config.pre_out_port == 6028
-    assert config.post_out_port == 6029
+    assert config.pre_out_port == 5558
+    assert config.post_out_port == 5559

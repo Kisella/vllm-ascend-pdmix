@@ -58,8 +58,6 @@ class PDSeparationConfig:
                 channel port (default: 5558)
             VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT: POST_OUT
                 channel port (default: 5559)
-            VLLM_PP_PRE_OUT_ZMQ_PORT: legacy PRE_OUT channel port
-            VLLM_PP_POST_OUT_ZMQ_PORT: legacy POST_OUT channel port
 
         Returns:
             PDSeparationConfig: Loaded configuration

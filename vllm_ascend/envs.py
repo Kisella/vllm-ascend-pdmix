@@ -106,20 +106,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Not supported in PD-disaggregated mode (`kv_producer` / `kv_consumer` only).
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # ZMQ port for the PD-separation scheduler-output channel from edge to cloud.
-    # Falls back to the legacy VLLM_PP_PRE_OUT_ZMQ_PORT variable.
     "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT": lambda: int(
-        os.getenv(
-            "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT",
-            os.getenv("VLLM_PP_PRE_OUT_ZMQ_PORT", "5558"),
-        )
+        os.getenv("VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT", "5558")
     ),
     # ZMQ port for the PD-separation scheduler-output channel from cloud to edge.
-    # Falls back to the legacy VLLM_PP_POST_OUT_ZMQ_PORT variable.
     "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT": lambda: int(
-        os.getenv(
-            "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT",
-            os.getenv("VLLM_PP_POST_OUT_ZMQ_PORT", "5559"),
-        )
+        os.getenv("VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT", "5559")
     ),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
