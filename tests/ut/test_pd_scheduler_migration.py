@@ -40,7 +40,7 @@ def test_passive_scheduler_module_is_owned_by_vllm_ascend():
     module = importlib.import_module("vllm_ascend.core.passive_scheduler")
 
     assert module.PassiveScheduler.__module__ == "vllm_ascend.core.passive_scheduler"
-    assert module.DispatchPolicy.EXPECT_ALTERNATION.value == "expect_alternation"
+    assert not hasattr(module, "DispatchPolicy")
 
 
 def test_pd_scheduler_cls_is_set_to_ascend_path():

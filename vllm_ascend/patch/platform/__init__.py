@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_interface  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
@@ -36,12 +34,9 @@ import vllm_ascend.patch.platform.patch_qwen3_5_config  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 
-if (
-    os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
-    or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
-    or os.getenv("VLLM_PP_NON_LEADER_ENGINE_CORE", "0") in ("1", "true", "True")
-):
-    import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+# Multiproc executor hooks are loaded unconditionally so passive EngineCore
+# processes can select the local + cross-node MQ path from ParallelConfig.
+import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
 # EngineCore PD-separation / edge-cloud / passive-PP hooks. Unconditionally
 # loaded — every behavior change inside the patch is gated at runtime by the

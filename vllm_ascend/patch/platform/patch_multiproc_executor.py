@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import os
+import signal
+import threading
+import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable
+from functools import partial
 from multiprocessing.synchronize import Lock as LockType
+from threading import Thread
 
+import cloudpickle
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.logger import init_logger
+from vllm.tracing import maybe_init_worker_tracer
+from vllm.utils import numa_utils
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.abstract import FailureCallback
@@ -19,6 +30,11 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+from vllm_ascend.passive_engine_core_state import (
+    is_ascend_non_leader_passive_engine_core,
+)
+
+logger = init_logger(__name__)
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -60,7 +76,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                 connect_ip=self.parallel_config.master_addr,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
-        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+        elif is_ascend_non_leader_passive_engine_core(self.vllm_config):
             # For non-leader PP rank running with a passive EngineCore,
             # create a local rpc_broadcast_mq to broadcast SchedulerOutput
             # to local workers. Workers will use this MQ instead of
@@ -137,7 +153,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                         remote_message_queue = self.workers[0].peer_worker_response_mqs[rank]
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
-            elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+            elif is_ascend_non_leader_passive_engine_core(self.vllm_config):
                 # For non-leader PP rank with passive EngineCore,
                 # collect local worker response mqs only.
                 for rank in range(self.local_world_size):
@@ -203,6 +219,27 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
 
 class AscendWorkerProc(WorkerProc):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        input_shm_handle: Handle,
+        shared_worker_lock: LockType,
+        is_driver_worker: bool,
+    ):
+        self.local_rank = local_rank
+        super().__init__(
+            vllm_config=vllm_config,
+            local_rank=local_rank,
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            input_shm_handle=input_shm_handle,
+            shared_worker_lock=shared_worker_lock,
+            is_driver_worker=is_driver_worker,
+        )
+
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
@@ -215,7 +252,7 @@ class AscendWorkerProc(WorkerProc):
             self.peer_response_handles = []
             self.local_rpc_broadcast_mq = None
             self.local_worker_response_mq = None
-        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+        elif is_ascend_non_leader_passive_engine_core(vllm_config):
             # Non-leader PP rank with passive EngineCore:
             # Dual MQ — local MQ for passive enginecore handshake +
             # cross-node MQ for actual communication with pp rank0.
@@ -239,6 +276,219 @@ class AscendWorkerProc(WorkerProc):
         else:
             # Delegate to parent class for the inner_dp_world_group path
             super()._init_message_queues(input_shm_handle, vllm_config)
+
+    def shutdown(self):
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.shutdown()
+        if self.worker_response_mq is not None:
+            self.worker_response_mq.shutdown()
+        if getattr(self, "local_rpc_broadcast_mq", None) is not None:
+            self.local_rpc_broadcast_mq.shutdown()
+            self.local_rpc_broadcast_mq = None
+        if getattr(self, "local_worker_response_mq", None) is not None:
+            self.local_worker_response_mq.shutdown()
+            self.local_worker_response_mq = None
+        self.worker.shutdown()
+        self.rpc_broadcast_mq = None
+        self.worker_response_mq = None
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+    def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
+        if death_pipe is None:
+            return
+
+        def death_pipe_monitor(queues_to_shutdown: list[MessageQueue]):
+            try:
+                death_pipe.recv()
+            except EOFError:
+                logger.info_once("Parent process exited, terminating worker queues")
+                shutdown_requested.set()
+                for mq in queues_to_shutdown:
+                    if mq is not None:
+                        mq.shutdown()
+            except Exception as e:
+                logger.warning("Death monitoring error: %s", e)
+
+        queues = [self.rpc_broadcast_mq, self.worker_response_mq]
+        if getattr(self, "local_rpc_broadcast_mq", None) is not None:
+            queues.append(self.local_rpc_broadcast_mq)
+        if getattr(self, "local_worker_response_mq", None) is not None:
+            queues.append(self.local_worker_response_mq)
+        Thread(
+            target=death_pipe_monitor,
+            args=(queues,),
+            daemon=True,
+            name="DeathPipeMonitor",
+        ).start()
+
+    @staticmethod
+    def worker_main(*args, **kwargs):
+        shutdown_requested = threading.Event()
+
+        def signal_handler(signum, frame):
+            if not shutdown_requested.is_set():
+                shutdown_requested.set()
+                logger.debug(
+                    "WorkerProc handling signal %d, raising SystemExit", signum
+                )
+                raise SystemExit()
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        worker = None
+        ready_writer = kwargs.pop("ready_pipe")
+        death_pipe = kwargs.pop("death_pipe", None)
+
+        for fd in kwargs.pop("inherited_fds", []):
+            try:
+                os.close(fd)
+            except Exception as e:
+                logger.warning("Error closing inherited connection: %s: %s", type(e), e)
+
+        try:
+            rank = kwargs.get("rank", 0)
+            maybe_init_worker_tracer(
+                instrumenting_module_name="vllm.worker",
+                process_kind="worker",
+                process_name=f"Worker_{rank}",
+            )
+
+            worker = AscendWorkerProc(*args, **kwargs)
+            assert worker.worker_response_mq is not None
+            if kwargs["vllm_config"].parallel_config.numa_bind:
+                numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
+
+            worker.monitor_death_pipe(death_pipe, shutdown_requested)
+
+            if (
+                is_ascend_non_leader_passive_engine_core(kwargs["vllm_config"])
+                and worker.local_worker_response_mq is not None
+            ):
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.READY_STR,
+                        "handle": worker.local_worker_response_mq.export_handle(),
+                        "peer_response_handles": worker.local_peer_response_handles,
+                    }
+                )
+            else:
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.READY_STR,
+                        "handle": worker.worker_response_mq.export_handle(),
+                        "peer_response_handles": worker.peer_response_handles,
+                    }
+                )
+
+            if getattr(worker, "local_rpc_broadcast_mq", None) is not None:
+                worker.local_rpc_broadcast_mq.wait_until_ready()
+            if worker.rpc_broadcast_mq is not None:
+                worker.rpc_broadcast_mq.wait_until_ready()
+            if getattr(worker, "local_worker_response_mq", None) is not None:
+                worker.local_worker_response_mq.wait_until_ready()
+            worker.worker_response_mq.wait_until_ready()
+            ready_writer.close()
+            ready_writer = None
+
+            worker.worker_busy_loop()
+
+        except Exception:
+            if ready_writer is not None:
+                logger.exception("WorkerProc failed to start.")
+            elif shutdown_requested.is_set():
+                logger.info("WorkerProc shutting down.")
+            else:
+                logger.exception("WorkerProc failed.")
+            shutdown_requested.set()
+
+        except SystemExit as e:
+            logger.warning("WorkerProc was terminated")
+            raise e
+
+        finally:
+            if ready_writer is not None:
+                ready_writer.close()
+            if death_pipe is not None:
+                death_pipe.close()
+            if worker is not None:
+                worker.shutdown()
+
+    def worker_busy_loop(self):
+        assert self.rpc_broadcast_mq is not None
+        run_rpc_broadcast_mq = True
+        run_local_rpc_broadcast_mq = False
+        while True:
+            if getattr(self, "local_rpc_broadcast_mq", None) is not None and run_local_rpc_broadcast_mq:
+                try:
+                    method, args, kwargs, output_rank = (
+                        self.local_rpc_broadcast_mq.dequeue(timeout=0)
+                    )
+                    if isinstance(method, bytes) and method == b"pp_scheduler_output":
+                        scheduler_output = args[0]
+                        slice_info = args[1] if len(args) > 1 else None
+                        try:
+                            func = getattr(self.worker, "execute_model")
+                            output = func(
+                                scheduler_output,
+                                layer_slice_info=slice_info,
+                            )
+                        except Exception as e:
+                            if hasattr(e, "add_note"):
+                                e.add_note(traceback.format_exc())
+                            logger.exception("PP worker execute_model failed.")
+                            if output_rank is None or self.rank == output_rank:
+                                run_rpc_broadcast_mq = True
+                                run_local_rpc_broadcast_mq = False
+                                self.handle_output(e)
+                            continue
+                        if slice_info is not None and not slice_info.is_last_slice:
+                            continue
+                        if output_rank is None or self.rank == output_rank:
+                            run_rpc_broadcast_mq = True
+                            run_local_rpc_broadcast_mq = False
+                            self.handle_output(output)
+                        continue
+                except Exception:
+                    pass
+
+            if not run_rpc_broadcast_mq:
+                continue
+
+            try:
+                method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                    timeout=0.1
+                )
+            except TimeoutError:
+                continue
+
+            if (
+                getattr(self, "local_rpc_broadcast_mq", None) is not None
+                and isinstance(method, str)
+                and method == "execute_model"
+            ):
+                run_rpc_broadcast_mq = False
+                run_local_rpc_broadcast_mq = True
+                continue
+
+            try:
+                if isinstance(method, str):
+                    func = getattr(self.worker, method)
+                elif isinstance(method, bytes):
+                    func = partial(cloudpickle.loads(method), self.worker)
+
+                output = func(*args, **kwargs)
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception("WorkerProc hit an exception.")
+                if output_rank is None or self.rank == output_rank:
+                    self.handle_output(e)
+                continue
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)
 
     @staticmethod
     def make_worker_process(
@@ -274,7 +524,7 @@ class AscendWorkerProc(WorkerProc):
         }
         # Run EngineCore busy loop in background process.
         proc = context.Process(
-            target=WorkerProc.worker_main,
+            target=AscendWorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
             daemon=False,

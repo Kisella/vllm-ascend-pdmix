@@ -53,6 +53,10 @@ def _launch_passive_engine_core(vllm_config, shutdown_requested: bool) -> None:
     from vllm.version import __version__ as VLLM_VERSION
 
     parallel_config = vllm_config.parallel_config
+    from vllm_ascend.passive_engine_core_state import (
+        mark_ascend_non_leader_passive_engine_core,
+    )
+    mark_ascend_non_leader_passive_engine_core(vllm_config)
     host = parallel_config.master_addr
     head_node_address = f"{host}:{parallel_config.master_port}"
 
