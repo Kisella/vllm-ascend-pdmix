@@ -22,8 +22,12 @@ ZMQ channels used in PD-separation deployments. Configuration is loaded
 from environment variables with sensible defaults.
 """
 
-import os
 from dataclasses import dataclass
+from importlib import import_module
+
+
+EDGE_TO_CLOUD_ZMQ_PORT_ENV = "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT"
+CLOUD_TO_EDGE_ZMQ_PORT_ENV = "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT"
 
 
 @dataclass
@@ -44,32 +48,24 @@ class PDSeparationConfig:
     # Default port: 5559
     post_out_port: int = 5559
 
-    # Dispatch policy for PassiveScheduler on the cloud side.
-    # Valid options: "expect_alternation", "prefill_first", "decode_first", "pdmix_first"
-    # Default: "expect_alternation" - implements EEP/EED PD-covering state machine
-    dispatch_policy: str = "expect_alternation"
-
     @classmethod
     def from_env(cls) -> "PDSeparationConfig":
         """
         Load PD-separation configuration from environment variables.
 
         Environment variables:
-            VLLM_PP_PRE_OUT_ZMQ_PORT: PRE_OUT channel port (default: 5558)
-            VLLM_PP_POST_OUT_ZMQ_PORT: POST_OUT channel port (default: 5559)
-            VLLM_PP_PASSIVE_DISPATCH_POLICY: PassiveScheduler dispatch policy
+            VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT: PRE_OUT
+                channel port (default: 5558)
+            VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT: POST_OUT
+                channel port (default: 5559)
 
         Returns:
             PDSeparationConfig: Loaded configuration
         """
+        envs = import_module("vllm_ascend.envs")
         return cls(
-            pre_out_port=int(os.getenv("VLLM_PP_PRE_OUT_ZMQ_PORT", cls.pre_out_port)),
-            post_out_port=int(os.getenv(
-                "VLLM_PP_POST_OUT_ZMQ_PORT", cls.post_out_port
-            )),
-            dispatch_policy=os.getenv(
-                "VLLM_PP_PASSIVE_DISPATCH_POLICY", cls.dispatch_policy
-            ),
+            pre_out_port=getattr(envs, EDGE_TO_CLOUD_ZMQ_PORT_ENV),
+            post_out_port=getattr(envs, CLOUD_TO_EDGE_ZMQ_PORT_ENV),
         )
 
     def get_pre_out_bind_addr(self) -> str:
