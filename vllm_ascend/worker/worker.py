@@ -558,7 +558,7 @@ class NPUWorker(WorkerBase):
         if cloud_zmq_recv_time is None:
             return
 
-        logger.info(
+        logger.warning(
             "[CloudTiming] zmq_recv_to_worker_start_ms=%.3f "
             "batch_type=%s total_tokens=%d new_reqs=%d cached_reqs=%d "
             "head_token=%s hidden_channel=%s",
