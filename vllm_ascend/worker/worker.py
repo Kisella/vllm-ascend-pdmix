@@ -22,6 +22,7 @@ from typing import Any
 import copy
 import gc
 import logging
+import time
 from types import NoneType
 
 import torch
@@ -547,12 +548,38 @@ class NPUWorker(WorkerBase):
                 result[key] = tensor
         return result
 
+    @staticmethod
+    def _log_cloud_scheduler_output_timing(
+        scheduler_output: "SchedulerOutput", worker_start_time: float
+    ) -> None:
+        cloud_zmq_recv_time = getattr(
+            scheduler_output, "cloud_zmq_recv_time", None
+        )
+        if cloud_zmq_recv_time is None:
+            return
+
+        logger.info(
+            "[CloudTiming] zmq_recv_to_worker_start_ms=%.3f "
+            "batch_type=%s total_tokens=%d new_reqs=%d cached_reqs=%d "
+            "head_token=%s hidden_channel=%s",
+            (worker_start_time - cloud_zmq_recv_time) * 1000,
+            scheduler_output.batch_type,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduler_output.scheduled_new_reqs),
+            scheduler_output.scheduled_cached_reqs.num_reqs,
+            getattr(scheduler_output, "head_token", None),
+            getattr(scheduler_output, "hidden_channel", None),
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         batch_type = scheduler_output.batch_type
+        self._log_cloud_scheduler_output_timing(
+            scheduler_output, time.perf_counter()
+        )
         use_alt_group = (batch_type == SchedulerBatchType.ALL_DECODE)
 
         if envs_ascend.MSMONITOR_USE_DAEMON:

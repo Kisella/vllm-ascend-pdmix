@@ -207,6 +207,10 @@ class PPSchedulerZmqSubscriber:
         )
         self._thread.start()
 
+    @staticmethod
+    def _mark_cloud_zmq_recv_time(scheduler_output: SchedulerOutput) -> None:
+        scheduler_output.cloud_zmq_recv_time = time.perf_counter()
+
     def _subscriber_thread(self) -> None:
         while self._running:
             try:
@@ -217,6 +221,7 @@ class PPSchedulerZmqSubscriber:
                 scheduler_output = pickle.loads(data)
                 if scheduler_output.batch_type is BatchType.EMPTY:
                     continue
+                self._mark_cloud_zmq_recv_time(scheduler_output)
                 with self._lock:
                     self._received_outputs.append((seq, scheduler_output))
                 logger.info(
