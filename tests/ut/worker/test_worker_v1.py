@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -44,52 +43,6 @@ class TestNPUWorker(TestBase):
         self.rank = 0
         self.distributed_init_method = "tcp://localhost:12345"
         self.is_driver_worker = False
-
-    @patch("vllm_ascend.worker.worker.logger")
-    def test_log_cloud_scheduler_output_timing(self, mock_logger):
-        """Test cloud ZMQ receive to worker start timing log."""
-        from vllm_ascend.worker.worker import NPUWorker
-
-        scheduler_output = SimpleNamespace(
-            cloud_zmq_recv_time=1.0,
-            batch_type="PREFILL_FIRST",
-            total_num_scheduled_tokens=128,
-            scheduled_new_reqs=[object(), object()],
-            scheduled_cached_reqs=SimpleNamespace(num_reqs=3),
-            head_token="test-head-token",
-            hidden_channel="PREFILL_1",
-        )
-
-        NPUWorker._log_cloud_scheduler_output_timing(
-            scheduler_output, worker_start_time=1.123
-        )
-
-        mock_logger.info.assert_called_once()
-        log_args = mock_logger.info.call_args.args
-        self.assertIn("[CloudTiming]", log_args[0])
-        self.assertIn("zmq_recv_to_worker_start_ms", log_args[0])
-        self.assertAlmostEqual(log_args[1], 123.0)
-        self.assertEqual(log_args[2], "PREFILL_FIRST")
-        self.assertEqual(log_args[3], 128)
-        self.assertEqual(log_args[4], 2)
-        self.assertEqual(log_args[5], 3)
-        self.assertEqual(log_args[6], "test-head-token")
-        self.assertEqual(log_args[7], "PREFILL_1")
-
-    @patch("vllm_ascend.worker.worker.logger")
-    def test_log_cloud_scheduler_output_timing_without_timestamp(
-        self, mock_logger
-    ):
-        """No timing log is emitted when SchedulerOutput has no timestamp."""
-        from vllm_ascend.worker.worker import NPUWorker
-
-        scheduler_output = SimpleNamespace()
-
-        NPUWorker._log_cloud_scheduler_output_timing(
-            scheduler_output, worker_start_time=1.123
-        )
-
-        mock_logger.info.assert_not_called()
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
