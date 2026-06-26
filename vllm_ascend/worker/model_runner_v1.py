@@ -251,6 +251,41 @@ def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
 
 
+def _pd_diag_tensor_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
+    if tensor is None:
+        return {"is_none": True}
+    try:
+        detached = tensor.detach()
+        finite = torch.isfinite(detached)
+        finite_count = int(finite.sum().item())
+        numel = detached.numel()
+        stats: dict[str, Any] = {
+            "shape": tuple(detached.shape),
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+            "numel": numel,
+            "finite": finite_count,
+            "nan": int(torch.isnan(detached).sum().item()),
+            "inf": int(torch.isinf(detached).sum().item()),
+        }
+        if finite_count > 0:
+            finite_values = detached[finite].float()
+            stats.update({
+                "min": float(finite_values.min().item()),
+                "max": float(finite_values.max().item()),
+                "mean": float(finite_values.mean().item()),
+                "norm": float(torch.linalg.vector_norm(finite_values).item()),
+            })
+        return stats
+    except Exception as exc:
+        return {
+            "shape": tuple(tensor.shape) if hasattr(tensor, "shape") else None,
+            "dtype": str(tensor.dtype) if hasattr(tensor, "dtype") else None,
+            "device": str(tensor.device) if hasattr(tensor, "device") else None,
+            "error": repr(exc),
+        }
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -2763,8 +2798,52 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        logger.error(
+            "[PD-DIAG] logits before sample: batch_type=%s, "
+            "head_token=%s, total_tokens=%s, req_ids=%s, logits_shape=%s, "
+            "logits_dtype=%s, logits_stats=%s, sample_hidden_stats=%s, "
+            "top_token_ids=%s, top_logits=%s, async_scheduling=%s, "
+            "temperature=%s, top_k=%s, top_p=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            scheduler_output.total_num_scheduled_tokens,
+            list(scheduler_output.num_scheduled_tokens.keys()),
+            tuple(logits.shape) if logits is not None else None,
+            str(logits.dtype) if logits is not None else None,
+            _pd_diag_tensor_stats(logits),
+            _pd_diag_tensor_stats(sample_hidden_states),
+            (
+                torch.topk(logits.float(), k=min(5, logits.shape[-1]), dim=-1)
+                .indices.detach().cpu().tolist()
+                if logits is not None and logits.numel() > 0
+                else None
+            ),
+            (
+                torch.topk(logits.float(), k=min(5, logits.shape[-1]), dim=-1)
+                .values.detach().cpu().tolist()
+                if logits is not None and logits.numel() > 0
+                else None
+            ),
+            self.use_async_scheduling,
+            self.input_batch.temperature_cpu[:self.input_batch.num_reqs].tolist(),
+            self.input_batch.top_k_cpu[:self.input_batch.num_reqs].tolist(),
+            self.input_batch.top_p_cpu[:self.input_batch.num_reqs].tolist(),
+        )
+
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        logger.error(
+            "[PD-DIAG] sampler output: batch_type=%s, head_token=%s, "
+            "sampled_token_ids=%s, sampled_shape=%s, sampled_dtype=%s, "
+            "has_logprobs=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            sampler_output.sampled_token_ids.detach().cpu().tolist(),
+            tuple(sampler_output.sampled_token_ids.shape),
+            str(sampler_output.sampled_token_ids.dtype),
+            sampler_output.logprobs_tensors is not None,
+        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -3816,10 +3895,13 @@ class NPUModelRunner(GPUModelRunner):
             if not layer_slice_info.is_last_slice:
                 assert isinstance(hidden_states, IntermediateTensors)
                 self._layerwise_intermediate = hidden_states
+                hidden_tensor = hidden_states.tensors.get("hidden_states")
+                residual_tensor = hidden_states.tensors.get("residual")
                 logger.error(
                     "[PD-DIAG] layerwise continuation saved intermediate: "
                     "batch_type=%s, head_token=%s, total_tokens=%s, "
-                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s",
+                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s, "
+                    "hidden_stats=%s, residual_stats=%s",
                     getattr(layerwise_scheduler_output, "batch_type", None),
                     getattr(layerwise_scheduler_output, "head_token", None),
                     getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
@@ -3828,6 +3910,8 @@ class NPUModelRunner(GPUModelRunner):
                     layer_slice_info.start_layer,
                     layer_slice_info.end_layer,
                     list(hidden_states.tensors.keys()),
+                    _pd_diag_tensor_stats(hidden_tensor),
+                    _pd_diag_tensor_stats(residual_tensor),
                 )
                 return None
 
@@ -3838,10 +3922,13 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(hidden_states, IntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
+                hidden_tensor = hidden_states.tensors.get("hidden_states")
+                residual_tensor = hidden_states.tensors.get("residual")
                 logger.error(
                     "[PD-DIAG] layerwise continuation last cloud slice returning: "
                     "batch_type=%s, head_token=%s, total_tokens=%s, "
-                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s",
+                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s, "
+                    "hidden_stats=%s, residual_stats=%s",
                     getattr(layerwise_scheduler_output, "batch_type", None),
                     getattr(layerwise_scheduler_output, "head_token", None),
                     getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
@@ -3850,6 +3937,8 @@ class NPUModelRunner(GPUModelRunner):
                     layer_slice_info.start_layer,
                     layer_slice_info.end_layer,
                     list(hidden_states.tensors.keys()),
+                    _pd_diag_tensor_stats(hidden_tensor),
+                    _pd_diag_tensor_stats(residual_tensor),
                 )
                 return hidden_states
 
