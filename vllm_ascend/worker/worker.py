@@ -729,6 +729,23 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Cloud middle segment: recv -> segment_b/c -> isend -> return."""
+        slice_desc = (
+            "None"
+            if layer_slice_info is None
+            else f"{layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices} "
+                 f"layers=[{layer_slice_info.start_layer},{layer_slice_info.end_layer}) "
+                 f"is_first={layer_slice_info.is_first_slice} "
+                 f"is_last={layer_slice_info.is_last_slice}"
+        )
+        logger.error(
+            "[LAYER_SLICE_TRACE][CloudWorker] execute_start "
+            "batch_type=%s head_token=%s channel=%s slice=%s total_tokens=%d",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            getattr(scheduler_output, "hidden_channel", None),
+            slice_desc,
+            scheduler_output.total_num_scheduled_tokens,
+        )
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, " + (
                 f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
@@ -774,6 +791,15 @@ class NPUWorker(WorkerBase):
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
+        logger.error(
+            "[LAYER_SLICE_TRACE][CloudWorker] execute_after "
+            "batch_type=%s head_token=%s channel=%s slice=%s output_type=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            getattr(scheduler_output, "hidden_channel", None),
+            slice_desc,
+            type(output).__name__,
+        )
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
 
         is_last_slice = (
@@ -794,10 +820,28 @@ class NPUWorker(WorkerBase):
             _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
+            logger.error(
+                "[LAYER_SLICE_TRACE][CloudWorker] send_to_edge_start "
+                "batch_type=%s head_token=%s channel=%s slice=%s total_tokens=%d",
+                scheduler_output.batch_type,
+                getattr(scheduler_output, "head_token", None),
+                channel,
+                slice_desc,
+                scheduler_output.total_num_scheduled_tokens,
+            )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
                 channel=channel,
+            )
+            logger.error(
+                "[LAYER_SLICE_TRACE][CloudWorker] send_to_edge_enqueued "
+                "batch_type=%s head_token=%s channel=%s slice=%s total_tokens=%d",
+                scheduler_output.batch_type,
+                getattr(scheduler_output, "head_token", None),
+                channel,
+                slice_desc,
+                scheduler_output.total_num_scheduled_tokens,
             )
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output

@@ -449,6 +449,31 @@ class PassiveEngineCoreProc:
         )
 
         for slice_info in batch.slices:
+            if slice_info is not None:
+                logger.error(
+                    "[LAYER_SLICE_TRACE][CloudPassive] enqueue_worker "
+                    "batch_type=%s head_token=%s channel=%s "
+                    "slice=%d/%d layers=[%d,%d) is_first=%s is_last=%s total_tokens=%d",
+                    batch.scheduler_output.batch_type,
+                    getattr(batch.scheduler_output, "head_token", None),
+                    getattr(batch.scheduler_output, "hidden_channel", None),
+                    slice_info.slice_index + 1,
+                    slice_info.total_slices,
+                    slice_info.start_layer,
+                    slice_info.end_layer,
+                    slice_info.is_first_slice,
+                    slice_info.is_last_slice,
+                    batch.scheduler_output.total_num_scheduled_tokens,
+                )
+            else:
+                logger.error(
+                    "[LAYER_SLICE_TRACE][CloudPassive] enqueue_worker "
+                    "batch_type=%s head_token=%s channel=%s slice=None total_tokens=%d",
+                    batch.scheduler_output.batch_type,
+                    getattr(batch.scheduler_output, "head_token", None),
+                    getattr(batch.scheduler_output, "hidden_channel", None),
+                    batch.scheduler_output.total_num_scheduled_tokens,
+                )
             payload = (
                 (batch.scheduler_output, slice_info)
                 if slice_info is not None
@@ -464,6 +489,19 @@ class PassiveEngineCoreProc:
             # edge tail segment because doing so can block the edge on a recv
             # and prevent it from issuing decode head work between P slices.
             if slice_info is None or slice_info.is_last_slice:
+                logger.error(
+                    "[LAYER_SLICE_TRACE][CloudPassive] publish_post_out_before_worker_done "
+                    "batch_type=%s head_token=%s channel=%s slice=%s total_tokens=%d",
+                    batch.scheduler_output.batch_type,
+                    getattr(batch.scheduler_output, "head_token", None),
+                    getattr(batch.scheduler_output, "hidden_channel", None),
+                    (
+                        "None"
+                        if slice_info is None
+                        else f"{slice_info.slice_index + 1}/{slice_info.total_slices}"
+                    ),
+                    batch.scheduler_output.total_num_scheduled_tokens,
+                )
                 self._maybe_publish_post_out(batch.scheduler_output)
         return True
 
@@ -506,6 +544,15 @@ class PassiveEngineCoreProc:
             return
         # Echo the head_token back so the edge can correlate the tail
         # segment with its suspended head state.
+        logger.error(
+            "[LAYER_SLICE_TRACE][CloudPassive] post_out_publish "
+            "head_batch_type=%s tail_batch_type=%s head_token=%s channel=%s total_tokens=%d",
+            bt,
+            tail.batch_type,
+            tail.head_token,
+            tail.hidden_channel,
+            tail.total_num_scheduled_tokens,
+        )
         self._pp_pd_channel.publish(tail)
 
     def run_busy_loop(self) -> None:
