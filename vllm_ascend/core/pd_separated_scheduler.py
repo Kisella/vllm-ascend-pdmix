@@ -580,6 +580,20 @@ class PDSeparatedScheduler(Scheduler):
                 f"running[]: {len(self.running)}, "
                 f"chunk_prefill_first[]: {len(self.chunk_prefill_first)}",
             )
+            logger.error(
+                f"[PD-DIAG] PREFILL_LAST pre-super update: "
+                f"head_token={scheduler_output.head_token}, "
+                f"hidden_channel={scheduler_output.hidden_channel}, "
+                f"completed_req_ids={sorted(completed_req_ids)}, "
+                f"model_output_req_ids={getattr(model_runner_output, 'req_ids', None)}, "
+                f"sampled_token_ids={getattr(model_runner_output, 'sampled_token_ids', None)}, "
+                f"newly_running={[req.request_id for req in newly_running]}, "
+                f"newly_chunked={[req.request_id for req in newly_chunked]}, "
+                f"remaining_pending={[req.request_id for req in self.prefill_last_pending]}, "
+                f"running_before_super={[req.request_id for req in self.running]}, "
+                f"chunk_prefill_first_before_super={[req.request_id for req in self.chunk_prefill_first]}, "
+                f"waiting={len(self.waiting)}"
+            )
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             # D首完成后立即释放 inflight 计数，使下一个 D首可以
             # 在 D尾仍在 batch_queue 中时就被调度，消除 Cloud idle gap。
@@ -597,12 +611,40 @@ class PDSeparatedScheduler(Scheduler):
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
         outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if scheduler_output.batch_type in (
+            BatchType.PREFILL_LAST,
+            BatchType.DECODE_LAST,
+        ):
+            logger.error(
+                f"[PD-DIAG] {scheduler_output.batch_type} post-super update: "
+                f"head_token={scheduler_output.head_token}, "
+                f"model_output_req_ids={getattr(model_runner_output, 'req_ids', None)}, "
+                f"sampled_token_ids={getattr(model_runner_output, 'sampled_token_ids', None)}, "
+                f"running={[req.request_id for req in self.running]}, "
+                f"running_finished={[req.request_id for req in self.running if req.is_finished()]}, "
+                f"chunk_prefill_first={[req.request_id for req in self.chunk_prefill_first]}, "
+                f"prefill_last_pending={[req.request_id for req in self.prefill_last_pending]}, "
+                f"waiting={len(self.waiting)}, outputs={outputs}"
+            )
         self.chunk_prefill_first = [
             req for req in self.chunk_prefill_first if not req.is_finished()
         ]
         self.prefill_last_pending = [
             req for req in self.prefill_last_pending if not req.is_finished()
         ]
+        if scheduler_output.batch_type in (
+            BatchType.PREFILL_LAST,
+            BatchType.DECODE_LAST,
+        ):
+            logger.error(
+                f"[PD-DIAG] {scheduler_output.batch_type} post-cleanup update: "
+                f"running={[req.request_id for req in self.running]}, "
+                f"chunk_prefill_first={[req.request_id for req in self.chunk_prefill_first]}, "
+                f"prefill_last_pending={[req.request_id for req in self.prefill_last_pending]}, "
+                f"can_decode={self._can_schedule_decode_first()}, "
+                f"decode_inflight={self.decode_inflight_count}/{self.decode_inflight_limit}, "
+                f"prefill_inflight={self.prefill_inflight_count}/{self.prefill_inflight_limit}"
+            )
         return outputs
 
     def get_request_counts(self) -> tuple[int, int]:

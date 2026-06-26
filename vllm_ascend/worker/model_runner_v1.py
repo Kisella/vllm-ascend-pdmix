@@ -2156,6 +2156,19 @@ class NPUModelRunner(GPUModelRunner):
             # without saving intermediate state.  In that case all
             # subsequent slices should also return early.
             if self._layerwise_intermediate is None:
+                logger.error(
+                    "[PD-DIAG] layerwise continuation missing intermediate: "
+                    "batch_type=%s, head_token=%s, total_tokens=%s, "
+                    "slice=%s/%s, layers=[%s,%s), req_ids=%s",
+                    scheduler_output.batch_type,
+                    getattr(scheduler_output, "head_token", None),
+                    scheduler_output.total_num_scheduled_tokens,
+                    layer_slice_info.slice_index + 1,
+                    layer_slice_info.total_slices,
+                    layer_slice_info.start_layer,
+                    layer_slice_info.end_layer,
+                    list(scheduler_output.num_scheduled_tokens.keys()),
+                )
                 return EMPTY_MODEL_RUNNER_OUTPUT
             return self._execute_layerwise_continuation(
                 layer_slice_info
@@ -2842,6 +2855,20 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
 
+        logger.error(
+            "[PD-DIAG] model_runner_output ready: batch_type=%s, "
+            "head_token=%s, total_tokens=%s, req_ids=%s, "
+            "req_id_to_index=%s, sampled_token_ids=%s, "
+            "invalid_req_indices=%s, async_scheduling=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            scheduler_output.total_num_scheduled_tokens,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            valid_sampled_token_ids,
+            invalid_req_indices,
+            self.use_async_scheduling,
+        )
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2998,6 +3025,23 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+
+        logger.error(
+            "[PD-DIAG] bookkeeping sampled tokens: batch_type=%s, "
+            "head_token=%s, total_tokens=%s, req_ids=%s, "
+            "valid_sampled_token_ids=%s, invalid_req_indices=%s, "
+            "discard_req_indices=%s, async_scheduling=%s, "
+            "sampled_token_shape=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "head_token", None),
+            scheduler_output.total_num_scheduled_tokens,
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+            invalid_req_indices,
+            discard_sampled_tokens_req_indices.tolist(),
+            self.use_async_scheduling,
+            tuple(sampled_token_ids.shape),
+        )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -3710,6 +3754,24 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded = self._layerwise_num_tokens_padded
         num_tokens_across_dp = self._layerwise_num_tokens_across_dp
         batch_desc = self._layerwise_batch_desc
+        layerwise_scheduler_output = self._layerwise_scheduler_output
+        logger.error(
+            "[PD-DIAG] layerwise continuation start: batch_type=%s, "
+            "head_token=%s, total_tokens=%s, num_tokens_padded=%s, "
+            "slice=%s/%s, layers=[%s,%s), req_ids=%s, positions_is_none=%s, "
+            "attn_metadata_is_none=%s",
+            getattr(layerwise_scheduler_output, "batch_type", None),
+            getattr(layerwise_scheduler_output, "head_token", None),
+            getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
+            num_tokens_padded,
+            layer_slice_info.slice_index + 1,
+            layer_slice_info.total_slices,
+            layer_slice_info.start_layer,
+            layer_slice_info.end_layer,
+            list(getattr(layerwise_scheduler_output, "num_scheduled_tokens", {}).keys()),
+            positions is None,
+            attn_metadata is None,
+        )
 
         has_encoder_input = False
         clear_kv_metadata = self.speculative_config is None
@@ -3754,6 +3816,19 @@ class NPUModelRunner(GPUModelRunner):
             if not layer_slice_info.is_last_slice:
                 assert isinstance(hidden_states, IntermediateTensors)
                 self._layerwise_intermediate = hidden_states
+                logger.error(
+                    "[PD-DIAG] layerwise continuation saved intermediate: "
+                    "batch_type=%s, head_token=%s, total_tokens=%s, "
+                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s",
+                    getattr(layerwise_scheduler_output, "batch_type", None),
+                    getattr(layerwise_scheduler_output, "head_token", None),
+                    getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
+                    layer_slice_info.slice_index + 1,
+                    layer_slice_info.total_slices,
+                    layer_slice_info.start_layer,
+                    layer_slice_info.end_layer,
+                    list(hidden_states.tensors.keys()),
+                )
                 return None
 
             # Edge-cloud cloud segment: always returns IntermediateTensors
@@ -3763,6 +3838,19 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(hidden_states, IntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
+                logger.error(
+                    "[PD-DIAG] layerwise continuation last cloud slice returning: "
+                    "batch_type=%s, head_token=%s, total_tokens=%s, "
+                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s",
+                    getattr(layerwise_scheduler_output, "batch_type", None),
+                    getattr(layerwise_scheduler_output, "head_token", None),
+                    getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
+                    layer_slice_info.slice_index + 1,
+                    layer_slice_info.total_slices,
+                    layer_slice_info.start_layer,
+                    layer_slice_info.end_layer,
+                    list(hidden_states.tensors.keys()),
+                )
                 return hidden_states
 
             # Last slice on a non-final PP rank: return IntermediateTensors
