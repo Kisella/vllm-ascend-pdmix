@@ -174,17 +174,8 @@ def _drain_pd_channel_inbox(self) -> None:
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
-    for _seq, so in new_outputs:
+    for _, so in new_outputs:
         bt = so.batch_type
-        logger.error(
-            "[LAYER_SLICE_TRACE][EdgeEngine] post_out_received "
-            "seq=%s batch_type=%s head_token=%s channel=%s total_tokens=%d",
-            _seq,
-            bt,
-            getattr(so, "head_token", None),
-            getattr(so, "hidden_channel", None),
-            so.total_num_scheduled_tokens,
-        )
         logger.info(f"Received scheduler_output from cloud, batch_type: {bt}")
         if bt == BatchType.PREFILL_LAST:
             self.scheduler.prefills_last_ready.append(so)
