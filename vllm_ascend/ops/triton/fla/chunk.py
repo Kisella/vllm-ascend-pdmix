@@ -33,7 +33,7 @@ def _validate_chunk_gated_delta_rule_inputs(
     cu_seqlens: torch.Tensor | None,
     chunk_indices_chunk64: torch.Tensor | None,
     prebuilt_meta,
-) -> None:
+) -> list[int]:
     if cu_seqlens is None:
         raise RuntimeError("GDN chunk prefill requires cu_seqlens, got None")
     if cu_seqlens.ndim != 1:
@@ -95,15 +95,7 @@ def _validate_chunk_gated_delta_rule_inputs(
                 f"cu_seqlens={cu_seqlens_host}"
             )
 
-    logger.error(
-        "[GDN_CHUNK_CHECK] q_shape=%s initial_state_shape=%s cu_seqlens=%s "
-        "chunk_indices_shape=%s prebuilt_meta=%s",
-        tuple(q.shape),
-        None if initial_state is None else tuple(initial_state.shape),
-        cu_seqlens_host,
-        None if chunk_indices_chunk64 is None else tuple(chunk_indices_chunk64.shape),
-        type(prebuilt_meta).__name__ if prebuilt_meta is not None else None,
-    )
+    return cu_seqlens_host
 
 
 def chunk_gated_delta_rule_fwd(
@@ -170,7 +162,7 @@ def chunk_gated_delta_rule_fwd(
     g_ascendc = g.transpose(1, 2).contiguous()
     q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
 
-    _validate_chunk_gated_delta_rule_inputs(
+    cu_seqlens_host = _validate_chunk_gated_delta_rule_inputs(
         q=q,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
@@ -179,6 +171,18 @@ def chunk_gated_delta_rule_fwd(
     )
     cu_seqlens = cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
+    chunk_indices_host = None if chunk_indices is None else chunk_indices.flatten().tolist()
+    logger.error(
+        "[GDN_FWD_H_ENTER] q_shape=%s k_shape=%s v_shape=%s "
+        "initial_state_shape=%s cu_seqlens=%s chunk_indices_shape=%s prebuilt_meta=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        None if initial_state is None else tuple(initial_state.shape),
+        cu_seqlens_host,
+        None if chunk_indices is None else tuple(chunk_indices.shape),
+        type(prebuilt_meta).__name__ if prebuilt_meta is not None else None,
+    )
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,
@@ -189,11 +193,19 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=True,
         chunk_size=64,
         save_new_value=True,
-        cu_seqlens=cu_seqlens.tolist() if cu_seqlens is not None else None,
-        chunk_indices=chunk_indices.flatten().tolist() if chunk_indices is not None else None,
+        cu_seqlens=cu_seqlens_host,
+        chunk_indices=chunk_indices_host,
         use_exp2=False,
         transpose_state_layout=False,
     )
+    logger.error(
+        "[GDN_FWD_H_LAUNCHED] h_shape=%s v_new_shape=%s final_state_shape=%s",
+        tuple(h.shape),
+        tuple(v_new.shape),
+        tuple(final_state.shape),
+    )
+    torch.npu.current_stream().synchronize()
+    logger.error("[GDN_FWD_H_SYNC_DONE]")
 
     if get_pcp_group().world_size > 1:
         h_update = chunk_gated_delta_rule_fwd_hupdate(
@@ -247,6 +259,16 @@ def chunk_gated_delta_rule_fwd(
             h = h.transpose(1, 2).contiguous()
             v_new = v_new.transpose(1, 2).contiguous()
 
+    logger.error(
+        "[GDN_FWD_O_ENTER] q_ascendc_shape=%s k_ascendc_shape=%s "
+        "v_new_shape=%s h_shape=%s cu_seqlens=%s chunk_indices_shape=%s",
+        tuple(q_ascendc.shape),
+        tuple(k_ascendc.shape),
+        tuple(v_new.shape),
+        tuple(h.shape),
+        cu_seqlens_host,
+        None if chunk_indices is None else tuple(chunk_indices.shape),
+    )
     o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
         q_ascendc,
         k_ascendc,
@@ -255,11 +277,14 @@ def chunk_gated_delta_rule_fwd(
         scale,
         g=g_ascendc,
         g_gamma=None,
-        cu_seqlens=cu_seqlens.tolist() if cu_seqlens is not None else None,
-        chunk_indices=chunk_indices.flatten().tolist() if chunk_indices is not None else None,
+        cu_seqlens=cu_seqlens_host,
+        chunk_indices=chunk_indices_host,
         chunk_size=64,
         transpose_state_layout=False,
     )
+    logger.error("[GDN_FWD_O_LAUNCHED] o_ascendc_shape=%s", tuple(o_ascendc.shape))
+    torch.npu.current_stream().synchronize()
+    logger.error("[GDN_FWD_O_SYNC_DONE]")
 
     o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
     v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()

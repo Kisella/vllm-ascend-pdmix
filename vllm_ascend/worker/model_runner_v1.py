@@ -3203,6 +3203,17 @@ class NPUModelRunner(GPUModelRunner):
                     forward_context,
                     graph_wrapper,
                 )
+                logger.error(
+                    "[EC_GRAPH_UPDATE_SYNC_ENTER] num_tokens=%s layer_indices=%s",
+                    num_tokens_padded,
+                    layer_indices,
+                )
+                self.update_stream.synchronize()
+                logger.error(
+                    "[EC_GRAPH_UPDATE_SYNC_DONE] num_tokens=%s layer_indices=%s",
+                    num_tokens_padded,
+                    layer_indices,
+                )
             finally:
                 forward_context.attn_metadata = original_attn_metadata
 
