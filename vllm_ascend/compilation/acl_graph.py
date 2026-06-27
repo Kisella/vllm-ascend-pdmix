@@ -291,7 +291,11 @@ def update_full_graph_params(
     # so we import graph_params_scope inside the function body.
     from vllm_ascend.compilation.acl_graph_edge_cloud import graph_params_scope
 
-    with graph_params_scope(graph_params, draft_graph_params), set_current_vllm_config(vllm_config):
+    with graph_params_scope(
+        graph_params,
+        draft_graph_params,
+        sync_on_exit=False,
+    ), set_current_vllm_config(vllm_config):
         impl_cls = attn_backend.get_impl_cls()
 
         # Use the caller-supplied unfiltered metadata if available;
@@ -312,13 +316,6 @@ def update_full_graph_params(
             forward_context.attn_metadata = filtered_metadata
 
         try:
-            logger.error(
-                "[EC_UPDATE_IMPL_ENTER] num_tokens=%s layer_indices=%s metadata_keys=%s impl=%s",
-                num_tokens,
-                layer_indices,
-                list(forward_context.attn_metadata.keys()) if isinstance(forward_context.attn_metadata, dict) else None,
-                getattr(impl_cls, "__name__", str(impl_cls)),
-            )
             impl_cls.update_graph_params(
                 update_stream,
                 forward_context,
@@ -327,11 +324,6 @@ def update_full_graph_params(
                 speculative_config,
                 num_dcp_pcp_tokens,
                 draft_attn_metadatas,
-            )
-            logger.error(
-                "[EC_UPDATE_IMPL_DONE] num_tokens=%s layer_indices=%s",
-                num_tokens,
-                layer_indices,
             )
             # For GDN Attention: AscendC operate(conv1d update) update graph params
             # _filter_attn_metadata_for_layers drops GDN keys (they do not contain
@@ -343,12 +335,6 @@ def update_full_graph_params(
                 old_metadata = forward_context.attn_metadata
                 forward_context.attn_metadata = unfiltered_metadata
                 try:
-                    logger.error(
-                        "[EC_UPDATE_CONV1D_ENTER] num_tokens=%s layer_indices=%s metadata_keys=%s",
-                        num_tokens,
-                        layer_indices,
-                        list(forward_context.attn_metadata.keys()) if isinstance(forward_context.attn_metadata, dict) else None,
-                    )
                     update_conv1d_graph_params(
                         update_stream,
                         forward_context,
@@ -357,20 +343,9 @@ def update_full_graph_params(
                         _EXTRA_CTX.is_draft_model,
                         draft_attn_metadatas,
                     )
-                    logger.error(
-                        "[EC_UPDATE_CONV1D_DONE] num_tokens=%s layer_indices=%s",
-                        num_tokens,
-                        layer_indices,
-                    )
                 finally:
                     forward_context.attn_metadata = old_metadata
             else:
-                logger.error(
-                    "[EC_UPDATE_CONV1D_ENTER] num_tokens=%s layer_indices=%s metadata_keys=%s",
-                    num_tokens,
-                    layer_indices,
-                    list(forward_context.attn_metadata.keys()) if isinstance(forward_context.attn_metadata, dict) else None,
-                )
                 update_conv1d_graph_params(
                     update_stream,
                     forward_context,
@@ -379,16 +354,6 @@ def update_full_graph_params(
                     _EXTRA_CTX.is_draft_model,
                     draft_attn_metadatas,
                 )
-                logger.error(
-                    "[EC_UPDATE_CONV1D_DONE] num_tokens=%s layer_indices=%s",
-                    num_tokens,
-                    layer_indices,
-                )
-            logger.error(
-                "[EC_UPDATE_SCOPE_EXIT] num_tokens=%s layer_indices=%s",
-                num_tokens,
-                layer_indices,
-            )
         finally:
             if filtered_metadata is not None:
                 forward_context.attn_metadata = unfiltered_metadata

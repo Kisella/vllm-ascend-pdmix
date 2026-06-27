@@ -3078,62 +3078,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
 
-    def _log_edge_cloud_graph_params_counts(
-        self,
-        tag: str,
-        num_tokens: int,
-        layer_indices: list[int] | None,
-        forward_context: ForwardContext,
-        graph_wrapper: ACLGraphWrapper | None,
-    ) -> None:
-        if graph_wrapper is None or graph_wrapper.graph_params is None:
-            return
-        graph_params = graph_wrapper.graph_params
-        attn_metadata = forward_context.attn_metadata
-        metadata_keys = list(attn_metadata.keys()) if isinstance(attn_metadata, dict) else None
-        attn_params_len = len(graph_params.attn_params.get(num_tokens, []))
-        handles_len = len(graph_params.handles.get(num_tokens, []))
-        events_len = len(graph_params.events.get(num_tokens, []))
-        conv1d_params_len = len(graph_params.conv1d_params.get(num_tokens, []))
-        conv1d_handles_len = len(graph_params.conv1d_handles.get(num_tokens, []))
-        conv1d_events_len = len(graph_params.conv1d_events.get(num_tokens, []))
-        logger.error(
-            "[EC_GRAPH_PARAMS:%s] num_tokens=%s layer_indices=%s metadata_keys=%s "
-            "attn_params=%s handles=%s events=%s conv1d_params=%s "
-            "conv1d_handles=%s conv1d_events=%s wrapper=%s",
-            tag,
-            num_tokens,
-            layer_indices,
-            metadata_keys,
-            attn_params_len,
-            handles_len,
-            events_len,
-            conv1d_params_len,
-            conv1d_handles_len,
-            conv1d_events_len,
-            type(graph_wrapper).__name__,
-        )
-        if attn_params_len != handles_len or handles_len != events_len:
-            logger.error(
-                "[EC_GRAPH_PARAMS:%s] attention graph params count mismatch: "
-                "attn_params=%s handles=%s events=%s num_tokens=%s",
-                tag,
-                attn_params_len,
-                handles_len,
-                events_len,
-                num_tokens,
-            )
-        if conv1d_params_len != conv1d_handles_len or conv1d_handles_len != conv1d_events_len:
-            logger.error(
-                "[EC_GRAPH_PARAMS:%s] conv1d graph params count mismatch: "
-                "conv1d_params=%s conv1d_handles=%s conv1d_events=%s num_tokens=%s",
-                tag,
-                conv1d_params_len,
-                conv1d_handles_len,
-                conv1d_events_len,
-                num_tokens,
-            )
-
     def _update_full_graph_params_if_needed(
         self,
         forward_context: ForwardContext,
@@ -3174,13 +3118,6 @@ class NPUModelRunner(GPUModelRunner):
                 if len(filtered_metadata) != len(original_attn_metadata):
                     forward_context.attn_metadata = filtered_metadata
             try:
-                self._log_edge_cloud_graph_params_counts(
-                    "before",
-                    num_tokens_padded,
-                    layer_indices,
-                    forward_context,
-                    graph_wrapper,
-                )
                 update_full_graph_params(
                     self.attn_backend,
                     self.update_stream,
@@ -3196,24 +3133,10 @@ class NPUModelRunner(GPUModelRunner):
                     ),
                     unfiltered_attn_metadata=original_attn_metadata,
                 )
-                self._log_edge_cloud_graph_params_counts(
-                    "after",
-                    num_tokens_padded,
-                    layer_indices,
-                    forward_context,
-                    graph_wrapper,
-                )
-                logger.error(
-                    "[EC_GRAPH_UPDATE_SYNC_ENTER] num_tokens=%s layer_indices=%s",
-                    num_tokens_padded,
-                    layer_indices,
-                )
+                # Graph params updates run on update_stream.  Keep this barrier so
+                # replay sees recorded update events, but do not synchronize the
+                # current replay stream from graph_params_scope.
                 self.update_stream.synchronize()
-                logger.error(
-                    "[EC_GRAPH_UPDATE_SYNC_DONE] num_tokens=%s layer_indices=%s",
-                    num_tokens_padded,
-                    layer_indices,
-                )
             finally:
                 forward_context.attn_metadata = original_attn_metadata
 

@@ -449,19 +449,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         context_lens=seq_lens,
                         out=output,
                     )
-                    logger.error(
-                        "[ATTN_UPDATE_KEY_ENTER:PA] key=%s num_tokens=%s query_shape=%s "
-                        "block_table_shape=%s seq_lens=%s",
-                        key,
-                        num_tokens,
-                        tuple(query.shape),
-                        None if block_table is None else tuple(block_table.shape),
-                        seq_lens,
-                    )
-                    logger.error("[ATTN_UPDATE_BEGIN_ENTER:PA] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_begin(update_stream, handle)
-                    logger.error("[ATTN_UPDATE_BEGIN_DONE:PA] key=%s num_tokens=%s", key, num_tokens)
-                    logger.error("[ATTN_UPDATE_OP_ENTER:PA] key=%s num_tokens=%s", key, num_tokens)
                     torch_npu._npu_paged_attention(
                         query=query,
                         key_cache=key_cache,
@@ -474,12 +462,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         out=output,
                         workspace=workspace,
                     )
-                    logger.error("[ATTN_UPDATE_OP_DONE:PA] key=%s num_tokens=%s", key, num_tokens)
-                    logger.error("[ATTN_UPDATE_END_ENTER:PA] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_end(update_stream)
-                    logger.error("[ATTN_UPDATE_END_DONE:PA] key=%s num_tokens=%s", key, num_tokens)
                     event.record(update_stream)
-                    logger.error("[ATTN_UPDATE_EVENT_RECORDED:PA] key=%s num_tokens=%s", key, num_tokens)
         elif _EXTRA_CTX.sinks:
             # FIA update logic
             if _EXTRA_CTX.is_draft_model:
@@ -536,20 +520,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
 
-                    logger.error(
-                        "[ATTN_UPDATE_KEY_ENTER:FIA_V2] key=%s num_tokens=%s query_shape=%s "
-                        "block_table_shape=%s actual_seq_q=%s actual_seq_kv=%s",
-                        key,
-                        num_tokens,
-                        tuple(query.shape),
-                        None if block_tables is None else tuple(block_tables.shape),
-                        actual_seq_lengths_q,
-                        seq_lens,
-                    )
-                    logger.error("[ATTN_UPDATE_BEGIN_ENTER:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_begin(update_stream, handle)
-                    logger.error("[ATTN_UPDATE_BEGIN_DONE:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
-                    logger.error("[ATTN_UPDATE_OP_ENTER:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
                         query=query,
                         key=key_cache,
@@ -570,12 +541,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         workspace=graph_params.workspaces.get(num_tokens),
                         out=[attn_output, softmax_lse],
                     )
-                    logger.error("[ATTN_UPDATE_OP_DONE:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
-                    logger.error("[ATTN_UPDATE_END_ENTER:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_end(update_stream)
-                    logger.error("[ATTN_UPDATE_END_DONE:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
                     event.record(update_stream)
-                    logger.error("[ATTN_UPDATE_EVENT_RECORDED:FIA_V2] key=%s num_tokens=%s", key, num_tokens)
         else:
             # FIA update logic
             if _EXTRA_CTX.is_draft_model:
@@ -673,20 +640,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
                             block_tables = attn_metadata[key].block_tables
 
-                    logger.error(
-                        "[ATTN_UPDATE_KEY_ENTER:FIA] key=%s num_tokens=%s query_shape=%s "
-                        "block_table_shape=%s actual_seq_q=%s actual_seq_kv=%s sparse_mode=%s",
-                        key,
-                        num_tokens,
-                        tuple(query.shape),
-                        None if block_tables is None else tuple(block_tables.shape),
-                        actual_seq_lengths_q,
-                        seq_lens,
-                        sparse_mode,
-                    )
-                    logger.error("[ATTN_UPDATE_BEGIN_ENTER:FIA] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_begin(update_stream, handle)
-                    logger.error("[ATTN_UPDATE_BEGIN_DONE:FIA] key=%s num_tokens=%s", key, num_tokens)
                     input_layout = "TND"
                     extra_args = {}
                     if c8_k_aq_scale is not None:
@@ -700,7 +654,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         }
                         input_layout = "BNSD"
                         sparse_mode = 0
-                    logger.error("[ATTN_UPDATE_OP_ENTER:FIA] key=%s num_tokens=%s", key, num_tokens)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
                         key=key_cache,
@@ -721,13 +674,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         workspace=graph_params.workspaces.get(num_tokens),
                         out=[attn_output, softmax_lse],
                     )
-                    logger.error("[ATTN_UPDATE_OP_DONE:FIA] key=%s num_tokens=%s", key, num_tokens)
-                    logger.error("[ATTN_UPDATE_END_ENTER:FIA] key=%s num_tokens=%s", key, num_tokens)
                     torch.npu.graph_task_update_end(update_stream)
-                    logger.error("[ATTN_UPDATE_END_DONE:FIA] key=%s num_tokens=%s", key, num_tokens)
 
                     event.record(update_stream)
-                    logger.error("[ATTN_UPDATE_EVENT_RECORDED:FIA] key=%s num_tokens=%s", key, num_tokens)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)

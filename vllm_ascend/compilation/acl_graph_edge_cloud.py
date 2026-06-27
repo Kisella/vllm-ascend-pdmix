@@ -52,6 +52,8 @@ def make_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
 def graph_params_scope(
     graph_params: GraphParams | None,
     draft_graph_params: GraphParams | None = None,
+    *,
+    sync_on_exit: bool = True,
 ):
     """临时将 acl_graph 的 _graph_params / _draft_graph_params 替换为指定参数。
 
@@ -59,7 +61,9 @@ def graph_params_scope(
     访问这些模块级变量的代码（包括 attention 后端和 ACLGraphWrapper）
     都会自动感知到替换后的值。
 
-    退出时同步 NPU 流并恢复原值，防止后续 segment 读到错误参数。
+    默认在退出时同步 NPU 流并恢复原值，防止后续 segment 读到错误参数。
+    graph 参数 update 路径只更新 update_stream 上的 graph task，不应同步
+    current_stream（graph replay 所在流），因此可传入 sync_on_exit=False。
     """
     old_graph_params = _acl_graph._graph_params
     old_draft_graph_params = _acl_graph._draft_graph_params
@@ -70,7 +74,7 @@ def graph_params_scope(
     try:
         yield
     finally:
-        if graph_params is not None:
+        if sync_on_exit and graph_params is not None:
             torch.npu.current_stream().synchronize()
         _acl_graph._graph_params = old_graph_params
         _acl_graph._draft_graph_params = old_draft_graph_params
