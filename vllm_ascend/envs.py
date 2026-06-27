@@ -105,6 +105,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # ZMQ port for the PD-separation scheduler-output channel from edge to cloud.
+    "VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SCHEDULER_EDGE_TO_CLOUD_ZMQ_PORT", "5558")
+    ),
+    # ZMQ port for the PD-separation scheduler-output channel from cloud to edge.
+    "VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SCHEDULER_CLOUD_TO_EDGE_ZMQ_PORT", "5559")
+    ),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))

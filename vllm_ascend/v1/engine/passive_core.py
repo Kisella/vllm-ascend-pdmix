@@ -33,7 +33,6 @@ the upstream ``vllm/v1/engine/core.py`` stays untouched.
 """
 from __future__ import annotations
 
-import os
 import pickle
 import queue
 import signal
@@ -42,7 +41,6 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import zmq
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
@@ -370,20 +368,15 @@ class PassiveEngineCoreProc:
         vllm_config: "VllmConfig",
         executor,  # MultiprocExecutor — duck-typed to avoid heavy import
         scheduler_input,
-        dispatch_policy=None,
         pp_pd_channel: Optional["PPSchedulerZmqChannel"] = None,
     ) -> None:
         passive_scheduler_module = _import_passive_scheduler_module()
-        if dispatch_policy is None:
-            dispatch_policy = (
-                passive_scheduler_module.DispatchPolicy.EXPECT_ALTERNATION
-            )
         self.vllm_config = vllm_config
         self.executor = executor
         # scheduler_input is any object exposing consume_new_outputs(); in
         # PD-separation mode this is the cloud-side PPSchedulerZmqChannel.
         self.passive_scheduler = passive_scheduler_module.PassiveScheduler(
-            vllm_config, scheduler_input, dispatch_policy=dispatch_policy
+            vllm_config, scheduler_input
         )
         # Optional POST_OUT (cloud → edge) channel. Only set on the cloud
         # side in PD-separation mode; left None for the legacy PP path.
@@ -412,8 +405,8 @@ class PassiveEngineCoreProc:
     def step(self) -> bool:
         """Single tick: poll ZMQ → pick batches → enqueue worker payloads.
 
-        Batches are dispatched one phase at a time in the order encoded by
-        the configured dispatch policy.
+        Batches are dispatched with the fixed expect-alternation cloud-side
+        state machine.
 
         Returns:
             True if at least one payload was enqueued, False if the
@@ -531,11 +524,13 @@ class PassiveEngineCoreProc:
 
         maybe_register_config_serialize_by_value()
 
-        # Mark this process as a non-leader PP rank running with passive
+        # Mark this config as a non-leader PP rank running with passive
         # EngineCore, so that AscendMultiprocExecutor and AscendWorkerProc
         # set up dual message queues (local + cross-node).
-        os.environ["VLLM_PP_NON_LEADER_ENGINE_CORE"] = "1"
-        envs.disable_envs_cache()
+        from vllm_ascend.passive_engine_core_state import (
+            mark_ascend_non_leader_passive_engine_core,
+        )
+        mark_ascend_non_leader_passive_engine_core(vllm_config)
 
         set_process_title("PassiveEngineCore")
         maybe_init_worker_tracer(
@@ -567,20 +562,9 @@ class PassiveEngineCoreProc:
             ready_pipe.close()
             ready_pipe = None
 
-            passive_scheduler_module = _import_passive_scheduler_module()
-            dispatch_policy_cls = passive_scheduler_module.DispatchPolicy
-            # Load PD-separation configuration from environment variables.
+            # Load PD-separation ZMQ configuration from environment variables.
             from vllm_ascend.pd_separation_config import PDSeparationConfig
             pd_config = PDSeparationConfig.from_env()
-            try:
-                policy = dispatch_policy_cls(pd_config.dispatch_policy)
-            except ValueError:
-                logger.warning(
-                    "Unknown VLLM_PP_PASSIVE_DISPATCH_POLICY=%r; "
-                    "falling back to expect_alternation.",
-                    pd_config.dispatch_policy,
-                )
-                policy = dispatch_policy_cls.EXPECT_ALTERNATION
 
             scheduler_input = None
 
@@ -642,7 +626,6 @@ class PassiveEngineCoreProc:
                 executor.start_worker_monitor(inline=False)
                 proc = PassiveEngineCoreProc(
                     vllm_config, executor, scheduler_input,
-                    dispatch_policy=policy,
                     pp_pd_channel=pp_pd_channel,
                 )
                 proc.run_busy_loop()
