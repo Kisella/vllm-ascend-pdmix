@@ -4078,6 +4078,38 @@ class NPUModelRunner(GPUModelRunner):
 
         seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
+        batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+        logger.error(
+            "[PD-DIAG] cloud graph decision: use_graph=%s, "
+            "seg_c_graph=%s, runtime_mode=%s, batch_descriptor=%s, "
+            "layer_slice=%s, num_tokens_padded=%s, positions_shape=%s, "
+            "intermediate_keys=%s",
+            use_graph,
+            seg_c_graph,
+            getattr(forward_context, "cudagraph_runtime_mode", None),
+            batch_descriptor,
+            (
+                None
+                if layer_slice_info is None
+                else {
+                    "slice_index": layer_slice_info.slice_index,
+                    "total_slices": layer_slice_info.total_slices,
+                    "start_layer": layer_slice_info.start_layer,
+                    "end_layer": layer_slice_info.end_layer,
+                    "global_start": layer_slice_info.start_layer + self.head_k,
+                    "global_end": layer_slice_info.end_layer + self.head_k,
+                    "is_first": layer_slice_info.is_first_slice,
+                    "is_last": layer_slice_info.is_last_slice,
+                }
+            ),
+            num_tokens_padded,
+            tuple(positions.shape) if positions is not None else None,
+            (
+                list(intermediate_tensors.tensors.keys())
+                if isinstance(intermediate_tensors, IntermediateTensors)
+                else None
+            ),
+        )
 
         if seg_c_graph:
             if layer_slice_info is not None:
@@ -4124,6 +4156,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             if not layer_slice_info.is_last_slice:
                 model_kwargs["layer_slice_return_intermediate"] = True
+        logger.error(
+            "[PD-DIAG] cloud graph call: use_graph=%s, seg_c_graph=%s, "
+            "batch_descriptor=%s, layer_slice_start=%s, layer_slice_end=%s, "
+            "layer_slice_return_intermediate=%s, model_kwargs_keys=%s",
+            use_graph,
+            seg_c_graph,
+            batch_descriptor,
+            model_kwargs.get("layer_slice_start"),
+            model_kwargs.get("layer_slice_end"),
+            model_kwargs.get("layer_slice_return_intermediate"),
+            sorted(model_kwargs.keys()),
+        )
 
         hidden_states = seg_c(
             positions=positions,

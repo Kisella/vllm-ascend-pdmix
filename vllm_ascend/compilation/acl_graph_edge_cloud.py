@@ -10,6 +10,8 @@ import torch
 from vllm.config import VllmConfig
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 
 from vllm_ascend.compilation import acl_graph as _acl_graph
 from vllm_ascend.compilation.acl_graph import (
@@ -112,5 +114,55 @@ class EdgeCloudACLGraphWrapper(ACLGraphWrapper):
         self.draft_graph_params: GraphParams | None = None
 
     def __call__(self, *args, **kwargs):
+        forward_context = get_forward_context()
+        batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+        runtime_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+        if hasattr(runtime_mode, "decode_mode"):
+            runtime_mode_for_match = runtime_mode.decode_mode()
+        else:
+            runtime_mode_for_match = runtime_mode
+        cache_hit = batch_descriptor in self.concrete_aclgraph_entries
+        entry = self.concrete_aclgraph_entries.get(batch_descriptor)
+        logger.error(
+            "[PD-DIAG] EdgeCloudACLGraphWrapper call: wrapper_id=%s, "
+            "runtime_mode=%s, wrapper_runtime_mode=%s, batch_descriptor=%s, "
+            "cache_hit=%s, graph_captured=%s, cache_size=%s, "
+            "layer_slice_start=%s, layer_slice_end=%s, "
+            "layer_slice_return_intermediate=%s, kwargs_keys=%s",
+            id(self),
+            runtime_mode,
+            self.runtime_mode,
+            batch_descriptor,
+            cache_hit,
+            bool(entry is not None and entry.aclgraph is not None),
+            len(self.concrete_aclgraph_entries),
+            kwargs.get("layer_slice_start"),
+            kwargs.get("layer_slice_end"),
+            kwargs.get("layer_slice_return_intermediate"),
+            sorted(kwargs.keys()),
+        )
+        if (
+            runtime_mode_for_match != CUDAGraphMode.NONE
+            and runtime_mode_for_match == self.runtime_mode
+            and cache_hit
+            and entry is not None
+            and entry.aclgraph is not None
+            and (
+                kwargs.get("layer_slice_start") is not None
+                or kwargs.get("layer_slice_end") is not None
+            )
+        ):
+            logger.error(
+                "[PD-DIAG] EdgeCloudACLGraphWrapper replay candidate for "
+                "layer slice: wrapper_id=%s, batch_descriptor=%s, "
+                "layer_slice_start=%s, layer_slice_end=%s. If another "
+                "slice used the same batch_descriptor earlier, this may replay "
+                "a graph captured for a different layer range.",
+                id(self),
+                batch_descriptor,
+                kwargs.get("layer_slice_start"),
+                kwargs.get("layer_slice_end"),
+            )
         with graph_params_scope(self.graph_params, self.draft_graph_params):
             return super().__call__(*args, **kwargs)
+
