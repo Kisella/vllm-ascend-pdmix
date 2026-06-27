@@ -4111,6 +4111,31 @@ class NPUModelRunner(GPUModelRunner):
             ),
         )
 
+        logger.error(
+            "[PD-DIAG] cloud segment type: use_graph=%s, seg_c_type=%s, "
+            "segment_c_type=%s, segment_c_wrapper_type=%s, "
+            "segment_c_is_compiled=%s, seg_c_is_compiled=%s, "
+            "segment_c_inner_type=%s, seg_c_inner_type=%s, "
+            "segment_c_wrapper_is_acl=%s, seg_c_is_acl=%s, "
+            "layer_slice=%s",
+            use_graph,
+            type(seg_c).__name__,
+            type(self.segment_c).__name__,
+            type(self.segment_c_wrapper).__name__,
+            isinstance(self.segment_c, EdgeCloudCompiledSegment),
+            isinstance(seg_c, EdgeCloudCompiledSegment),
+            type(getattr(self.segment_c, "_segment", None)).__name__,
+            type(getattr(seg_c, "_segment", None)).__name__,
+            isinstance(self.segment_c_wrapper, ACLGraphWrapper),
+            isinstance(seg_c, ACLGraphWrapper),
+            (
+                None
+                if layer_slice_info is None
+                else f"{layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}"
+                f"[{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
+            ),
+        )
+
         if seg_c_graph:
             if layer_slice_info is not None:
                 cloud_layer_indices = list(range(
