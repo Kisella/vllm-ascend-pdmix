@@ -14,6 +14,7 @@ import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
@@ -25,6 +26,84 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
+
+def _validate_chunk_gated_delta_rule_inputs(
+    q: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_indices_chunk64: torch.Tensor | None,
+    prebuilt_meta,
+) -> None:
+    if cu_seqlens is None:
+        raise RuntimeError("GDN chunk prefill requires cu_seqlens, got None")
+    if cu_seqlens.ndim != 1:
+        raise RuntimeError(f"cu_seqlens must be 1D, got shape={tuple(cu_seqlens.shape)}")
+    if cu_seqlens.numel() < 1:
+        raise RuntimeError("cu_seqlens must contain at least one element")
+    if not cu_seqlens.is_contiguous():
+        raise RuntimeError("cu_seqlens must be contiguous")
+
+    cu_seqlens_host = cu_seqlens.detach().cpu().tolist()
+    total_tokens = int(cu_seqlens_host[-1])
+    if total_tokens != q.shape[1]:
+        raise RuntimeError(
+            "GDN chunk metadata mismatch: "
+            f"cu_seqlens[-1]={total_tokens}, q.shape={tuple(q.shape)}, "
+            f"cu_seqlens={cu_seqlens_host}"
+        )
+    if any(eos < bos for bos, eos in zip(cu_seqlens_host, cu_seqlens_host[1:])):
+        raise RuntimeError(f"cu_seqlens must be non-decreasing, got {cu_seqlens_host}")
+
+    expected_num_states = cu_seqlens.numel() - 1
+    if initial_state is not None and initial_state.shape[0] != expected_num_states:
+        raise RuntimeError(
+            "GDN initial_state mismatch: "
+            f"initial_state.shape={tuple(initial_state.shape)}, "
+            f"expected first dim={expected_num_states}, cu_seqlens={cu_seqlens_host}"
+        )
+
+    if chunk_indices_chunk64 is not None:
+        if chunk_indices_chunk64.ndim != 2 or chunk_indices_chunk64.shape[1] != 2:
+            raise RuntimeError(
+                "chunk_indices_chunk64 must have shape [num_chunks, 2], "
+                f"got {tuple(chunk_indices_chunk64.shape)}"
+            )
+        if not chunk_indices_chunk64.is_contiguous():
+            raise RuntimeError("chunk_indices_chunk64 must be contiguous")
+
+        chunk_indices_host = chunk_indices_chunk64.detach().cpu()
+        seq_indices = chunk_indices_host[:, 0]
+        chunk_ids = chunk_indices_host[:, 1]
+        non_empty_seqs = [idx for idx, (bos, eos) in enumerate(zip(cu_seqlens_host, cu_seqlens_host[1:])) if eos > bos]
+        if seq_indices.numel() > 0:
+            min_seq = int(seq_indices.min().item())
+            max_seq = int(seq_indices.max().item())
+            if min_seq < 0 or max_seq >= len(non_empty_seqs):
+                raise RuntimeError(
+                    "chunk_indices sequence index out of compact range: "
+                    f"min={min_seq}, max={max_seq}, non_empty_seqs={len(non_empty_seqs)}, "
+                    f"cu_seqlens={cu_seqlens_host}"
+                )
+            if int(chunk_ids.min().item()) < 0:
+                raise RuntimeError("chunk_indices chunk id must be non-negative")
+
+        expected_chunks = sum((eos - bos + 63) // 64 for bos, eos in zip(cu_seqlens_host, cu_seqlens_host[1:]))
+        if chunk_indices_chunk64.shape[0] != expected_chunks:
+            raise RuntimeError(
+                "chunk_indices_chunk64 count mismatch: "
+                f"actual={chunk_indices_chunk64.shape[0]}, expected={expected_chunks}, "
+                f"cu_seqlens={cu_seqlens_host}"
+            )
+
+    logger.error(
+        "[GDN_CHUNK_CHECK] q_shape=%s initial_state_shape=%s cu_seqlens=%s "
+        "chunk_indices_shape=%s prebuilt_meta=%s",
+        tuple(q.shape),
+        None if initial_state is None else tuple(initial_state.shape),
+        cu_seqlens_host,
+        None if chunk_indices_chunk64 is None else tuple(chunk_indices_chunk64.shape),
+        type(prebuilt_meta).__name__ if prebuilt_meta is not None else None,
+    )
 
 
 def chunk_gated_delta_rule_fwd(
@@ -91,6 +170,13 @@ def chunk_gated_delta_rule_fwd(
     g_ascendc = g.transpose(1, 2).contiguous()
     q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
 
+    _validate_chunk_gated_delta_rule_inputs(
+        q=q,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices_chunk64=chunk_indices_chunk64,
+        prebuilt_meta=prebuilt_meta,
+    )
     cu_seqlens = cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
