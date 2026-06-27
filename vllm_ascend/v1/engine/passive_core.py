@@ -448,16 +448,6 @@ class PassiveEngineCoreProc:
             f"slice_info={_slice_info_str}",
         )
 
-        logger.error(
-            "[PD-DIAG] cloud dispatch: batch_type=%s, head_token=%s, "
-            "hidden_channel=%s, total_tokens=%s, slices=%s, req_ids=%s",
-            batch.scheduler_output.batch_type,
-            getattr(batch.scheduler_output, "head_token", None),
-            getattr(batch.scheduler_output, "hidden_channel", None),
-            batch.scheduler_output.total_num_scheduled_tokens,
-            _slice_info_str,
-            list(batch.scheduler_output.num_scheduled_tokens.keys()),
-        )
 
         for slice_info in batch.slices:
             payload = (
@@ -475,24 +465,6 @@ class PassiveEngineCoreProc:
             # edge tail segment because doing so can block the edge on a recv
             # and prevent it from issuing decode head work between P slices.
             if slice_info is None or slice_info.is_last_slice:
-                logger.error(
-                    "[PD-DIAG] cloud POST_OUT trigger: batch_type=%s, "
-                    "head_token=%s, hidden_channel=%s, total_tokens=%s, "
-                    "slice=%s, req_ids=%s",
-                    batch.scheduler_output.batch_type,
-                    getattr(batch.scheduler_output, "head_token", None),
-                    getattr(batch.scheduler_output, "hidden_channel", None),
-                    batch.scheduler_output.total_num_scheduled_tokens,
-                    (
-                        "None"
-                        if slice_info is None
-                        else (
-                            f"{slice_info.slice_index + 1}/{slice_info.total_slices}"
-                            f"[{slice_info.start_layer},{slice_info.end_layer})"
-                        )
-                    ),
-                    list(batch.scheduler_output.num_scheduled_tokens.keys()),
-                )
                 self._maybe_publish_post_out(batch.scheduler_output)
         return True
 
@@ -535,17 +507,6 @@ class PassiveEngineCoreProc:
             return
         # Echo the head_token back so the edge can correlate the tail
         # segment with its suspended head state.
-        logger.error(
-            "[PD-DIAG] cloud POST_OUT publish: head_batch_type=%s, "
-            "tail_batch_type=%s, head_token=%s, hidden_channel=%s, "
-            "total_tokens=%s, req_ids=%s",
-            bt,
-            tail.batch_type,
-            getattr(tail, "head_token", None),
-            getattr(tail, "hidden_channel", None),
-            tail.total_num_scheduled_tokens,
-            list(tail.num_scheduled_tokens.keys()),
-        )
         self._pp_pd_channel.publish(tail)
 
     def run_busy_loop(self) -> None:

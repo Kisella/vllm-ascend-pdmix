@@ -251,41 +251,6 @@ def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
 
 
-def _pd_diag_tensor_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
-    if tensor is None:
-        return {"is_none": True}
-    try:
-        detached = tensor.detach()
-        finite = torch.isfinite(detached)
-        finite_count = int(finite.sum().item())
-        numel = detached.numel()
-        stats: dict[str, Any] = {
-            "shape": tuple(detached.shape),
-            "dtype": str(detached.dtype),
-            "device": str(detached.device),
-            "numel": numel,
-            "finite": finite_count,
-            "nan": int(torch.isnan(detached).sum().item()),
-            "inf": int(torch.isinf(detached).sum().item()),
-        }
-        if finite_count > 0:
-            finite_values = detached[finite].float()
-            stats.update({
-                "min": float(finite_values.min().item()),
-                "max": float(finite_values.max().item()),
-                "mean": float(finite_values.mean().item()),
-                "norm": float(torch.linalg.vector_norm(finite_values).item()),
-            })
-        return stats
-    except Exception as exc:
-        return {
-            "shape": tuple(tensor.shape) if hasattr(tensor, "shape") else None,
-            "dtype": str(tensor.dtype) if hasattr(tensor, "dtype") else None,
-            "device": str(tensor.device) if hasattr(tensor, "device") else None,
-            "error": repr(exc),
-        }
-
-
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -2191,19 +2156,6 @@ class NPUModelRunner(GPUModelRunner):
             # without saving intermediate state.  In that case all
             # subsequent slices should also return early.
             if self._layerwise_intermediate is None:
-                logger.error(
-                    "[PD-DIAG] layerwise continuation missing intermediate: "
-                    "batch_type=%s, head_token=%s, total_tokens=%s, "
-                    "slice=%s/%s, layers=[%s,%s), req_ids=%s",
-                    scheduler_output.batch_type,
-                    getattr(scheduler_output, "head_token", None),
-                    scheduler_output.total_num_scheduled_tokens,
-                    layer_slice_info.slice_index + 1,
-                    layer_slice_info.total_slices,
-                    layer_slice_info.start_layer,
-                    layer_slice_info.end_layer,
-                    list(scheduler_output.num_scheduled_tokens.keys()),
-                )
                 return EMPTY_MODEL_RUNNER_OUTPUT
             return self._execute_layerwise_continuation(
                 layer_slice_info
@@ -2798,52 +2750,8 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        logger.error(
-            "[PD-DIAG] logits before sample: batch_type=%s, "
-            "head_token=%s, total_tokens=%s, req_ids=%s, logits_shape=%s, "
-            "logits_dtype=%s, logits_stats=%s, sample_hidden_stats=%s, "
-            "top_token_ids=%s, top_logits=%s, async_scheduling=%s, "
-            "temperature=%s, top_k=%s, top_p=%s",
-            scheduler_output.batch_type,
-            getattr(scheduler_output, "head_token", None),
-            scheduler_output.total_num_scheduled_tokens,
-            list(scheduler_output.num_scheduled_tokens.keys()),
-            tuple(logits.shape) if logits is not None else None,
-            str(logits.dtype) if logits is not None else None,
-            _pd_diag_tensor_stats(logits),
-            _pd_diag_tensor_stats(sample_hidden_states),
-            (
-                torch.topk(logits.float(), k=min(5, logits.shape[-1]), dim=-1)
-                .indices.detach().cpu().tolist()
-                if logits is not None and logits.numel() > 0
-                else None
-            ),
-            (
-                torch.topk(logits.float(), k=min(5, logits.shape[-1]), dim=-1)
-                .values.detach().cpu().tolist()
-                if logits is not None and logits.numel() > 0
-                else None
-            ),
-            self.use_async_scheduling,
-            self.input_batch.temperature_cpu[:self.input_batch.num_reqs].tolist(),
-            self.input_batch.top_k_cpu[:self.input_batch.num_reqs].tolist(),
-            self.input_batch.top_p_cpu[:self.input_batch.num_reqs].tolist(),
-        )
-
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
-        logger.error(
-            "[PD-DIAG] sampler output: batch_type=%s, head_token=%s, "
-            "sampled_token_ids=%s, sampled_shape=%s, sampled_dtype=%s, "
-            "has_logprobs=%s",
-            scheduler_output.batch_type,
-            getattr(scheduler_output, "head_token", None),
-            sampler_output.sampled_token_ids.detach().cpu().tolist(),
-            tuple(sampler_output.sampled_token_ids.shape),
-            str(sampler_output.sampled_token_ids.dtype),
-            sampler_output.logprobs_tensors is not None,
-        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2934,20 +2842,6 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
 
-        logger.error(
-            "[PD-DIAG] model_runner_output ready: batch_type=%s, "
-            "head_token=%s, total_tokens=%s, req_ids=%s, "
-            "req_id_to_index=%s, sampled_token_ids=%s, "
-            "invalid_req_indices=%s, async_scheduling=%s",
-            scheduler_output.batch_type,
-            getattr(scheduler_output, "head_token", None),
-            scheduler_output.total_num_scheduled_tokens,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            valid_sampled_token_ids,
-            invalid_req_indices,
-            self.use_async_scheduling,
-        )
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -3104,23 +2998,6 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
-
-        logger.error(
-            "[PD-DIAG] bookkeeping sampled tokens: batch_type=%s, "
-            "head_token=%s, total_tokens=%s, req_ids=%s, "
-            "valid_sampled_token_ids=%s, invalid_req_indices=%s, "
-            "discard_req_indices=%s, async_scheduling=%s, "
-            "sampled_token_shape=%s",
-            scheduler_output.batch_type,
-            getattr(scheduler_output, "head_token", None),
-            scheduler_output.total_num_scheduled_tokens,
-            req_ids_output_copy,
-            valid_sampled_token_ids,
-            invalid_req_indices,
-            discard_sampled_tokens_req_indices.tolist(),
-            self.use_async_scheduling,
-            tuple(sampled_token_ids.shape),
-        )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -3834,23 +3711,6 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = self._layerwise_num_tokens_across_dp
         batch_desc = self._layerwise_batch_desc
         layerwise_scheduler_output = self._layerwise_scheduler_output
-        logger.error(
-            "[PD-DIAG] layerwise continuation start: batch_type=%s, "
-            "head_token=%s, total_tokens=%s, num_tokens_padded=%s, "
-            "slice=%s/%s, layers=[%s,%s), req_ids=%s, positions_is_none=%s, "
-            "attn_metadata_is_none=%s",
-            getattr(layerwise_scheduler_output, "batch_type", None),
-            getattr(layerwise_scheduler_output, "head_token", None),
-            getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
-            num_tokens_padded,
-            layer_slice_info.slice_index + 1,
-            layer_slice_info.total_slices,
-            layer_slice_info.start_layer,
-            layer_slice_info.end_layer,
-            list(getattr(layerwise_scheduler_output, "num_scheduled_tokens", {}).keys()),
-            positions is None,
-            attn_metadata is None,
-        )
 
         has_encoder_input = False
         clear_kv_metadata = self.speculative_config is None
@@ -3897,22 +3757,6 @@ class NPUModelRunner(GPUModelRunner):
                 self._layerwise_intermediate = hidden_states
                 hidden_tensor = hidden_states.tensors.get("hidden_states")
                 residual_tensor = hidden_states.tensors.get("residual")
-                logger.error(
-                    "[PD-DIAG] layerwise continuation saved intermediate: "
-                    "batch_type=%s, head_token=%s, total_tokens=%s, "
-                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s, "
-                    "hidden_stats=%s, residual_stats=%s",
-                    getattr(layerwise_scheduler_output, "batch_type", None),
-                    getattr(layerwise_scheduler_output, "head_token", None),
-                    getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
-                    layer_slice_info.slice_index + 1,
-                    layer_slice_info.total_slices,
-                    layer_slice_info.start_layer,
-                    layer_slice_info.end_layer,
-                    list(hidden_states.tensors.keys()),
-                    _pd_diag_tensor_stats(hidden_tensor),
-                    _pd_diag_tensor_stats(residual_tensor),
-                )
                 return None
 
             # Edge-cloud cloud segment: always returns IntermediateTensors
@@ -3924,22 +3768,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.kv_connector_output = kv_connector_output
                 hidden_tensor = hidden_states.tensors.get("hidden_states")
                 residual_tensor = hidden_states.tensors.get("residual")
-                logger.error(
-                    "[PD-DIAG] layerwise continuation last cloud slice returning: "
-                    "batch_type=%s, head_token=%s, total_tokens=%s, "
-                    "slice=%s/%s, layers=[%s,%s), tensor_keys=%s, "
-                    "hidden_stats=%s, residual_stats=%s",
-                    getattr(layerwise_scheduler_output, "batch_type", None),
-                    getattr(layerwise_scheduler_output, "head_token", None),
-                    getattr(layerwise_scheduler_output, "total_num_scheduled_tokens", None),
-                    layer_slice_info.slice_index + 1,
-                    layer_slice_info.total_slices,
-                    layer_slice_info.start_layer,
-                    layer_slice_info.end_layer,
-                    list(hidden_states.tensors.keys()),
-                    _pd_diag_tensor_stats(hidden_tensor),
-                    _pd_diag_tensor_stats(residual_tensor),
-                )
                 return hidden_states
 
             # Last slice on a non-final PP rank: return IntermediateTensors
@@ -4079,78 +3907,13 @@ class NPUModelRunner(GPUModelRunner):
         if layer_slice_info is not None:
             seg_c = self.segment_c
             if isinstance(seg_c, EdgeCloudCompiledSegment):
-                logger.error(
-                    "[PD-DIAG] bypass EdgeCloudCompiledSegment for layer slice: "
-                    "slice=%s/%s, layers=[%s,%s), global_layers=[%s,%s)",
-                    layer_slice_info.slice_index + 1,
-                    layer_slice_info.total_slices,
-                    layer_slice_info.start_layer,
-                    layer_slice_info.end_layer,
-                    layer_slice_info.start_layer + self.head_k,
-                    layer_slice_info.end_layer + self.head_k,
-                )
                 seg_c = seg_c.unwrap()
             use_graph = False
         else:
             seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
         batch_descriptor = getattr(forward_context, "batch_descriptor", None)
-        logger.error(
-            "[PD-DIAG] cloud graph decision: use_graph=%s, "
-            "seg_c_graph=%s, runtime_mode=%s, batch_descriptor=%s, "
-            "layer_slice=%s, num_tokens_padded=%s, positions_shape=%s, "
-            "intermediate_keys=%s",
-            use_graph,
-            seg_c_graph,
-            getattr(forward_context, "cudagraph_runtime_mode", None),
-            batch_descriptor,
-            (
-                None
-                if layer_slice_info is None
-                else {
-                    "slice_index": layer_slice_info.slice_index,
-                    "total_slices": layer_slice_info.total_slices,
-                    "start_layer": layer_slice_info.start_layer,
-                    "end_layer": layer_slice_info.end_layer,
-                    "global_start": layer_slice_info.start_layer + self.head_k,
-                    "global_end": layer_slice_info.end_layer + self.head_k,
-                    "is_first": layer_slice_info.is_first_slice,
-                    "is_last": layer_slice_info.is_last_slice,
-                }
-            ),
-            num_tokens_padded,
-            tuple(positions.shape) if positions is not None else None,
-            (
-                list(intermediate_tensors.tensors.keys())
-                if isinstance(intermediate_tensors, IntermediateTensors)
-                else None
-            ),
-        )
 
-        logger.error(
-            "[PD-DIAG] cloud segment type: use_graph=%s, seg_c_type=%s, "
-            "segment_c_type=%s, segment_c_wrapper_type=%s, "
-            "segment_c_is_compiled=%s, seg_c_is_compiled=%s, "
-            "segment_c_inner_type=%s, seg_c_inner_type=%s, "
-            "segment_c_wrapper_is_acl=%s, seg_c_is_acl=%s, "
-            "layer_slice=%s",
-            use_graph,
-            type(seg_c).__name__,
-            type(self.segment_c).__name__,
-            type(self.segment_c_wrapper).__name__,
-            isinstance(self.segment_c, EdgeCloudCompiledSegment),
-            isinstance(seg_c, EdgeCloudCompiledSegment),
-            type(getattr(self.segment_c, "_segment", None)).__name__,
-            type(getattr(seg_c, "_segment", None)).__name__,
-            isinstance(self.segment_c_wrapper, ACLGraphWrapper),
-            isinstance(seg_c, ACLGraphWrapper),
-            (
-                None
-                if layer_slice_info is None
-                else f"{layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}"
-                f"[{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
-            ),
-        )
 
         if seg_c_graph:
             if layer_slice_info is not None:
@@ -4197,18 +3960,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             if not layer_slice_info.is_last_slice:
                 model_kwargs["layer_slice_return_intermediate"] = True
-        logger.error(
-            "[PD-DIAG] cloud graph call: use_graph=%s, seg_c_graph=%s, "
-            "batch_descriptor=%s, layer_slice_start=%s, layer_slice_end=%s, "
-            "layer_slice_return_intermediate=%s, model_kwargs_keys=%s",
-            use_graph,
-            seg_c_graph,
-            batch_descriptor,
-            model_kwargs.get("layer_slice_start"),
-            model_kwargs.get("layer_slice_end"),
-            model_kwargs.get("layer_slice_return_intermediate"),
-            sorted(model_kwargs.keys()),
-        )
 
         hidden_states = seg_c(
             positions=positions,
