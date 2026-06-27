@@ -4076,7 +4076,23 @@ class NPUModelRunner(GPUModelRunner):
             "Cloud segment_c requires intermediate_tensors from Edge side"
         )
 
-        seg_c = self.segment_c_wrapper if use_graph else self.segment_c
+        if layer_slice_info is not None:
+            seg_c = self.segment_c
+            if isinstance(seg_c, EdgeCloudCompiledSegment):
+                logger.error(
+                    "[PD-DIAG] bypass EdgeCloudCompiledSegment for layer slice: "
+                    "slice=%s/%s, layers=[%s,%s), global_layers=[%s,%s)",
+                    layer_slice_info.slice_index + 1,
+                    layer_slice_info.total_slices,
+                    layer_slice_info.start_layer,
+                    layer_slice_info.end_layer,
+                    layer_slice_info.start_layer + self.head_k,
+                    layer_slice_info.end_layer + self.head_k,
+                )
+                seg_c = seg_c.unwrap()
+            use_graph = False
+        else:
+            seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
         batch_descriptor = getattr(forward_context, "batch_descriptor", None)
         logger.error(

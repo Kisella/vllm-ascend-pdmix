@@ -184,6 +184,16 @@ class EdgeCloudCompiledSegment(nn.Module):
         )
         return compiled_fn
 
+    def unwrap(self) -> nn.Module:
+        """Return the original uncompiled edge-cloud segment.
+
+        Layer-sliced execution passes Python integer layer ranges that are
+        control-flow inputs to the segment.  The compiled callable may specialize
+        those ranges during tracing, so callers that need per-slice dynamic layer
+        ranges can explicitly bypass the compiled wrapper.
+        """
+        return self._segment
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Invoke the compiled segment forward.
 
