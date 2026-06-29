@@ -26,6 +26,12 @@ from .solve_tril import solve_tril
 from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
 
+def _tensor_to_host_list(tensor: torch.Tensor) -> list[int]:
+    if tensor.device.type == "cpu":
+        return tensor.tolist()
+    return tensor.detach().cpu().tolist()
+
+
 def _validate_chunk_gated_delta_rule_inputs(
     q: torch.Tensor,
     initial_state: torch.Tensor,
@@ -42,7 +48,11 @@ def _validate_chunk_gated_delta_rule_inputs(
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
 
-    cu_seqlens_host = cu_seqlens.detach().cpu().tolist()
+    cu_seqlens_cpu = getattr(prebuilt_meta, "cu_seqlens_cpu", None)
+    if cu_seqlens_cpu is not None:
+        cu_seqlens_host = _tensor_to_host_list(cu_seqlens_cpu)
+    else:
+        cu_seqlens_host = _tensor_to_host_list(cu_seqlens)
     total_tokens = int(cu_seqlens_host[-1])
     if total_tokens != q.shape[1]:
         raise RuntimeError(
@@ -70,7 +80,13 @@ def _validate_chunk_gated_delta_rule_inputs(
         if not chunk_indices_chunk64.is_contiguous():
             raise RuntimeError("chunk_indices_chunk64 must be contiguous")
 
-        chunk_indices_host = chunk_indices_chunk64.detach().cpu()
+        chunk_indices_cpu = getattr(prebuilt_meta, "chunk_indices_chunk64_cpu", None)
+        if chunk_indices_cpu is not None:
+            chunk_indices_host = chunk_indices_cpu
+        elif chunk_indices_chunk64.device.type == "cpu":
+            chunk_indices_host = chunk_indices_chunk64
+        else:
+            chunk_indices_host = chunk_indices_chunk64.detach().cpu()
         seq_indices = chunk_indices_host[:, 0]
         chunk_ids = chunk_indices_host[:, 1]
         non_empty_seqs = [idx for idx, (bos, eos) in enumerate(zip(cu_seqlens_host, cu_seqlens_host[1:])) if eos > bos]
@@ -169,8 +185,15 @@ def chunk_gated_delta_rule_fwd(
         prebuilt_meta=prebuilt_meta,
     )
     cu_seqlens = cu_seqlens.to(torch.int64)
-    chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
-    chunk_indices_host = None if chunk_indices is None else chunk_indices.flatten().tolist()
+    chunk_indices_cpu = getattr(prebuilt_meta, "chunk_indices_chunk64_cpu", None)
+    if chunk_indices_cpu is not None:
+        chunk_indices_host = chunk_indices_cpu.flatten().tolist()
+    elif chunk_indices_chunk64 is None:
+        chunk_indices_host = None
+    elif chunk_indices_chunk64.device.type == "cpu":
+        chunk_indices_host = chunk_indices_chunk64.to(torch.int64).flatten().tolist()
+    else:
+        chunk_indices_host = chunk_indices_chunk64.to(torch.int64).flatten().tolist()
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,

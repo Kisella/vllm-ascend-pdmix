@@ -409,6 +409,8 @@ def _clone_gdn_attn_metadata(meta):
                 "final_chunk_indices_chunk64",
                 "chunk_indices_large_block",
                 "block_indices_cumsum",
+                "cu_seqlens_cpu",
+                "chunk_indices_chunk64_cpu",
             ):
                 t = getattr(cloned_chunk, attr, None)
                 if t is not None and isinstance(t, torch.Tensor) and t.device.type != "cpu":
@@ -897,11 +899,16 @@ class NPUModelRunner(GPUModelRunner):
             return segment
         if self._is_dummy_or_profile_run():
             return segment
+        # Edge-cloud segments update graph params explicitly and wait on
+        # update_stream before replay.  Do not add ACLGraphWrapper's generic
+        # current-stream pre-replay barrier here; on edge/cloud split decode it
+        # can wait on remote-side work and deadlock the pair.
         return EdgeCloudACLGraphWrapper(
             segment,
             self.vllm_config,
             runtime_mode=runtime_mode,
             cudagraph_options=None,
+            enable_enpu=True,
         )
 
     def _load_model_edge_cloud(self) -> None:

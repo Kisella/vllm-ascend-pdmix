@@ -24,6 +24,7 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
+from vllm_ascend.ops.triton.fla.utils import prepare_chunk_indices
 from vllm_ascend.utils import is_310p
 
 _GDN_CHUNK_SIZE = 64
@@ -44,6 +45,8 @@ class GDNChunkedPrefillMetadata:
     final_chunk_indices_chunk64: torch.Tensor
     chunk_indices_large_block: torch.Tensor
     block_indices_cumsum: torch.Tensor
+    cu_seqlens_cpu: torch.Tensor | None = None
+    chunk_indices_chunk64_cpu: torch.Tensor | None = None
     _buffer_slot: object | None = None
 
 
@@ -341,8 +344,15 @@ def _build_chunked_prefill_metadata(
     builder,
     tensors: dict[str, torch.Tensor],
     *,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     slot: _GDNChunkedPrefillBufferSlot | None = None,
 ) -> GDNChunkedPrefillMetadata:
+    chunk_indices_chunk64_cpu = None
+    if cu_seqlens_cpu is not None:
+        chunk_indices_chunk64_cpu = prepare_chunk_indices(
+            cu_seqlens_cpu,
+            builder._ascend_gdn_chunk_size,
+        )
     return GDNChunkedPrefillMetadata(
         chunk_indices_chunk64=tensors["chunk_indices_chunk64"],
         chunk_offsets_chunk64=tensors["chunk_offsets_chunk64"],
@@ -350,6 +360,8 @@ def _build_chunked_prefill_metadata(
         final_chunk_indices_chunk64=tensors["final_chunk_indices_chunk64"],
         chunk_indices_large_block=tensors["chunk_indices_large_block"],
         block_indices_cumsum=tensors["block_indices_cumsum"],
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        chunk_indices_chunk64_cpu=chunk_indices_chunk64_cpu,
         _buffer_slot=slot,
     )
 
@@ -696,7 +708,7 @@ def _build_non_spec_chunked_prefill_meta_cpu(builder, cu_seqlens_cpu: torch.Tens
     shape_info = _build_chunk_meta_shape_info(builder, cu_seqlens_cpu)
     tensors = _allocate_chunk_meta_cpu_tensors(shape_info)
     _fill_chunk_meta_cpu_tensors(tensors, shape_info)
-    return _build_chunked_prefill_metadata(builder, tensors)
+    return _build_chunked_prefill_metadata(builder, tensors, cu_seqlens_cpu=cu_seqlens_cpu)
 
 
 def _build_non_spec_chunked_prefill_meta(
@@ -715,7 +727,12 @@ def _build_non_spec_chunked_prefill_meta(
     slot = builder._ascend_gdn_chunked_prefill_pool[builder._ascend_gdn_chunked_prefill_pool_idx]
     tensors = _slice_chunk_meta_slot_tensors(slot, shape_info)
     _fill_chunk_meta_device_tensors(builder, cu_seqlens, tensors)
-    return _build_chunked_prefill_metadata(builder, tensors, slot=slot)
+    return _build_chunked_prefill_metadata(
+        builder,
+        tensors,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        slot=slot,
+    )
 
 
 def _patched_build(
