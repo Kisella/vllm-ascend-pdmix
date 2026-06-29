@@ -286,11 +286,6 @@ def update_full_graph_params(
             提前过滤掉了 skip_graph_params_update=True 的 key 时，需要传入此参数
             以保证 GDN 的 update_conv1d_graph_params 仍能按 layer_prefix 查找。
     """
-    # Lazy import to avoid circular dependency:
-    # acl_graph_edge_cloud.py imports ACLGraphWrapper / GraphParams from this module,
-    # so we import graph_params_scope inside the function body.
-    from vllm_ascend.compilation.acl_graph_edge_cloud import graph_params_scope
-
     with graph_params_scope(
         graph_params,
         draft_graph_params,
@@ -455,6 +450,9 @@ def make_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
     )
 
 
@@ -462,6 +460,8 @@ def make_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
 def graph_params_scope(
     graph_params: GraphParams | None,
     draft_graph_params: GraphParams | None = None,
+    *,
+    sync_on_exit: bool = True,
 ):
     global _active_graph_params, _active_draft_graph_params
     old_graph_params = _active_graph_params
@@ -475,7 +475,7 @@ def graph_params_scope(
     finally:
         # 在切回旧的 graph_params 之前，确保当前流上所有 attention 参数更新任务
         # 已全部完成，避免异步流仍在引用本段 graph_params 导致 task handle 错配
-        if graph_params is not None:
+        if sync_on_exit and graph_params is not None:
             torch.npu.current_stream().synchronize()
         _active_graph_params = old_graph_params
         _active_draft_graph_params = old_draft_graph_params
