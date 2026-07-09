@@ -444,6 +444,9 @@ def _patched_step_with_batch_queue(self):
         ):
             scheduler_output.head_token = uuid4().hex
 
+
+        logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0}")
+
         # [ascend insert] DECODE_FIRST is published immediately to keep the
         # decode pipeline full; PREFILL_FIRST is delayed via
         # _publish_pre_out_when_ready until it becomes next to execute.
@@ -451,7 +454,6 @@ def _patched_step_with_batch_queue(self):
             self._maybe_publish_pre_out(scheduler_output)
 
         if scheduler_output.batch_type == BatchType.EMPTY:
-            logger.error(f"schedule EMPTY batch, queue_len={len(batch_queue) if batch_queue else 0}")
             if batch_queue:
                 self._defer_empty_batch(scheduler_output)
                 scheduler_output = None
@@ -528,10 +530,10 @@ def _patched_step_with_batch_queue(self):
     future, scheduler_output, exec_model_fut = batch_queue.pop()
 
     vllm_logger.error(
-        "[BATCH_QUEUE] Dequeued %s, before pop queue_len=%d, types=%s",
-        scheduler_output.batch_type.value,
+        "[BATCH_QUEUE] before pop queue_len=%d, types=%s Dequeued %s,",
         batch_queue_len,
         queue_types,
+        scheduler_output.batch_type.value,
     )
 
     # [ascend insert] Clean up PRE_OUT tracking for completed batch.
