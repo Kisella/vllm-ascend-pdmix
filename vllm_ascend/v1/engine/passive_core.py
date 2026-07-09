@@ -560,7 +560,7 @@ class PassiveEngineCoreProc:
             else:
                 _slice_info_str += "None;"
         _slice_info_str += "]"
-        logger.info(
+        logger.error(
             f"\r\n[Cloud] Step dispatched batch_type: "
             f"{batch.scheduler_output.batch_type}, "
             f"slices_count={len(batch.slices)}, "
@@ -600,6 +600,16 @@ class PassiveEngineCoreProc:
                 batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
             ):
+                chunk_info = []
+                for req_id, num_tokens in batch.scheduler_output.num_scheduled_tokens.items():
+                    chunk_info.append(f"{req_id}:{num_tokens}")
+                logger.error(
+                    "[PREFILL-CHUNK] batch_type=%s, total_tokens=%d, chunk_sizes=%s",
+                    batch.scheduler_output.batch_type,
+                    batch.scheduler_output.total_num_scheduled_tokens,
+                    ", ".join(chunk_info),
+                )
+
                 head_token = getattr(batch.scheduler_output, "head_token", None)
                 if head_token:
                     self._pending_post_out_by_head_token[head_token] = (
