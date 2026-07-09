@@ -126,6 +126,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
     from vllm_ascend.pd_separation_config import PDSeparationConfig
     pd_config = PDSeparationConfig.from_env()
 
+    self.empty_count = 0
     # Edge-cloud PD-separation bidirectional ZMQ channel (edge side).
     self._pp_pd_channel = None
     if pd_enabled and getattr(parallel_config, "is_edge_node", False):
@@ -445,7 +446,7 @@ def _patched_step_with_batch_queue(self):
             scheduler_output.head_token = uuid4().hex
 
 
-        logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0}")
+
 
         # [ascend insert] DECODE_FIRST is published immediately to keep the
         # decode pipeline full; PREFILL_FIRST is delayed via
@@ -454,6 +455,7 @@ def _patched_step_with_batch_queue(self):
             self._maybe_publish_pre_out(scheduler_output)
 
         if scheduler_output.batch_type == BatchType.EMPTY:
+            self.empty_count += 1
             if batch_queue:
                 self._defer_empty_batch(scheduler_output)
                 scheduler_output = None
@@ -461,6 +463,8 @@ def _patched_step_with_batch_queue(self):
                 return self._finish_empty_batch(scheduler_output)
 
         if scheduler_output is not None:
+            logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count}")
+            self.empty_count = 0
             self._merge_pending_worker_cleanup(scheduler_output)
 
             with self.log_error_detail(scheduler_output):
