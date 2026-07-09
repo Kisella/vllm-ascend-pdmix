@@ -451,6 +451,7 @@ def _patched_step_with_batch_queue(self):
             self._maybe_publish_pre_out(scheduler_output)
 
         if scheduler_output.batch_type == BatchType.EMPTY:
+            logger.error(f"schedule EMPTY batch, queue_len={len(batch_queue) if batch_queue else 0}")
             if batch_queue:
                 self._defer_empty_batch(scheduler_output)
                 scheduler_output = None
@@ -517,7 +518,22 @@ def _patched_step_with_batch_queue(self):
     # to execute (rightmost in deque).  FIFO guarantees every PREFILL_FIRST
     # eventually becomes batch_queue[-1] before pop().
     self._publish_pre_out_when_ready()
+
+    queue_types = [
+        so.batch_type.value
+        for _, so, _ in batch_queue
+    ]
+    batch_queue_len =len(batch_queue)
+
     future, scheduler_output, exec_model_fut = batch_queue.pop()
+
+    vllm_logger.error(
+        "[BATCH_QUEUE] Dequeued %s, before pop queue_len=%d, types=%s",
+        scheduler_output.batch_type.value,
+        batch_queue_len,
+        queue_types,
+    )
+
     # [ascend insert] Clean up PRE_OUT tracking for completed batch.
     self._clear_published_pre_out_token(scheduler_output)
     with (

@@ -3,6 +3,7 @@
 import enum
 import os
 import time
+import sys
 from collections import deque
 
 import numpy as np
@@ -198,6 +199,7 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
+            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
@@ -218,6 +220,7 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_first_batch()
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
+            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
 
         # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
@@ -227,6 +230,7 @@ class PDSeparatedScheduler(Scheduler):
             return self._pick_decode_first_batch()
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
+        logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -392,6 +396,7 @@ class PDSeparatedScheduler(Scheduler):
 
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
+                    logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
                     scheduler_output.batch_type = BatchType.EMPTY
                     # No request was actually scheduled this round.
                     # self.running currently holds saved_chunk_prefill_first
@@ -454,6 +459,7 @@ class PDSeparatedScheduler(Scheduler):
         ``update_from_output`` does not double-account them.
         """
         if not self.prefills_last_ready:
+            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
         so = self.prefills_last_ready.popleft()
         assert so.batch_type == BatchType.PREFILL_LAST, (
@@ -495,6 +501,7 @@ class PDSeparatedScheduler(Scheduler):
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:
+            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
         so = self.decodes_last_ready.popleft()
         assert so.batch_type == BatchType.DECODE_LAST, (
@@ -544,6 +551,7 @@ class PDSeparatedScheduler(Scheduler):
 
     def _pick_decode_first_batch(self) -> SchedulerOutput:
         if not self.running:
+            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
 
         saved_chunk_prefill_first = self.chunk_prefill_first
@@ -560,6 +568,7 @@ class PDSeparatedScheduler(Scheduler):
         finally:
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
+                    logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
                     scheduler_output.batch_type = BatchType.EMPTY
                     logger.debug(
                         "DECODE_FIRST race: empty batch due to async "
