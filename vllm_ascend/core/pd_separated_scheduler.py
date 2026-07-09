@@ -199,7 +199,7 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
+            #logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
@@ -220,7 +220,7 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_first_batch()
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
-            logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
+            #logger.error(f"schedule EMPTY batch for {sys._getframe().f_lineno}")
             return self._make_empty_batch()
 
         # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
