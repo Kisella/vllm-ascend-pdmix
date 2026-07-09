@@ -560,7 +560,7 @@ class PassiveEngineCoreProc:
             else:
                 _slice_info_str += "None;"
         _slice_info_str += "]"
-        logger.error(
+        logger.info(
             f"\r\n[Cloud] Step dispatched batch_type: "
             f"{batch.scheduler_output.batch_type}, "
             f"slices_count={len(batch.slices)}, "
@@ -578,7 +578,7 @@ class PassiveEngineCoreProc:
                 else (worker_scheduler_output,)
             )
             bt = batch.scheduler_output.batch_type.value
-            logger.info("[CLOUD-MQ] About to enqueue batch_type=%s", bt)
+
             _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
@@ -587,7 +587,7 @@ class PassiveEngineCoreProc:
                 batch.scheduler_output.num_scheduled_tokens.keys()
             )
             _dt_ms = (time.monotonic() - _t0) * 1000
-            logger.info(
+            logger.error(
                 "[CLOUD-ENQUEUE] %s enqueue took %.3f ms",
                 bt,
                 _dt_ms,
