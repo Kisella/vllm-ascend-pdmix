@@ -463,7 +463,7 @@ def _patched_step_with_batch_queue(self):
                 return self._finish_empty_batch(scheduler_output)
 
         if scheduler_output is not None:
-            logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count}")
+            vllm_logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count}")
             self.empty_count = 0
             self._merge_pending_worker_cleanup(scheduler_output)
 
