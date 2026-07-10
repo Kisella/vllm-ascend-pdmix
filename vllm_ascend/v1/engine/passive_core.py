@@ -581,24 +581,25 @@ class PassiveEngineCoreProc:
             )
             bt = batch.scheduler_output.batch_type.value
 
-            _t0 = time.monotonic()
+            _t0 = time.monotonic() * 1000
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
             self._prev_dispatch_req_ids = set(
                 batch.scheduler_output.num_scheduled_tokens.keys()
             )
-            _dt_ms = (time.monotonic() - _t0) * 1000
+            _t1 = time.monotonic() * 1000
             logger.error(
-                "[CLOUD-ENQUEUE] %s enqueue took %.3f ms",
-                bt,
-                _dt_ms,
+                "[CLOUD-ENQUEUE] %s enqueue took %.3f ms  %f - %f",
+                bt, _t1 - _t0, _t0, _t1,
             )
             # For PREFILL_FIRST, POST_OUT must mean the cloud middle segment
             # has completed and started sending hidden states back.  Store the
             # original SchedulerOutput here and publish it from
             # _drain_worker_completion_acks() after the worker reports done.
-            if (
+            if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
+                self._maybe_publish_post_out(batch.scheduler_output)
+            elif (
                 batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
             ):
