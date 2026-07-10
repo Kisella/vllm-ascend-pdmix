@@ -166,6 +166,7 @@ class PPSchedulerZmqPublisher:
         )
         self._running = True
         self._seq = 0
+        self._last_send_time_ms = time.perf_counter() * 1000.0
 
         # Set up ZMQ PUSH socket
         self._ctx = zmq.Context.instance()
@@ -205,6 +206,10 @@ class PPSchedulerZmqPublisher:
     def _publisher_thread(self) -> None:
         while self._running or self._queue.qsize() > 0:
             try:
+                # Queue depth measured *before* taking an item from the
+                # bridge queue; reflects how backed-up the publisher is
+                # (pending SchedulerOutputs not yet pickled + sent).
+                _queue_depth_before = self._queue.qsize()
                 item = self._queue.get(timeout=0.1)
                 if item is None:
                     break
@@ -220,6 +225,22 @@ class PPSchedulerZmqPublisher:
                     continue
                 seq_bytes = seq.to_bytes(8, "big")
                 self._push.send_multipart((seq_bytes, data))
+                # Send timestamp captured right after the ZMQ send returns;
+                # this is the edge-side departure moment used to correlate
+                # against the cloud-side recv timestamp (wall-clock epoch
+                # ms, not monotonic).
+                _send_time_ms = time.perf_counter() * 1000.0
+                send_diff = _send_time_ms - self._last_send_time_ms
+                self._last_send_time_ms = _send_time_ms
+                logger.error(
+                    "[EDGE-ZMQ-SEND] seq=%d send_time=%.3f ms (epoch ms), "
+                    "batch_type=%s, queue_depth_before_get=%d, send_diff=%.3f ms",
+                    seq,
+                    _send_time_ms,
+                    scheduler_output.batch_type.value,
+                    _queue_depth_before,
+                    send_diff,
+                )
             except queue.Empty:
                 continue
             except Exception:
@@ -262,6 +283,7 @@ class PPSchedulerZmqSubscriber:
         self._pull = self._ctx.socket(zmq.PULL)
         self._pull.set_hwm(1000)
         self._pull.connect(endpoint)
+        self._last_recv_time_ms = time.perf_counter() * 1000.0
 
         logger.info("PP Scheduler ZMQ subscriber connecting to %s", endpoint)
 
@@ -285,6 +307,9 @@ class PPSchedulerZmqSubscriber:
                 # to correlate against the edge-side send timestamp across
                 # machines (wall-clock epoch ms, not monotonic).
                 _recv_time_ms = time.perf_counter() * 1000.0
+                recv_diff = _recv_time_ms - self._last_recv_time_ms
+                self._last_recv_time_ms = _recv_time_ms
+
                 seq = int.from_bytes(seq_bytes, "big")
                 scheduler_output = pickle.loads(data)
                 if scheduler_output.batch_type is BatchType.EMPTY:
@@ -297,11 +322,12 @@ class PPSchedulerZmqSubscriber:
                     self._received_outputs.append((seq, scheduler_output))
                 logger.error(
                     "[CLOUD-ZMQ-RECV] seq=%d recv_time=%.3f ms (epoch ms), "
-                    "batch_type=%s, queue_depth_before_append=%d",
+                    "batch_type=%s, queue_depth_before_append=%d, recv_diff=%.3f ms",
                     seq,
                     _recv_time_ms,
                     scheduler_output.batch_type.value,
                     _queue_depth_before,
+                    recv_diff,
                 )
                 logger.info(
                     "PP rank1 received SchedulerOutput seq=%d, "
