@@ -107,7 +107,7 @@ def _pin_current_thread(env_var: str, label: str) -> None:
         return
     try:
         os.sched_setaffinity(0, cpus)
-        logger.info(
+        logger.error(
             "[%s] thread affinity -> %s (from %s=%s)",
             label,
             sorted(cpus),
