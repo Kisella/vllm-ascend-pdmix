@@ -280,12 +280,29 @@ class PPSchedulerZmqSubscriber:
                 if not self._pull.poll(timeout=100):
                     continue
                 seq_bytes, data = self._pull.recv_multipart()
+                # Capture the receive timestamp immediately after the ZMQ
+                # recv returns; this is the cloud-side arrival moment used
+                # to correlate against the edge-side send timestamp across
+                # machines (wall-clock epoch ms, not monotonic).
+                _recv_time_ms = time.perf_counter() * 1000.0
                 seq = int.from_bytes(seq_bytes, "big")
                 scheduler_output = pickle.loads(data)
                 if scheduler_output.batch_type is BatchType.EMPTY:
                     continue
                 with self._lock:
+                    # Queue depth measured *before* appending the newly
+                    # received output, i.e. how backed-up the receive
+                    # buffer is at arrival time.
+                    _queue_depth_before = len(self._received_outputs)
                     self._received_outputs.append((seq, scheduler_output))
+                logger.error(
+                    "[CLOUD-ZMQ-RECV] seq=%d recv_time=%.3f ms (epoch ms), "
+                    "batch_type=%s, queue_depth_before_append=%d",
+                    seq,
+                    _recv_time_ms,
+                    scheduler_output.batch_type.value,
+                    _queue_depth_before,
+                )
                 logger.info(
                     "PP rank1 received SchedulerOutput seq=%d, "
                     "total_scheduled_tokens=%d, "
