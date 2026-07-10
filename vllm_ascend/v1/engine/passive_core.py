@@ -159,8 +159,9 @@ class PPSchedulerZmqPublisher:
 
     SHUTDOWN_TIMEOUT: float = 2.0
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, name: str = "pp-publisher") -> None:
         self._endpoint = endpoint
+        self._name = name
         self._queue: queue.Queue[Optional[tuple[int, SchedulerOutput]]] = (
             queue.Queue(maxsize=1000)
         )
@@ -197,7 +198,27 @@ class PPSchedulerZmqPublisher:
         try:
             seq = self._seq
             self._seq += 1
+            # Producer-side instrumentation: queue depth right before
+            # enqueue (how full the bridge queue is at put time) and the
+            # put timestamp. Captured immediately before put_nowait, so it
+            # is accurate -- the blocking-get caveat does not apply on the
+            # producer side. perf_counter matches [EDGE-ZMQ-SEND] so
+            # send_time - put_time yields queue dwell time on the same host.
+            _queue_depth_before_put = self._queue.qsize()
+            _put_time_ms = time.perf_counter() * 1000.0
             self._queue.put_nowait((seq, scheduler_output))
+            # Edge-only: publish() is shared with the cloud's POST_OUT
+            # (cloud->edge) direction; instrument just the edge->cloud
+            # (PRE_OUT) put, identified by the channel name.
+            if self._name == "pd-edge":
+                logger.error(
+                    "[EDGE-ZMQ-PUT] seq=%d put_time=%.3f ms, "
+                    "batch_type=%s, queue_depth_before_put=%d",
+                    seq,
+                    _put_time_ms,
+                    scheduler_output.batch_type.value,
+                    _queue_depth_before_put,
+                )
         except queue.Full:
             logger.warning(
                 "PP Scheduler ZMQ publish queue full, dropping message"
@@ -431,7 +452,7 @@ class PPSchedulerZmqChannel:
         # `PPSchedulerZmqPublisher.__init__`); subscriber always connects.
         # The endpoints chosen by the caller therefore fully determine the
         # bind/connect roles of each side.
-        self._publisher = PPSchedulerZmqPublisher(send_endpoint)
+        self._publisher = PPSchedulerZmqPublisher(send_endpoint, name=name)
         self._subscriber = PPSchedulerZmqSubscriber(recv_endpoint)
         logger.info(
             "PPSchedulerZmqChannel[%s] up: send=%s, recv=%s",
