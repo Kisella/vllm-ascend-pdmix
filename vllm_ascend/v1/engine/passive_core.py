@@ -59,6 +59,70 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _pin_current_thread(env_var: str, label: str) -> None:
+    """Pin the calling OS thread to a CPU set read from ``env_var``.
+
+    ``os.sched_setaffinity(0, ...)`` applies to the *calling thread*
+    (pid==0) under Linux semantics, so it neither changes the process-wide
+    mask nor affects sibling threads. This is used to give the PP scheduler
+    subscriber thread a dedicated core so that cross-node ``recv`` + pickle
+    is not delayed by GIL/CPU contention with the busy loop or worker
+    processes -- a direct contributor to the cloud-side
+    ``local_rpc_broadcast_mq.dequeue`` tail latency.
+
+    ``env_var`` accepts numactl-style CPU lists: ``"2"`` / ``"2,3"`` /
+    ``"0-3"``. Unset / empty / unparsable values are a no-op. Select a core
+    that does not overlap any worker's NPU CPU pool (see
+    ``vllm_ascend.cpu_binding``); for hard isolation also use ``isolcpus``.
+    """
+    if not hasattr(os, "sched_setaffinity"):
+        logger.warning(
+            "[%s] os.sched_setaffinity unavailable on this platform; "
+            "skip thread pinning.",
+            label,
+        )
+        return
+    spec = os.environ.get(env_var, "").strip()
+    if not spec:
+        return
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                cpus.update(range(int(a), int(b) + 1))
+            else:
+                cpus.add(int(part))
+        except ValueError:
+            logger.warning(
+                "[%s] ignoring unparsable cpu spec %r from %s",
+                label,
+                part,
+                env_var,
+            )
+    if not cpus:
+        return
+    try:
+        os.sched_setaffinity(0, cpus)
+        logger.info(
+            "[%s] thread affinity -> %s (from %s=%s)",
+            label,
+            sorted(cpus),
+            env_var,
+            spec,
+        )
+    except OSError as e:
+        logger.warning(
+            "[%s] sched_setaffinity(%s) failed: %s",
+            label,
+            sorted(cpus),
+            e,
+        )
+
+
 def _import_passive_scheduler_module():
     """Lazily resolve the PassiveScheduler implementation.
 
@@ -210,6 +274,7 @@ class PPSchedulerZmqSubscriber:
         self._thread.start()
 
     def _subscriber_thread(self) -> None:
+        _pin_current_thread("VLLM_ASCEND_SUB_CPU", "pp-scheduler-zmq-sub")
         while self._running:
             try:
                 if not self._pull.poll(timeout=100):

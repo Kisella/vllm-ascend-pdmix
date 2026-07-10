@@ -385,12 +385,12 @@ class CpuAlloc:
             self.assign_rel[npu] = rel
 
     def print_plan(self) -> None:
-        logger.info("The CPU allocation plan is as follows:")
+        logger.error("The CPU allocation plan is as follows:")
         current_npu = self.device_info.running_npu_list[self.rank_id]
         main = " ".join(map(str, self.assign_main[current_npu]))
         acl = " ".join(map(str, self.assign_acl[current_npu]))
         rel = str(self.assign_rel[current_npu]) if self.assign_rel[current_npu] else ""
-        logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
+        logger.error("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
 
     def bind_memory(self, pid: str, npu: int) -> None:
         def _get_npu_numa_node(npu_id: int) -> int | None:
