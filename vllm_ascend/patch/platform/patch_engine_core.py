@@ -498,6 +498,9 @@ def _patched_step_with_batch_queue(self):
 
             if not deferred_scheduler_output:
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                # [ascend insert] Publish PRE_OUT only when the oldest
+                # head segment becomes next to execute (rightmost in deque).
+                self._publish_pre_out_when_ready()
                 # [ascend insert] Log batch_queue contents for debugging.
                 queue_types = [
                     so.batch_type.value
@@ -518,12 +521,6 @@ def _patched_step_with_batch_queue(self):
 
     elif not batch_queue:
         return None, False
-
-    # Block until the next result is available.
-    # [ascend insert] Publish PRE_OUT for the head segment that is about
-    # to execute (rightmost in deque).  FIFO guarantees every PREFILL_FIRST
-    # eventually becomes batch_queue[-1] before pop().
-    self._publish_pre_out_when_ready()
 
     queue_types = [
         so.batch_type.value
