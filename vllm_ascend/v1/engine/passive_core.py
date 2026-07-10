@@ -206,13 +206,16 @@ class PPSchedulerZmqPublisher:
     def _publisher_thread(self) -> None:
         while self._running or self._queue.qsize() > 0:
             try:
-                # Queue depth measured *before* taking an item from the
-                # bridge queue; reflects how backed-up the publisher is
-                # (pending SchedulerOutputs not yet pickled + sent).
-                _queue_depth_before = self._queue.qsize()
                 item = self._queue.get(timeout=0.1)
                 if item is None:
                     break
+                # get() blocks until an item is available, so sampling
+                # qsize() *before* it would only ever see the post-drain
+                # empty state (always 0). Sample *after* get() returns: the
+                # item is now removed, so qsize() is the count still waiting
+                # behind this one; +1 recovers the depth that existed the
+                # instant before this item was taken.
+                _queue_depth_before = self._queue.qsize() + 1
                 seq, scheduler_output = item
                 try:
                     data = pickle.dumps(
