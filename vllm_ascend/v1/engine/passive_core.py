@@ -756,6 +756,18 @@ class PassiveEngineCoreProc:
         )
         decorate_logs()
 
+        # [CPU pinning A] Pin this PassiveEngineCore process to a set of
+        # "control cores" before any worker/subscriber is spawned. Because
+        # sched_setaffinity(0) sets the calling (main) thread's mask and
+        # every later thread/child inherits it, this keeps the producer-side
+        # busy loop and the subscriber thread off the workers' NPU cores.
+        # Spawned workers re-pin themselves to NPU pools via
+        # AscendWorker.bind_cpus, so the inherited mask is only a transient
+        # startup constraint for them. VLLM_ASCEND_CTRL_CPUS uses the same
+        # CPU-list syntax as VLLM_ASCEND_SUB_CPU; pick cores that overlap no
+        # worker NPU pool, and pick VLLM_ASCEND_SUB_CPU from within this set.
+        _pin_current_thread("VLLM_ASCEND_CTRL_CPUS", "passive-engine-core")
+
         # Cloud-side PD-separation channel is constructed inside the try
         # block below (depends on `vllm_config`); declared here so the
         # `finally` clean-up can reference it unconditionally.
