@@ -129,7 +129,6 @@ def _patched_engine_core_init(self, *args, **kwargs):
     pd_config = PDSeparationConfig.from_env()
 
     self.empty_count = 0
-    self.scheduler_time = time.perf_counter()
     
     # Edge-cloud PD-separation bidirectional ZMQ channel (edge side).
     self._pp_pd_channel = None
@@ -373,8 +372,6 @@ def _patched_step_with_batch_queue(self):
         self._drain_pd_channel_inbox()
 
         scheduler_output = self.scheduler.schedule()
-        scheduler_diff_time = time.perf_counter() - self.scheduler_time
-        self.scheduler_time = time.perf_counter()
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
@@ -400,7 +397,7 @@ def _patched_step_with_batch_queue(self):
                 return self._finish_empty_batch(scheduler_output)
 
         if scheduler_output is not None:
-            vllm_logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count} scheduler_diff_time={scheduler_diff_time}")
+            vllm_logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count}")
             self.empty_count = 0
             self._merge_pending_worker_cleanup(scheduler_output)
 
@@ -415,15 +412,18 @@ def _patched_step_with_batch_queue(self):
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
+                vllm_logger.error(f"111 batch_type: {scheduler_output.batch_type.value}")
                 future = cast(Future[ModelRunnerOutput], exec_future)
             elif not self._needs_sample_tokens(scheduler_output):
                 # [ascend insert] Edge-cloud head segment (PF/DF): sampling is
                 # done in the tail segment (PL/DL) after the cloud returns
                 # intermediate tensors. Skip sample_tokens for the head
                 # segment.
+                vllm_logger.error(f"222 batch_type: {scheduler_output.batch_type.value}")
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
+                    vllm_logger.error(f"333 batch_type: {scheduler_output.batch_type.value}")
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
@@ -431,6 +431,7 @@ def _patched_step_with_batch_queue(self):
                         grammar_output, non_block=True
                     )
                 else:
+                    vllm_logger.error(f"444 batch_type: {scheduler_output.batch_type.value}")
                     deferred_scheduler_output = scheduler_output
 
             if not deferred_scheduler_output:
@@ -451,6 +452,7 @@ def _patched_step_with_batch_queue(self):
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
+                    vllm_logger.error(f"return model_executed batch_type: {scheduler_output.batch_type.value} len(batch_queue) {len(batch_queue)} batch_queue[-1][0].done() {batch_queue[-1][0].done()}")
                     return None, True
 
     elif not batch_queue:
