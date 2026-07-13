@@ -450,9 +450,8 @@ def _patched_step_with_batch_queue(self):
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
                 ):
-                    vllm_logger.error(f"return model_executed batch_type: {scheduler_output.batch_type.value} len(batch_queue) {len(batch_queue)} batch_queue[-1][0].done() {batch_queue[-1][0].done()}")
+                    vllm_logger.error(f"return model_executed batch_type: {scheduler_output.batch_type.value} len(batch_queue) self.batch_queue_size={self.batch_queue_size} {len(batch_queue)} batch_queue[-1][0].done() {batch_queue[-1][0].done()}")
                     return None, True
 
     elif not batch_queue:
