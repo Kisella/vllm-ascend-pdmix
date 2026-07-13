@@ -127,6 +127,8 @@ def _patched_engine_core_init(self, *args, **kwargs):
     pd_config = PDSeparationConfig.from_env()
 
     self.empty_count = 0
+    self.scheduler_time = time.perf_counter()
+    
     # Edge-cloud PD-separation bidirectional ZMQ channel (edge side).
     self._pp_pd_channel = None
     if pd_enabled and getattr(parallel_config, "is_edge_node", False):
@@ -369,6 +371,8 @@ def _patched_step_with_batch_queue(self):
         self._drain_pd_channel_inbox()
 
         scheduler_output = self.scheduler.schedule()
+        scheduler_diff_time = time.perf_counter() - self.scheduler_time
+        self.scheduler_time = time.perf_counter()
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
@@ -394,7 +398,7 @@ def _patched_step_with_batch_queue(self):
                 return self._finish_empty_batch(scheduler_output)
 
         if scheduler_output is not None:
-            vllm_logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count}")
+            vllm_logger.error(f"schedule batch_type {scheduler_output.batch_type.value} queue_len={len(batch_queue) if batch_queue else 0} empty_count={self.empty_count} scheduler_diff_time={scheduler_diff_time}")
             self.empty_count = 0
             self._merge_pending_worker_cleanup(scheduler_output)
 
