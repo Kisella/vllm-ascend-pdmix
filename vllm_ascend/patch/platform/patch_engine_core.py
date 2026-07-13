@@ -63,6 +63,8 @@ source and re-apply the dest-only inserts.
 """
 from __future__ import annotations
 
+import time
+
 import functools
 from concurrent.futures import Future
 from typing import cast
