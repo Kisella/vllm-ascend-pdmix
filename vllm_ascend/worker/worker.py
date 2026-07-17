@@ -238,6 +238,16 @@ class NPUWorker(WorkerBase):
             used_bytes / GiB_bytes,
         )
 
+    def _pp_timing(self, stage: str, sync_npu: bool = False) -> None:
+        import time
+        from vllm_ascend.utils import pp_timing_enabled, should_pp_timing_sync
+
+        if not pp_timing_enabled():
+            return
+        if sync_npu and should_pp_timing_sync():
+            torch.npu.synchronize()
+        print(f"[PP_TIMING][{stage}] {time.perf_counter()}")
+
     def wake_up(self, tags: list[str] | None = None) -> None:
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
@@ -601,6 +611,7 @@ class NPUWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # enable msMonitor to monitor the performance of vllm-ascend
+        self._pp_timing("execute_model enter", True)
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
 
@@ -631,7 +642,9 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        self._pp_timing("model runner execute_model start", True)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        self._pp_timing("model runner execute_model end", True)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -659,6 +672,7 @@ class NPUWorker(WorkerBase):
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        self._pp_timing("execute_model exit", True)
         return output
 
     @torch.inference_mode()
