@@ -64,19 +64,19 @@ source and re-apply the dest-only inserts.
 from __future__ import annotations
 
 import functools
+import time
+from collections import deque
 from concurrent.futures import Future
 from typing import cast
 from uuid import uuid4
 
 from vllm.config import ParallelConfig
-from vllm.logger import init_logger, logger as vllm_logger
+from vllm.logger import logger
 from vllm.v1.core.sched.output import BatchType, SchedulerOutput
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_ascend.v1.engine.passive_core import PPSchedulerZmqChannel
-
-logger = init_logger(__name__)
 
 
 # Idempotency guard: re-importing this module (e.g. from a child process)
@@ -169,6 +169,50 @@ def _patched_engine_core_init(self, *args, **kwargs):
             pre_out, post_out, cloud_addr,
         )
 
+    # [EHER §十五] Edge hidden early-receive + P-tail gating flags.  Read from
+    # additional_config directly (same source as the worker's
+    # _edge_hidden_early_recv_enabled), not from scheduler_config -- on the edge
+    # EngineCore the platform's _configure_pd_separation_scheduler may not have
+    # run yet, so getattr would silently return the default (off).  The pd obj
+    # is already resolved above (edge_cloud.pd_separation).
+    if pd_enabled and getattr(parallel_config, "is_edge_node", False):
+        _pd = edge_cloud.pd_separation
+        _eher = _pd.enable_edge_hidden_early_recv
+        _eher_gating = _pd.enable_edge_hidden_early_recv_gating and _eher
+        self._eher_enabled = _eher
+        self._eher_gating_enabled = _eher_gating
+        self._ha_fallback_timeout_ms = _pd.ha_fallback_timeout_ms
+    else:
+        self._eher_enabled = False
+        self._eher_gating_enabled = False
+        self._ha_fallback_timeout_ms = 500.0
+    # Gating pending set + ack-ready set (populated by _drain_ha_acks_edge).
+    self._prefills_last_ha_pending: deque = deque()
+    self._prefills_last_ha_pending_ts: dict[str, float] = {}
+    self._ha_ready_head_tokens: set[str] = set()
+    self._recv_hint_sent: set[str] = set()
+    if self._eher_enabled:
+        logger.info(
+            "[EHER] edge hidden early-receive enabled on EngineCore "
+            "(gating=%s, fallback_timeout_ms=%.0f)",
+            self._eher_gating_enabled, self._ha_fallback_timeout_ms,
+        )
+    else:
+        _pd_eher_val = "N/A"
+        if pd_enabled and edge_cloud is not None:
+            _pd = getattr(edge_cloud, "pd_separation", None)
+            if _pd is not None:
+                _pd_eher_val = str(
+                    getattr(_pd, "enable_edge_hidden_early_recv", "N/A")
+                )
+        logger.info(
+            "[EHER] edge hidden early-receive DISABLED on EngineCore "
+            "(pd_enabled=%s, is_edge=%s, enable_edge_hidden_early_recv=%s)",
+            pd_enabled,
+            getattr(parallel_config, "is_edge_node", False),
+            _pd_eher_val,
+        )
+
 
 # =======================================================================#
 # Three helper methods bound on EngineCore. Mirror the dest fork.         #
@@ -176,8 +220,68 @@ def _patched_engine_core_init(self, *args, **kwargs):
 def _drain_pd_channel_inbox(self) -> None:
     """Move cloud-returned SchedulerOutputs into the local PDSeparated
     scheduler's ``prefills_last_ready`` / ``decodes_last_ready`` queues.
+
+    [EHER §十五] When P-tail gating is on, a PREFILL_LAST is NOT scheduled
+    immediately: it is parked in ``_prefills_last_ha_pending`` and a recv-hint
+    is fired so the edge worker posts the cloud->edge hidden irecv early.  The
+    P-tail is unlocked for scheduling only after the early-recv ack arrives
+    (``_unlock_prefills_last_with_ha``), or after the fallback timeout.  Decode
+    tails and the non-gating baseline path are unchanged.
     """
+    # Lazy EHER init: _patched_engine_core_init may not have run (import-order
+    # race between vllm-ascend patch install and EngineCore instantiation on the
+    # edge).  Resolve the EHER flags directly from additional_config on the
+    # first call so the function is self-sufficient — the init block in
+    # _patched_engine_core_init is a best-effort early setup, not a hard
+    # dependency.
+    if not hasattr(self, "_eher_enabled"):
+        self._eher_enabled = False
+        self._eher_gating_enabled = False
+        self._ha_fallback_timeout_ms = 500.0
+        self._prefills_last_ha_pending = deque()
+        self._prefills_last_ha_pending_ts = {}
+        self._ha_ready_head_tokens = set()
+        self._recv_hint_sent = set()
+        try:
+            _ac = (
+                getattr(self.vllm_config, "additional_config", None) or {}
+            )
+            _ec = _ac.get("edge_cloud_config", {}) if isinstance(_ac, dict) else {}
+            _pd_cfg = _ec.get("pd_separation", {}) if isinstance(_ec, dict) else {}
+            _pc = self.vllm_config.parallel_config
+            if (
+                _pd_cfg.get("enabled", False)
+                and getattr(_pc, "is_edge_node", False)
+            ):
+                self._eher_enabled = bool(
+                    _pd_cfg.get("enable_edge_hidden_early_recv", False)
+                )
+                self._eher_gating_enabled = bool(
+                    _pd_cfg.get(
+                        "enable_edge_hidden_early_recv_gating", True
+                    )
+                ) and self._eher_enabled
+                self._ha_fallback_timeout_ms = float(
+                    _pd_cfg.get("ha_fallback_timeout_ms", 500.0)
+                )
+            logger.info(
+                "[EHER] init (lazy from additional_config): "
+                "enabled=%s gating=%s fallback_ms=%.0f",
+                self._eher_enabled,
+                self._eher_gating_enabled,
+                self._ha_fallback_timeout_ms,
+            )
+        except Exception:
+            logger.exception(
+                "[EHER] lazy-init failed; EHER disabled"
+            )
+
     if getattr(self, "_pp_pd_channel", None) is None:
+        # Still run the EHER drain/unlock so any acks received before the channel
+        # is torn down do not strand gated P-tails.
+        if getattr(self, "_eher_gating_enabled", False):
+            self._drain_ha_acks_edge()
+            self._unlock_prefills_last_with_ha()
         return
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
@@ -190,7 +294,24 @@ def _drain_pd_channel_inbox(self) -> None:
         bt = so.batch_type
         logger.info(f"Received scheduler_output from cloud, batch_type: {bt}")
         if bt == BatchType.PREFILL_LAST:
-            self.scheduler.prefills_last_ready.append(so)
+            if getattr(self, "_eher_enabled", False) and getattr(
+                so, "head_token", None
+            ):
+                if getattr(self, "_eher_gating_enabled", False):
+                    # Gating on: park in pending + fire hint; unlock on ack.
+                    self._enqueue_prefill_last_ha_pending(so)
+                else:
+                    # early-recv on, gating off: fire the hint (guard thread
+                    # posts the irecv early) but keep the P-tail immediately
+                    # schedulable.  This is the EHER baseline (mirrors CHER's
+                    # non-gating cloud path): overlap the transfer with prior
+                    # edge work without gating the schedule.  Lets a gating
+                    # regression be isolated from the early-recv benefit.
+                    self._send_eher_recv_hint(so)
+                    self.scheduler.prefills_last_ready.append(so)
+            else:
+                # EHER off / no head_token -> fully baseline (sync recv).
+                self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
         elif bt == BatchType.DRAFT_LAST:
@@ -210,6 +331,163 @@ def _drain_pd_channel_inbox(self) -> None:
                 "Dropping.",
                 bt.value if bt is not None else "<none>",
             )
+
+    # [EHER §十五.3] After draining POST_OUT, drain acks and unlock gated
+    # P-tails whose hidden has arrived (or whose fallback timeout elapsed).
+    if getattr(self, "_eher_gating_enabled", False):
+        self._drain_ha_acks_edge()
+        self._unlock_prefills_last_with_ha()
+
+
+def _enqueue_prefill_last_ha_pending(self, scheduler_output: SchedulerOutput) -> None:
+    """Park a PREFILL_LAST in the gating pending set + fire its recv-hint.
+
+    Idempotent on head_token: a duplicate POST_OUT (rare, e.g. ZMQ redelivery)
+    does not double-enqueue.  The hint is fire-and-forget with timeout=0: if
+    the guard thread's sideband MQ is full/slow we DROP the hint (mirrors the
+    CHER rationale in passive_core.py) -- busy_loop then posts the irecv itself
+    via get_or_post_early_recv, losing only the early-post overlap, never
+    correctness.  The ack will still fire once that irecv completes.
+
+    [Why PDSeparatedScheduler is NOT modified]
+    The scheduler selects a P-tail solely by ``prefills_last_ready.popleft()``
+    (pd_separated_scheduler.py:535 / :544).  Gating adds a precondition on *who
+    enters* that queue: a gated PREFILL_LAST sits here (not in
+    ``prefills_last_ready``) until its ack arrives, then
+    ``_unlock_prefills_last_with_ha`` moves it in.  The scheduler's selection
+    logic, priority order (LOW: P首 > D尾 > D首 > P尾 > Empty), and
+    ``prefill_inflight_count`` state machine (incremented at P首 dispatch
+    :778, decremented at P尾 completion :1336) are all untouched --
+    ``_prefills_last_ha_pending`` is a third, independent state.  While a
+    P-tail is gated (absent from prefills_last_ready) the scheduler naturally
+    falls back to P首 / D首 / D尾 / Empty, which is exactly the bubble-fill we
+    want.  Gating delays P-tail execution and hence the hidden-channel
+    release (``release_prefill`` :1338), but that channel would be occupied
+    for the same duration by a synchronous recv on a non-gated P-tail, so no
+    new deadlock window is introduced.
+    """
+    ht = scheduler_output.head_token
+    if ht is None:
+        # No head_token -> cannot gate; fall back to immediate scheduling.
+        self.scheduler.prefills_last_ready.append(scheduler_output)
+        return
+    if ht in self._prefills_last_ha_pending_ts:
+        # Already pending (duplicate POST_OUT) -> do not re-enqueue/re-hint.
+        return
+    self._prefills_last_ha_pending.append(scheduler_output)
+    self._prefills_last_ha_pending_ts[ht] = time.monotonic()
+    self._send_eher_recv_hint(scheduler_output)
+
+
+def _send_eher_recv_hint(self, scheduler_output: SchedulerOutput) -> None:
+    """Fire a recv-hint so the edge worker guard thread posts the cloud->edge
+    hidden irecv early.  Idempotent on head_token via ``_recv_hint_sent``.
+
+    Called by both the gating path (``_enqueue_prefill_last_ha_pending``) and
+    the non-gating early-recv path, so the hint/early-post overlap is present
+    regardless of whether scheduling is gated.  Fire-and-forget with timeout=0:
+    on a full/slow sideband MQ the hint is DROPPED (busy_loop then posts the
+    irecv itself via get_or_post_early_recv) -- loses only the overlap, never
+    correctness.
+    """
+    ht = scheduler_output.head_token
+    if ht is None or ht in self._recv_hint_sent:
+        return
+    _channel = getattr(scheduler_output, "hidden_channel", None)
+    _hint = {
+        "head_token": ht,
+        "hidden_channel": (_channel.value if _channel is not None else None),
+        "num_tokens": scheduler_output.total_num_scheduled_tokens,
+        # direction tag is informational only (logs); start_early_irecv ignores it.
+        "direction": "cloud_to_edge",
+    }
+    _hint_mq = getattr(self.model_executor, "edge_recv_hint_mq", None)
+    if _hint_mq is not None:
+        try:
+            _hint_mq.enqueue((b"pp_recv_hint", (_hint,), {}, None), timeout=0)
+            self._recv_hint_sent.add(ht)
+            logger.info(
+                "[EHER] send recv-hint head_token=%s channel=%s gating=%s",
+                ht, _hint["hidden_channel"],
+                getattr(self, "_eher_gating_enabled", False),
+            )
+        except Exception:
+            # MQ full/torn-down -> hint dropped; busy_loop will post the irecv
+            # itself when the (gated) P-tail eventually runs (after unlock, or
+            # immediately in the non-gating path).
+            logger.debug(
+                "[EHER] recv-hint dropped for head_token=%s "
+                "(guard MQ full/down); will fallback to sync post", ht,
+            )
+    else:
+        logger.debug(
+            "[EHER] no edge_recv_hint_mq; head_token=%s gated on timeout only",
+            ht,
+        )
+
+
+def _drain_ha_acks_edge(self) -> None:
+    """Drain the ha_ack sideband MQ (guard thread -> edge EngineCore)."""
+    _ack_mq = getattr(self.model_executor, "ha_ack_mq", None)
+    if _ack_mq is None:
+        return
+    while True:
+        try:
+            _method, _args, _kw, _out = _ack_mq.dequeue(timeout=0)
+        except TimeoutError:
+            break
+        except Exception:
+            logger.exception("[EHER] ha_ack dequeue error")
+            break
+        if _method != b"ha_ack" or not _args:
+            continue
+        _ack = _args[0]
+        _ht = _ack.get("head_token") if isinstance(_ack, dict) else None
+        if _ht is None:
+            continue
+        self._ha_ready_head_tokens.add(_ht)
+        _enq_ts = self._prefills_last_ha_pending_ts.get(_ht)
+        if _enq_ts is not None:
+            logger.info(
+                "[EHER] ha_ack received head_token=%s ready_after_ms=%.1f",
+                _ht, (time.monotonic() - _enq_ts) * 1000.0,
+            )
+
+
+def _unlock_prefills_last_with_ha(self) -> None:
+    """Move gated P-tails whose ack arrived (or whose timeout elapsed) into
+    ``prefills_last_ready`` so the scheduler may pick them."""
+    if not self._prefills_last_ha_pending:
+        return
+    ready: list[SchedulerOutput] = []
+    for so in list(self._prefills_last_ha_pending):
+        ht = so.head_token
+        if ht in self._ha_ready_head_tokens:
+            ready.append(so)
+    for so in ready:
+        self.scheduler.prefills_last_ready.append(so)
+        self._ha_ready_head_tokens.discard(so.head_token)
+        self._prefills_last_ha_pending_ts.pop(so.head_token, None)
+        self._prefills_last_ha_pending.remove(so)
+
+    # Fallback: force-unlock any P-tail whose ack never arrived (guard thread
+    # dead / hint dropped / HCCL is_completed() never observed).  Prevents
+    # deadlock.  The worker then posts+waits the irecv synchronously in
+    # _execute_model_edge_tail (EHER fallback), so results stay correct.
+    now = time.monotonic()
+    for so in list(self._prefills_last_ha_pending):
+        ht = so.head_token
+        _enq_ts = self._prefills_last_ha_pending_ts.get(ht, now)
+        elapsed_ms = (now - _enq_ts) * 1000.0
+        if elapsed_ms > self._ha_fallback_timeout_ms:
+            logger.warning(
+                "[EHER] gating fallback: head_token=%s ack timeout %.0fms, "
+                "force-unlock (worker will sync-recv)", ht, elapsed_ms,
+            )
+            self.scheduler.prefills_last_ready.append(so)
+            self._prefills_last_ha_pending.remove(so)
+            self._prefills_last_ha_pending_ts.pop(ht, None)
+            self._ha_ready_head_tokens.discard(ht)
 
 
 def _maybe_publish_pre_out(
@@ -777,7 +1055,7 @@ def _patched_step_with_batch_queue(self):
             so.batch_type.value
             for _, so, _ in batch_queue
         ]
-        vllm_logger.info(
+        logger.info(
             "[BATCH_QUEUE] Enqueued %s, queue_len=%d, types=%s",
             scheduler_output.batch_type.value,
             len(batch_queue),
@@ -995,6 +1273,10 @@ def install() -> None:
 
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
+    EngineCore._enqueue_prefill_last_ha_pending = _enqueue_prefill_last_ha_pending
+    EngineCore._send_eher_recv_hint = _send_eher_recv_hint
+    EngineCore._drain_ha_acks_edge = _drain_ha_acks_edge
+    EngineCore._unlock_prefills_last_with_ha = _unlock_prefills_last_with_ha
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._release_deferred_draft_pre_out = (
         _release_deferred_draft_pre_out

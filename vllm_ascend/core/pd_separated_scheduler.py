@@ -330,7 +330,7 @@ class PDSeparatedScheduler(Scheduler):
         # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
         # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
         self._decode_or_draft_first_only_start_ts: float | None = None
-        self._decode_or_draft_first_only_window_ms: int = 10
+        self._decode_or_draft_first_only_window_ms: int = 30
 
         # [MTP] DRAFT_LAST delay scheduling (mirrors decode_last_delay).
         self._draft_last_delay_start_ts: float | None = None
@@ -695,7 +695,7 @@ class PDSeparatedScheduler(Scheduler):
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: P首 > Draft尾 > Draft首 > D尾 > D首 > P尾 > Empty
+            # LOW: chunk/P首(when slot available) > P尾 > Draft尾 > Draft首 > D尾 > D首 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -706,6 +706,8 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            if self.prefills_last_ready:
+                return self._pick_prefill_last_batch()
             if self.drafts_last_ready and self._can_schedule_draft_last():
                 return self._pick_draft_last_batch()
             if self._can_schedule_draft_first():
@@ -714,11 +716,11 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            if self.prefills_last_ready:
-                return self._pick_prefill_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: Draft尾 > Draft首 > D尾 > D首 > P尾 > Empty
+        # HIGH: P尾 > Draft尾 > Draft首 > D尾 > D首 > Empty. New P首 is forbidden.
+        if self.prefills_last_ready:
+            return self._pick_prefill_last_batch()
         if self.drafts_last_ready and self._can_schedule_draft_last():
             return self._pick_draft_last_batch()
         if self._can_schedule_draft_first():
@@ -727,8 +729,6 @@ class PDSeparatedScheduler(Scheduler):
             return self._pick_decode_last_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
-        if self.prefills_last_ready:
-            return self._pick_prefill_last_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
