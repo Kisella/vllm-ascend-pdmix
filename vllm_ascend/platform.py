@@ -308,6 +308,21 @@ class NPUPlatform(Platform):
             pd.max_chunk_prefill_ahead
         )
 
+        # [EHER] Edge-side hidden early-receive + P-tail gating flags. These
+        # are read by the edge EngineCore (patch_engine_core) to decide whether
+        # a PREFILL_LAST is gated behind an early-recv ack, and by the edge
+        # executor/worker to build the sideband hint/ack MQs and start the
+        # guard thread. See 边侧hidden支持提前收.md §十五.
+        scheduler_config.pd_enable_edge_hidden_early_recv = (
+            pd.enable_edge_hidden_early_recv
+        )
+        scheduler_config.pd_enable_edge_hidden_early_recv_gating = (
+            pd.enable_edge_hidden_early_recv_gating
+        )
+        scheduler_config.pd_ha_fallback_timeout_ms = (
+            pd.ha_fallback_timeout_ms
+        )
+
         if getattr(scheduler_config, "async_scheduling", False):
             scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.pd_separated_scheduler.AsyncPDSeparatedScheduler"

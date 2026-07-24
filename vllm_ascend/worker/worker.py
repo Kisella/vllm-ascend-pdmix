@@ -212,6 +212,11 @@ class NPUWorker(WorkerBase):
         # Prevents the guard thread from posting a duplicate (orphan) irecv
         # when its hint arrives after busy_loop already posted its own.
         self._early_recv_consumed: set[str] = set()
+        # [EHER §十五.4] head_tokens whose early-recv has been observed
+        # complete by the guard thread's non-blocking is_completed() probe.
+        # The guard thread posts a ha_ack once and marks the token here so it
+        # is never re-acked.  Read under _early_recv_lock.
+        self._early_recv_acked: set[str] = set()
         # Whether cloud-side hidden early-receive (CHER) is active on this
         # worker.  CHER is a built-in part of PD-separation masking, so on a
         # PD-separated cloud worker (local_rank==0) this is always True; False
@@ -473,6 +478,31 @@ class NPUWorker(WorkerBase):
                     "[CHER] cloud hidden early-receive enabled on worker "
                     "rank=%s", getattr(self, "rank", "?"),
                 )
+            # [EHER] Edge-side hidden early-receive mirror.  Same conditions as
+            # CHER but on the edge role: only local_rank==0 (PP-NPU0, the rank
+            # issuing the cross-node irecv/isend) participates.  Read from the
+            # same additional_config source so it is stable across processes
+            # (see 边侧hidden支持提前收.md §5.3 / §十五).  Gating is an EngineCore-
+            # side concern; the worker only needs to know early-recv is on so it
+            # consumes cached entries instead of always sync-recv'ing.
+            self._edge_hidden_early_recv_enabled = bool(
+                getattr(_pc, "enable_edge_cloud", False)
+                and getattr(_pc, "is_edge_node", True)
+                and _pd.get("enabled", False)
+                and _pd.get("enable_edge_hidden_early_recv", False)
+                and self.local_rank == 0
+            )
+            if self._edge_hidden_early_recv_enabled:
+                # Edge early-recv cache cap mirrors the cloud's empirical cap:
+                # the guard posts one P-tail irecv at a time and busy_loop
+                # consumes it before the next is posted.
+                self._early_recv_max_inflight = max(
+                    getattr(self, "_early_recv_max_inflight", 0), 1
+                )
+                logger.info(
+                    "[EHER] edge hidden early-receive enabled on worker "
+                    "rank=%s", getattr(self, "rank", "?"),
+                )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -731,6 +761,48 @@ class NPUWorker(WorkerBase):
         with self._early_recv_lock:
             self._early_recv_handles.pop(head_token, None)
             self._early_recv_consumed.discard(head_token)
+            self._early_recv_acked.discard(head_token)
+
+    def test_unacked_early_recv(self) -> list[tuple[str, AsyncIntermediateTensors]]:
+        """[EHER §十五.4] Non-blocking completion probe for gated P-tails.
+
+        Returns ``(head_token, entry)`` pairs whose early-recv HCCL handles are
+        all ``is_completed()`` AND not yet acked.  The guard thread calls this
+        to detect that a gated P-tail's hidden has arrived *without blocking*
+        (it must NOT call ``wait()``: HCCL does not tolerate a cross-thread
+        ``wait()`` on a hidden-channel irecv while busy_loop issues an isend on
+        that same channel -- see ``_early_recv_guard_loop`` docstring; the
+        non-blocking ``is_completed()`` probe does not block the isend).
+
+        Snapshot taken under the lock; the guard thread processes each pair
+        then calls :meth:`mark_early_recv_acked`.  An entry that busy_loop
+        already consumed (popped from ``_early_recv_handles``) is silently
+        absent from the snapshot, so the guard never acks a stale handle.
+
+        Completion semantics: ``is_completed()`` may return False while the
+        work is still in flight, and there is no entry until the guard has
+        posted the irecv -- so a gated P-tail simply stays gated until the
+        next probe round observes completion.  This is the intended gating
+        behaviour (P-tail waits for hidden arrival).
+        """
+        ready: list[tuple[str, AsyncIntermediateTensors]] = []
+        with self._early_recv_lock:
+            for ht, entry in self._early_recv_handles.items():
+                if ht in self._early_recv_acked:
+                    continue
+                handles = getattr(entry, "_comm_handles", None) or []
+                if not handles:
+                    # No comm handles (e.g. empty recv) -> treat as completed.
+                    ready.append((ht, entry))
+                    continue
+                if all(h.is_completed() for h in handles):
+                    ready.append((ht, entry))
+        return ready
+
+    def mark_early_recv_acked(self, head_token: str) -> None:
+        """Mark an early-recv as acked so it is not re-probed/re-acked."""
+        with self._early_recv_lock:
+            self._early_recv_acked.add(head_token)
 
     def _all_gather_tensor_dict(
         self,
@@ -881,24 +953,62 @@ class NPUWorker(WorkerBase):
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
-        tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-            num_tokens=scheduler_output.total_num_scheduled_tokens,
-            channel=channel,
-            sp_chunk=edge_sp and edge_merge,
-        )
-        logger.info(f"Receive intermediate tensors from cloud after, hidden_channel: {channel.value}")
-
-        if edge_sp and not edge_merge:
-            tensor_dict = {
-                k: sequence_parallel_chunk(v)
-                for k, v in tensor_dict.items()
-            }
-
-        intermediate_tensors = AsyncIntermediateTensors(
-            tensor_dict,
-            comm_handles=comm_handles,
-            comm_postprocess=comm_postprocess,
-        )
+        # [EHER] Consume the guard thread's early-recv entry if present (the
+        # irecv was posted ahead of this P-tail's execution), else post+wait
+        # inline.  get_or_post_early_recv guarantees exactly one irecv per
+        # head_token (no double-post deadlock) and falls back to a synchronous
+        # recv semantics via wait_for_comm when the entry is missing.  When EHER
+        # is off, head_token is ignored and we fall through to sync recv.
+        ht = getattr(scheduler_output, "head_token", None)
+        entry = None
+        if (
+            getattr(self, "_edge_hidden_early_recv_enabled", False)
+            and ht
+            and scheduler_output.batch_type == BatchType.PREFILL_LAST
+        ):
+            try:
+                entry = self.get_or_post_early_recv(
+                    ht, channel, scheduler_output.total_num_scheduled_tokens,
+                )
+            except Exception:
+                logger.exception(
+                    "[EHER] get_or_post_early_recv failed head_token=%s; "
+                    "falling back to sync recv", ht,
+                )
+                entry = None
+        if entry is not None:
+            # Early-recv posted: wait_for_comm() runs handle.wait()+postprocess
+            # (lazy on first .tensors access, or explicit here).  Under gating
+            # the ack already fired when is_completed() returned True, so this
+            # wait is typically a no-op (already complete).
+            entry.wait_for_comm()
+            intermediate_tensors = entry
+            logger.info(
+                "[EHER] consume early-recv head_token=%s channel=%s",
+                ht, channel.value,
+            )
+        else:
+            # Fallback: EHER off / hint not yet processed / guard thread down
+            # -> synchronous recv (equivalent to the pre-EHER path).
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                channel=channel,
+                sp_chunk=edge_sp and edge_merge,
+            )
+            if edge_sp and not edge_merge:
+                tensor_dict = {
+                    k: sequence_parallel_chunk(v)
+                    for k, v in tensor_dict.items()
+                }
+            intermediate_tensors = AsyncIntermediateTensors(
+                tensor_dict,
+                comm_handles=comm_handles,
+                comm_postprocess=comm_postprocess,
+            )
+            logger.info(
+                "Receive intermediate tensors from cloud after (sync), "
+                "hidden_channel: %s", channel.value,
+            )
 
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,

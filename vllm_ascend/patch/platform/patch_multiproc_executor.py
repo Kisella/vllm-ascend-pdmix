@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import pickle
+import tempfile
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -30,6 +31,56 @@ from vllm.v1.executor.multiproc_executor import (
 # make_worker_process/WorkerProc.__init__ signatures.  Fork inherits env
 # directly; spawn gets it via the env copied at process start.
 _CLOUD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_CLOUD_RECV_HINT_MQ_HANDLE"
+
+# [EHER] Sideband MQs on the EDGE executor (mirrors CHER's cloud side):
+#   edge_recv_hint_mq : edge EngineCore -> edge worker guard thread (recv-hints)
+#                     Follows the CHER pattern: executor=writer, worker=reader.
+#   ha_ack_mq          : edge worker guard thread -> edge EngineCore (recv-done acks)
+#                     Direction is REVERSED (worker writes, EngineCore reads).
+#                     The MessageQueue API is strictly unidirectional (creator is
+#                     always writer, create_from_handle always gives reader), so
+#                     the worker CREATES ha_ack_mq (as writer) and passes the
+#                     handle back to the executor via a temp file; the executor
+#                     then calls create_from_handle to get a reader proxy.
+_EDGE_RECV_HINT_MQ_ENV = "VLLM_ASCEND_EDGE_RECV_HINT_MQ_HANDLE"
+_EDGE_HA_ACK_MQ_ENV = "VLLM_ASCEND_EDGE_HA_ACK_MQ_HANDLE"
+# Temp-file path for the worker->executor ha_ack_mq handle handoff.  Set by the
+# executor before spawning workers so the worker knows where to write the handle.
+_EDGE_HA_ACK_HANDLE_PATH_ENV = "VLLM_ASCEND_EDGE_HA_ACK_HANDLE_PATH"
+
+
+def _edge_eher_enabled(vllm_config: VllmConfig) -> bool:
+    """True iff EHER (edge hidden early-receive) is active on this edge node.
+
+    EHER requires: edge role + PD enabled + `enable_edge_hidden_early_recv`.
+    The sideband MQs are built whenever early-recv is on (gating only adds the
+    ack MQ on top of the hint MQ).  Reads config the same way as
+    ``_cloud_pd_enabled`` so the gate is stable across processes.
+    """
+    pc = getattr(vllm_config, "parallel_config", None)
+    if pc is None:
+        return False
+    if not getattr(pc, "enable_edge_cloud", False):
+        return False
+    # edge role == is_edge_node (mirrors model_runner_v1 role inference).
+    if not getattr(pc, "is_edge_node", False):
+        return False
+    ac = getattr(vllm_config, "additional_config", None) or {}
+    ec = ac.get("edge_cloud_config", {}) if isinstance(ac, dict) else {}
+    pd = ec.get("pd_separation", {}) if isinstance(ec, dict) else {}
+    if not bool(pd.get("enabled", False)):
+        return False
+    return bool(pd.get("enable_edge_hidden_early_recv", False))
+
+
+def _edge_eher_gating_enabled(vllm_config: VllmConfig) -> bool:
+    """True iff P-tail scheduling gating is on (requires EHER)."""
+    if not _edge_eher_enabled(vllm_config):
+        return False
+    ac = getattr(vllm_config, "additional_config", None) or {}
+    ec = ac.get("edge_cloud_config", {}) if isinstance(ac, dict) else {}
+    pd = ec.get("pd_separation", {}) if isinstance(ec, dict) else {}
+    return bool(pd.get("enable_edge_hidden_early_recv_gating", True))
 
 
 def _cloud_pd_enabled(vllm_config: VllmConfig) -> bool:
@@ -152,6 +203,56 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         else:
             # Clean any stale handle so a non-cloud worker does not pick it up.
             os.environ.pop(_CLOUD_RECV_HINT_MQ_ENV, None)
+
+        # [EHER] Edge-side hidden early-receive + P-tail gating.  Build the
+        # sideband MQs on the EDGE leader:
+        #   edge_recv_hint_mq : edge EngineCore -> edge worker guard thread
+        #                        Standard CHER pattern: executor=writer (enqueues
+        #                        hints), worker=reader (guard dequeues).
+        #   ha_ack_mq          : edge worker guard thread -> edge EngineCore
+        #                        REVERSE direction (worker=writer, EngineCore=
+        #                        reader).  The MessageQueue API is strictly
+        #                        unidirectional (creator is always writer), so
+        #                        the WORKER creates ha_ack_mq and passes the
+        #                        handle back to the executor via a temp file;
+        #                        after wait_for_ready the executor calls
+        #                        create_from_handle to get a reader proxy.
+        self.edge_recv_hint_mq: MessageQueue | None = None
+        self.ha_ack_mq: MessageQueue | None = None
+        # Clean any stale env handles first.
+        os.environ.pop(_EDGE_RECV_HINT_MQ_ENV, None)
+        os.environ.pop(_EDGE_HA_ACK_MQ_ENV, None)
+        os.environ.pop(_EDGE_HA_ACK_HANDLE_PATH_ENV, None)
+        if (
+            self.parallel_config.enable_edge_cloud
+            and self.parallel_config.is_edge_node
+            and _edge_eher_enabled(self.vllm_config)
+        ):
+            self.edge_recv_hint_mq = MessageQueue(
+                1, 1, max_chunk_bytes=1024, max_chunks=8,
+            )
+            _hint_handle = self.edge_recv_hint_mq.export_handle()
+            os.environ[_EDGE_RECV_HINT_MQ_ENV] = base64.b64encode(
+                pickle.dumps(_hint_handle)
+            ).decode()
+            # ha_ack_mq: reverse direction — worker creates it (writer) and
+            # writes its handle to a temp file.  Set the file path BEFORE
+            # spawning workers so the worker's _init_message_queues can find
+            # it via env and write the handle there.  After wait_for_ready
+            # (workers have finished init), we read the handle back and call
+            # create_from_handle to get a reader proxy.
+            if _edge_eher_gating_enabled(self.vllm_config):
+                _ack_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"vllm_eher_ha_ack_{os.getpid()}_{id(self)}.handle",
+                )
+                os.environ[_EDGE_HA_ACK_HANDLE_PATH_ENV] = _ack_path
+            logger.info(
+                "[EHER] edge_recv_hint_mq created on edge executor "
+                "(local_world_size=%d, gating=%s)",
+                self.local_world_size,
+                _edge_eher_gating_enabled(self.vllm_config),
+            )
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -195,6 +296,35 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
             # Wait for all local workers to be ready.
             self.workers = AscendWorkerProc.wait_for_ready(unready_workers)
+
+            # [EHER ha_ack_mq] The worker created ha_ack_mq (reverse direction:
+            # worker=writer, EngineCore=reader) and wrote its Handle to the
+            # temp file set before spawning.  Read it back now that the worker
+            # has finished init, and create a READER proxy on the executor.
+            _ack_handle_path = os.environ.pop(
+                _EDGE_HA_ACK_HANDLE_PATH_ENV, None
+            )
+            if _ack_handle_path is not None:
+                try:
+                    with open(_ack_handle_path, "rb") as _fh:
+                        _ack_handle_raw = _fh.read()
+                    _ack_handle = pickle.loads(_ack_handle_raw)
+                    self.ha_ack_mq = MessageQueue.create_from_handle(
+                        _ack_handle, 0,
+                    )
+                    os.unlink(_ack_handle_path)
+                    logger.info(
+                        "[EHER] ha_ack_mq reader proxy created on executor "
+                        "(worker=writer, executor=reader)"
+                    )
+                except Exception:
+                    logger.exception(
+                        "[EHER] failed to read ha_ack_mq handle from %s; "
+                        "gating acks will not be received (fallback timeout "
+                        "will force-unlock P-tails)",
+                        _ack_handle_path,
+                    )
+                    self.ha_ack_mq = None
 
             # Start background thread to monitor worker health if not in headless mode.
             if self.monitor_workers:
@@ -336,6 +466,11 @@ class AscendWorkerProc(WorkerProc):
         # WorkerProc instances that worker_main actually creates.  Initialize
         # the attribute here for the AscendWorkerProc path (if ever taken).
         self.cloud_recv_hint_mq: MessageQueue | None = None
+        # [EHER] Edge sideband MQs, rebuilt by the chained _eher wrapper below.
+        if not hasattr(self, "edge_recv_hint_mq"):
+            self.edge_recv_hint_mq: MessageQueue | None = None
+        if not hasattr(self, "ha_ack_mq"):
+            self.ha_ack_mq: MessageQueue | None = None
 
     @staticmethod
     def make_worker_process(
@@ -440,3 +575,250 @@ def _cher_init_message_queues(self, input_shm_handle, vllm_config):
 
 
 _OrigWorkerProc._init_message_queues = _cher_init_message_queues
+
+
+# [EHER] Edge-side mirror of the CHER wrapper: rebuild edge_recv_hint_mq and
+# (when gating is on) ha_ack_mq on the edge worker (local_rank==0).  Same
+# rationale as the cloud wrapper: the spawned WorkerProc resolves to the base
+# class, so we patch _OrigWorkerProc._init_message_queues a SECOND time by
+# chaining after the CHER wrapper.  Keep both rebuilds idempotent so the order
+# (CHER then EHER) and a possible AscendWorkerProc early-set both work.
+_eher_orig_init_message_queues = _OrigWorkerProc._init_message_queues
+
+
+def _eher_init_message_queues(self, input_shm_handle, vllm_config):
+    _eher_orig_init_message_queues(self, input_shm_handle, vllm_config)
+    if getattr(self, "edge_recv_hint_mq", None) is not None:
+        return
+    self.edge_recv_hint_mq = None
+    self.ha_ack_mq = None
+    # Edge worker rebuilds the sideband MQs only on the leader (local_rank==0
+    # issues the cross-node irecv) and only when the edge executor built them.
+    # The edge runs WITHOUT VLLM_PP_NON_LEADER_ENGINE_CORE (edge is the PP
+    # rank-0 of the shared-model group), so unlike CHER we do not gate on it.
+    if not (
+        vllm_config.parallel_config.enable_edge_cloud
+        and vllm_config.parallel_config.is_edge_node
+        and self.local_rank == 0
+        and _edge_eher_enabled(vllm_config)
+    ):
+        return
+    _hint_raw = os.environ.get(_EDGE_RECV_HINT_MQ_ENV)
+    if _hint_raw is not None:
+        try:
+            _hint_handle = pickle.loads(base64.b64decode(_hint_raw))
+            self.edge_recv_hint_mq = MessageQueue.create_from_handle(
+                _hint_handle, self.local_rank
+            )
+            logger.info(
+                "[EHER] edge_recv_hint_mq rebuilt on worker local_rank=%d",
+                self.local_rank,
+            )
+        except Exception:
+            logger.exception(
+                "[EHER] failed to rebuild edge_recv_hint_mq on worker "
+                "local_rank=%d; EHER will fall back to sync recv",
+                self.local_rank,
+            )
+            self.edge_recv_hint_mq = None
+    # ha_ack_mq: reverse direction (worker=writer, EngineCore=reader).
+    # The MessageQueue API is strictly unidirectional (creator is always
+    # writer), so the WORKER creates it and passes the Handle back to the
+    # executor via a temp file (path in _EDGE_HA_ACK_HANDLE_PATH_ENV); the
+    # executor then calls create_from_handle to get a reader proxy.
+    if _edge_eher_gating_enabled(vllm_config):
+        _ack_path = os.environ.get(_EDGE_HA_ACK_HANDLE_PATH_ENV)
+        if _ack_path is None:
+            logger.warning(
+                "[EHER] gating on but ha_ack handle path env missing; "
+                "P-tails will force-unlock after fallback timeout"
+            )
+        else:
+            try:
+                self.ha_ack_mq = MessageQueue(
+                    1, 1, max_chunk_bytes=1024, max_chunks=8,
+                )
+                _ack_handle = self.ha_ack_mq.export_handle()
+                with open(_ack_path, "wb") as _fh:
+                    _fh.write(pickle.dumps(_ack_handle))
+                logger.info(
+                    "[EHER] ha_ack_mq created on worker local_rank=%d "
+                    "(worker=writer, handle written to %s)",
+                    self.local_rank, _ack_path,
+                )
+            except Exception:
+                logger.exception(
+                    "[EHER] failed to create ha_ack_mq on worker "
+                    "local_rank=%d; gating acks will be lost (force-unlock "
+                    "fallback applies)",
+                    self.local_rank,
+                )
+                self.ha_ack_mq = None
+
+        # [EHER] Start the guard thread on the edge.  The upstream guard-start
+        # trigger (_init_worker line 767) only fires when ``cloud_recv_hint_mq``
+        # is not None (CHER), which is always None on the edge.  Call the
+        # wrapper (which checks idempotency + the dual-MQ condition) to start
+        # the guard on the edge.
+        if getattr(self, "edge_recv_hint_mq", None) is not None:
+            self._start_early_recv_guard()
+
+
+_OrigWorkerProc._init_message_queues = _eher_init_message_queues
+
+
+# [EHER §十五.4] Extend the early-recv guard thread to also serve the edge:
+#   - drain ``edge_recv_hint_mq`` (edge EngineCore -> guard) and post the
+#     cloud->edge irecv early (mirrors CHER's cloud side);
+#   - when gating is on, run a NON-BLOCKING ``is_completed()`` probe over the
+#     posted edge early-recv entries and, for each newly-complete one, enqueue a
+#     recv-done ack to ``ha_ack_mq`` (edge guard -> edge EngineCore) so the
+#     gated P-tail is unlocked for scheduling.
+# The guard thread NEVER calls ``wait()`` (HCCL cross-thread wait on a hidden-
+# channel irecv while busy_loop isends on that channel deadlocks -- see the
+# upstream ``_early_recv_guard_loop`` docstring). ``is_completed()`` is a poll,
+# not a block, so it does not stall the busy_loop isend. Gating is feasible
+# precisely because the upstream ``Handle`` Protocol exposes ``is_completed()``
+# (vllm/vllm/distributed/parallel_state.py: class Handle).
+# We wrap _OrigWorkerProc (the base class worker_main actually instantiates),
+# calling the original loop body for the CHER path then appending the EHER path.
+_eher_orig_start_early_recv_guard = _OrigWorkerProc._start_early_recv_guard
+_eher_orig_early_recv_guard_loop = _OrigWorkerProc._early_recv_guard_loop
+
+
+def _eher_start_early_recv_guard(self) -> None:
+    """Start the guard thread if either sideband hint MQ exists (CHER or EHER).
+
+    The upstream gate (``cloud_recv_hint_mq is not None``) only starts it on
+    the cloud; this wrapper also starts it on the edge when ``edge_recv_hint_mq``
+    was rebuilt, so the same single guard thread serves both directions.
+    """
+    has_cloud = getattr(self, "cloud_recv_hint_mq", None) is not None
+    has_edge = getattr(self, "edge_recv_hint_mq", None) is not None
+    if not (has_cloud or has_edge):
+        # No sideband MQ on this worker -> upstream guard returns early via the
+        # ``hasattr(worker, "start_early_irecv")`` check anyway; call it so the
+        # upstream idempotency flag is set consistently.
+        _eher_orig_start_early_recv_guard(self)
+        return
+    if getattr(self, "_early_recv_guard_started", False):
+        return
+    worker = getattr(self, "worker", None)
+    if worker is None or not hasattr(worker, "start_early_irecv"):
+        return
+    import threading
+    self._early_recv_guard_started = True
+    self._early_recv_guard_shutdown = False
+    self._early_recv_guard_thread = threading.Thread(
+        target=self._early_recv_guard_loop,
+        name="cher-eher-early-recv-guard",
+        daemon=True,
+    )
+    self._early_recv_guard_thread.start()
+    logger.info(
+        "[CHER/EHER] early-irecv guard thread started "
+        "(cloud_mq=%s edge_mq=%s ha_ack_mq=%s)",
+        has_cloud, has_edge,
+        getattr(self, "ha_ack_mq", None) is not None,
+    )
+
+
+def _eher_early_recv_guard_loop(self) -> None:
+    """Guard loop: CHER path (drain cloud hints + post) + EHER path
+    (drain edge hints + post + non-blocking test -> ack).
+
+    Wraps the upstream loop: it calls the original body first (which posts any
+    cloud recv-hints), then runs the EHER additions.  No wait() anywhere.
+    """
+    # --- device context (same as upstream) ---
+    try:
+        from vllm.platforms import current_platform
+        worker = getattr(self, "worker", None)
+        if worker is not None and hasattr(worker, "device"):
+            current_platform.set_device(worker.device)
+    except Exception:
+        logger.exception("[CHER/EHER] guard thread failed to set device")
+
+    edge_hint_mq = getattr(self, "edge_recv_hint_mq", None)
+    ha_ack_mq = getattr(self, "ha_ack_mq", None)
+    worker = getattr(self, "worker", None)
+    # Gating probes are only meaningful when the ack channel exists; otherwise
+    # the EngineCore unlocks via the fallback timeout and we skip probing.
+    gating_on = ha_ack_mq is not None
+
+    import time
+    while not getattr(self, "_early_recv_guard_shutdown", False):
+        did_something = False
+
+        # [CHER] Drain cloud recv-hints + post (upstream body, isolated).
+        cloud_mq = getattr(self, "cloud_recv_hint_mq", None)
+        if cloud_mq is not None:
+            while True:
+                try:
+                    method, args, _kw, _out = cloud_mq.dequeue(timeout=0)
+                except TimeoutError:
+                    break
+                except Exception:
+                    logger.exception("[CHER] guard dequeue error")
+                    break
+                if method == b"pp_recv_hint" and args:
+                    try:
+                        worker.start_early_irecv(args[0])
+                        did_something = True
+                    except Exception:
+                        logger.exception("[CHER] start_early_irecv failed")
+
+        # [EHER] Drain edge recv-hints + post (mirrors the cloud path).
+        if edge_hint_mq is not None:
+            while True:
+                try:
+                    method, args, _kw, _out = edge_hint_mq.dequeue(timeout=0)
+                except TimeoutError:
+                    break
+                except Exception:
+                    logger.exception("[EHER] guard dequeue error")
+                    break
+                if method == b"pp_recv_hint" and args:
+                    try:
+                        worker.start_early_irecv(args[0])
+                        did_something = True
+                    except Exception:
+                        logger.exception("[EHER] start_early_irecv failed")
+
+        # [EHER §十五.4] Non-blocking completion probe -> post ack (gating).
+        # Does NOT wait(); only acks entries that are already complete so the
+        # gated P-tail can be unlocked.  Skipped entirely when gating is off.
+        if gating_on and worker is not None and hasattr(
+            worker, "test_unacked_early_recv"
+        ):
+            try:
+                ready = worker.test_unacked_early_recv()
+            except Exception:
+                logger.exception("[EHER] test_unacked_early_recv failed")
+                ready = []
+            for ht, _entry in ready:
+                try:
+                    _ack = {
+                        "__ha_ack__": True,
+                        "head_token": ht,
+                        "direction": "received",
+                    }
+                    ha_ack_mq.enqueue(
+                        (b"ha_ack", (_ack,), {}, None)
+                    )
+                    worker.mark_early_recv_acked(ht)
+                    did_something = True
+                    logger.debug(
+                        "[EHER] posted ha_ack head_token=%s", ht,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[EHER] ha_ack enqueue failed head_token=%s", ht,
+                    )
+
+        if not did_something:
+            time.sleep(0.00005)
+
+
+_OrigWorkerProc._start_early_recv_guard = _eher_start_early_recv_guard
+_OrigWorkerProc._early_recv_guard_loop = _eher_early_recv_guard_loop

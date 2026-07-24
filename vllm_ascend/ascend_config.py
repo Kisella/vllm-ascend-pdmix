@@ -749,6 +749,31 @@ class PDSeparationConfig:
         self.max_chunk_prefill_ahead: int = int(
             user_config.get("max_chunk_prefill_ahead", 1)
         )
+        # [EHER] Edge-side hidden early-receive. When True, the edge EngineCore
+        # fires a recv-hint for each PREFILL_LAST so the edge worker posts the
+        # Default True: EHER is a built-in part of PD masking and activates
+        # automatically when PD separation is enabled on the edge.
+        self.enable_edge_hidden_early_recv: bool = user_config.get(
+            "enable_edge_hidden_early_recv", True
+        )
+        # [EHER §十五] P-tail scheduling gate on hidden-arrival. When True, a
+        # PREFILL_LAST is NOT scheduled until the early-recv completes (ack) --
+        # preventing the edge worker from being scheduled onto a P-tail whose
+        # hidden is still in flight (which would block the single-threaded
+        # busy_loop on a fallback sync recv and stall the pipeline). Requires
+        # `enable_edge_hidden_early_recv` (gating without early-recv would gate
+        # on an irecv that is never posted). Default True (gating is the whole
+        # point of EHER once the early-recv machinery exists); set False to run
+        # the non-gating baseline.
+        self.enable_edge_hidden_early_recv_gating: bool = user_config.get(
+            "enable_edge_hidden_early_recv_gating", True
+        )
+        # [EHER §十五] Force-unlock a gated P-tail whose ack never arrives
+        # (guard thread dead / hint lost / HCCL test unsupported). The worker
+        # then falls back to the synchronous recv path. Prevents deadlock.
+        self.ha_fallback_timeout_ms: float = float(
+            user_config.get("ha_fallback_timeout_ms", 500.0)
+        )
 
     @property
     def prefill_inflight_limit(self) -> int:
@@ -764,7 +789,10 @@ class PDSeparationConfig:
             f"PDSeparationConfig(enabled={self.enabled}, "
             f"next_prefill_prior_enable={self.next_prefill_prior_enable}, "
             f"chunk_prefill_prior_enable={self.chunk_prefill_prior_enable}, "
-            f"max_chunk_prefill_ahead={self.max_chunk_prefill_ahead})"
+            f"max_chunk_prefill_ahead={self.max_chunk_prefill_ahead}, "
+            f"enable_edge_hidden_early_recv={self.enable_edge_hidden_early_recv}, "
+            f"enable_edge_hidden_early_recv_gating={self.enable_edge_hidden_early_recv_gating}, "
+            f"ha_fallback_timeout_ms={self.ha_fallback_timeout_ms})"
         )
 
 
