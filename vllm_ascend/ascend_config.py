@@ -768,11 +768,20 @@ class PDSeparationConfig:
         self.enable_edge_hidden_early_recv_gating: bool = user_config.get(
             "enable_edge_hidden_early_recv_gating", True
         )
-        # [EHER §十五] Force-unlock a gated P-tail whose ack never arrives
-        # (guard thread dead / hint lost / HCCL test unsupported). The worker
-        # then falls back to the synchronous recv path. Prevents deadlock.
+        # [EHER §十五] Force-unlock a gated P-tail whose release signal never
+        # arrives (no decode batches dispatched for too long).  The worker then
+        # falls back to the synchronous recv path.  Prevents deadlock.
         self.ha_fallback_timeout_ms: float = float(
             user_config.get("ha_fallback_timeout_ms", 500.0)
+        )
+        # [EHER gating release] Number of D首 (DECODE_FIRST) the scheduler must
+        # dispatch after a P-tail enters gating before the P-tail is released to
+        # prefills_last_ready.  Default 2.  Only D首 is counted: P首/P尾 should
+        # only be interleaved in the D首→D尾 gap, never between D尾→D首 (which
+        # is a tight forced pipeline).  Each D首 takes ~50-100ms; 2 D首 give the
+        # early-recv enough time to finish or nearly finish the hidden transfer.
+        self.eher_gating_release_after_batches: int = int(
+            user_config.get("eher_gating_release_after_batches", 2)
         )
 
     @property
