@@ -191,14 +191,6 @@ def _patched_engine_core_init(self, *args, **kwargs):
     self._prefills_last_ha_pending_ts: dict[str, float] = {}
     self._ha_ready_head_tokens: set[str] = set()
     self._recv_hint_sent: set[str] = set()
-    # [EHER count-gating] Global decode-dispatch counter + per-P尾 snapshot.
-    self._eher_decode_dispatch_count: int = 0
-    self._eher_pending_decode_mark: dict[str, int] = {}
-    self._eher_gating_release_after_batches: int = (
-        edge_cloud.pd_separation.eher_gating_release_after_batches
-        if pd_enabled and getattr(parallel_config, "is_edge_node", False)
-        else 2
-    )
     if self._eher_enabled:
         logger.info(
             "[EHER] edge hidden early-receive enabled on EngineCore "
@@ -250,17 +242,6 @@ def _drain_pd_channel_inbox(self) -> None:
         self._prefills_last_ha_pending_ts = {}
         self._ha_ready_head_tokens = set()
         self._recv_hint_sent = set()
-        # [EHER count-gating] Global decode-dispatch counter and per-P尾
-        # snapshot at pending entry.  A gated P尾 is released to
-        # prefills_last_ready when decode batches dispatched since its entry
-        # reaches ``_eher_gating_release_after_batches`` (default 2).  Each
-        # decode batch (D首 or D尾) takes ~50-100ms; 2 batches give the
-        # early-recv roughly 100-200ms to finish or nearly finish the hidden
-        # transfer, so the worker hits pop_early_recv with zero or residual
-        # wait instead of a full sync-recv block.
-        self._eher_decode_dispatch_count: int = 0
-        self._eher_pending_decode_mark: dict[str, int] = {}
-        self._eher_gating_release_after_batches: int = 2
         try:
             _ac = (
                 getattr(self.vllm_config, "additional_config", None) or {}
@@ -283,16 +264,11 @@ def _drain_pd_channel_inbox(self) -> None:
                 self._ha_fallback_timeout_ms = float(
                     _pd_cfg.get("ha_fallback_timeout_ms", 500.0)
                 )
-                self._eher_gating_release_after_batches = int(
-                    _pd_cfg.get("eher_gating_release_after_batches", 2)
-                )
             logger.info(
                 "[EHER] init (lazy from additional_config): "
-                "enabled=%s gating=%s release_after=%d batches "
-                "fallback_ms=%.0f",
+                "enabled=%s gating=%s fallback_ms=%.0f",
                 self._eher_enabled,
                 self._eher_gating_enabled,
-                self._eher_gating_release_after_batches,
                 self._ha_fallback_timeout_ms,
             )
         except Exception:
@@ -388,9 +364,6 @@ def _enqueue_prefill_last_ha_pending(self, scheduler_output: SchedulerOutput) ->
         return
     self._prefills_last_ha_pending.append(scheduler_output)
     self._prefills_last_ha_pending_ts[ht] = time.monotonic()
-    self._eher_pending_decode_mark[ht] = getattr(
-        self, "_eher_decode_dispatch_count", 0,
-    )
     self._send_eher_recv_hint(scheduler_output)
 
 
@@ -470,56 +443,25 @@ def _drain_ha_acks_edge(self) -> None:
 
 
 def _unlock_prefills_last_with_ha(self) -> None:
-    """Move gated P-tails whose decode-budget has been met (or whose
-    fallback timeout elapsed) into ``prefills_last_ready``.
-
-    Release criterion (count-based, replaces ack-based):
-      A P尾 is released when the global decode-dispatch counter has advanced
-      by at least ``_eher_gating_release_after_batches`` (default 2) since it
-      entered pending.  Each decode batch (D首/D尾) takes ~50-100ms; 2
-      batches give the early-recv roughly 100-200ms to finish the hidden
-      transfer, so the worker hits pop_early_recv with minimal wait.
-
-    Fallback: if no decode batches are dispatched (e.g. pure prefill
-    workload), the ack-based criterion (``_ha_ready_head_tokens``) still works
-    as a secondary path, and the timeout force-unlocks as a last resort.
-    """
+    """Move gated P-tails whose ack arrived (or whose timeout elapsed) into
+    ``prefills_last_ready`` so the scheduler may pick them."""
     if not self._prefills_last_ha_pending:
         return
-    _release_after = getattr(
-        self, "_eher_gating_release_after_batches", 2
-    )
-    _decode_count = getattr(self, "_eher_decode_dispatch_count", 0)
     ready: list[SchedulerOutput] = []
-
     for so in list(self._prefills_last_ha_pending):
         ht = so.head_token
-        _mark = self._eher_pending_decode_mark.get(ht, 0)
-        # Primary: count-based (decode batches filled the bubble).
-        if _decode_count - _mark >= _release_after:
+        if ht in self._ha_ready_head_tokens:
             ready.append(so)
-            logger.info(
-                "[EHER] gating release (decode-count): head_token=%s "
-                "batches_since=%d (mark=%d now=%d after=%d)",
-                ht, _decode_count - _mark, _mark, _decode_count,
-                _release_after,
-            )
-        # Secondary: ack-based (guard thread observed completion).
-        elif ht in self._ha_ready_head_tokens:
-            ready.append(so)
-            logger.info(
-                "[EHER] gating release (ack): head_token=%s", ht,
-            )
-
     for so in ready:
         self.scheduler.prefills_last_ready.append(so)
         self._ha_ready_head_tokens.discard(so.head_token)
         self._prefills_last_ha_pending_ts.pop(so.head_token, None)
-        self._eher_pending_decode_mark.pop(so.head_token, None)
         self._prefills_last_ha_pending.remove(so)
 
-    # Fallback: force-unlock any P-tail whose release never triggered (no
-    # decode batches dispatched + no ack).  Prevents deadlock.
+    # Fallback: force-unlock any P-tail whose ack never arrived (guard thread
+    # dead / hint dropped / HCCL is_completed() never observed).  Prevents
+    # deadlock.  The worker then posts+waits the irecv synchronously in
+    # _execute_model_edge_tail (EHER fallback), so results stay correct.
     now = time.monotonic()
     for so in list(self._prefills_last_ha_pending):
         ht = so.head_token
@@ -527,13 +469,12 @@ def _unlock_prefills_last_with_ha(self) -> None:
         elapsed_ms = (now - _enq_ts) * 1000.0
         if elapsed_ms > self._ha_fallback_timeout_ms:
             logger.warning(
-                "[EHER] gating fallback: head_token=%s timeout %.0fms, "
+                "[EHER] gating fallback: head_token=%s ack timeout %.0fms, "
                 "force-unlock (worker will sync-recv)", ht, elapsed_ms,
             )
             self.scheduler.prefills_last_ready.append(so)
             self._prefills_last_ha_pending.remove(so)
             self._prefills_last_ha_pending_ts.pop(ht, None)
-            self._eher_pending_decode_mark.pop(ht, None)
             self._ha_ready_head_tokens.discard(ht)
 
 
@@ -730,14 +671,6 @@ def _patched_step(self):
     # (edge → cloud) channel.
     self._maybe_publish_pre_out(scheduler_output)
 
-    # [EHER count-gating] Increment decode-dispatch counter when a D首
-    # is dispatched.  P首/P尾 should only be interleaved in the D首→D尾
-    # gap, never between D尾→D首 (which is a tight forced pipeline).
-    if getattr(self, "_eher_gating_enabled", False) and (
-        scheduler_output.batch_type == BatchType.DECODE_FIRST
-    ):
-        self._eher_decode_dispatch_count += 1
-
     if scheduler_output.batch_type == BatchType.EMPTY:
         return self._finish_empty_batch(scheduler_output)
 
@@ -805,13 +738,6 @@ def _patched_step_with_batch_queue(self):
         # _publish_pre_out_when_ready until it becomes next to execute.
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             self._maybe_publish_pre_out(scheduler_output)
-
-        # [EHER count-gating] Increment decode-dispatch counter when a D首
-        # is dispatched.  P首/P尾 only between D首→D尾.
-        if getattr(self, "_eher_gating_enabled", False) and (
-            scheduler_output.batch_type == BatchType.DECODE_FIRST
-        ):
-            self._eher_decode_dispatch_count += 1
 
         if scheduler_output.batch_type == BatchType.EMPTY:
             if batch_queue:
