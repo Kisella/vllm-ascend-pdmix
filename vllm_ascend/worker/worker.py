@@ -493,11 +493,18 @@ class NPUWorker(WorkerBase):
                 and self.local_rank == 0
             )
             if self._edge_hidden_early_recv_enabled:
-                # Edge early-recv cache cap mirrors the cloud's empirical cap:
-                # the guard posts one P-tail irecv at a time and busy_loop
-                # consumes it before the next is posted.
+                # Edge early-recv cache cap = prefill_inflight_limit (2 for
+                # 2P1D).  ALL in-flight P-tails' irecvs must be posted by the
+                # guard thread so their acks fire promptly -- otherwise the
+                # second P-tail waits 500ms for timeout, during which the
+                # cloud's _wait_pp_send_work blocks (no timeout) waiting for
+                # the edge to irecv its isend, deadlocking the pipeline.
+                _inflight_limit = (
+                    2 if _pd.get("next_prefill_prior_enable", False) else 1
+                )
                 self._early_recv_max_inflight = max(
-                    getattr(self, "_early_recv_max_inflight", 0), 1
+                    getattr(self, "_early_recv_max_inflight", 0),
+                    _inflight_limit,
                 )
                 logger.info(
                     "[EHER] edge hidden early-receive enabled on worker "

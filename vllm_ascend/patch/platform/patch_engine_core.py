@@ -296,16 +296,28 @@ def _drain_pd_channel_inbox(self) -> None:
             if getattr(self, "_eher_enabled", False) and getattr(
                 so, "head_token", None
             ):
-                if getattr(self, "_eher_gating_enabled", False):
-                    # Gating on: park in pending + fire hint; unlock on ack.
+                # Gating only when decode work is available to fill the
+                # bubble.  For pure-prefill workloads (no decode in flight),
+                # gating only adds delay -- P_tail has nothing to overlap
+                # with, and the delay cascades into an HCCL communication
+                # deadlock (cloud's _wait_pp_send_work blocks waiting for
+                # the edge to irecv, but the edge worker is stuck on an
+                # NPU stream dependency caused by the delayed irecv).
+                _has_decode_work = bool(
+                    self.scheduler.decodes_last_ready
+                    or getattr(self.scheduler, "running", None)
+                )
+                if (
+                    getattr(self, "_eher_gating_enabled", False)
+                    and _has_decode_work
+                ):
+                    # Gating on + decode available: park in pending + fire
+                    # hint; unlock on ack/count/timeout.
                     self._enqueue_prefill_last_ha_pending(so)
                 else:
-                    # early-recv on, gating off: fire the hint (guard thread
-                    # posts the irecv early) but keep the P-tail immediately
-                    # schedulable.  This is the EHER baseline (mirrors CHER's
-                    # non-gating cloud path): overlap the transfer with prior
-                    # edge work without gating the schedule.  Lets a gating
-                    # regression be isolated from the early-recv benefit.
+                    # No decode work (pure prefill) or gating off: fire the
+                    # hint (guard thread posts irecv early for overlap) but
+                    # keep P-tail immediately schedulable.
                     self._send_eher_recv_hint(so)
                     self.scheduler.prefills_last_ready.append(so)
             else:
