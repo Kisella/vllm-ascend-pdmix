@@ -5374,6 +5374,12 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if not num_scheduled_tokens:
             self._cloud_prepare_cache = None
+            # Still run _update_states: a zero-token slice may be the first
+            # slice of a new request that just entered the cloud worker's
+            # batch.  _update_states must see the request at least once to
+            # populate req_data.all_token_ids; otherwise a later
+            # DECODE_FIRST / DRAFT_FIRST will KeyError.
+            self._update_states(scheduler_output)
             return
 
         # Replicate scheduler_output handling from execute_model
