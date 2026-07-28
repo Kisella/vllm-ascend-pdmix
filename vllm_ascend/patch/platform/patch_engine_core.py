@@ -194,7 +194,15 @@ def _drain_pd_channel_inbox(self) -> None:
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
         elif bt == BatchType.DRAFT_LAST:
-            self.scheduler.drafts_last_ready.append(so)
+            # DRAFT_LAST is self-posted by _pick_draft_first_batch (like
+            # DECODE_LAST). If it arrives via POST_OUT (e.g. from an older
+            # cloud that still publishes it), drop it -- the edge already has
+            # its own copy in drafts_last_ready.
+            logger.debug(
+                "Dropping POST_OUT DRAFT_LAST head_token=%s "
+                "(edge self-posts DRAFT_LAST)",
+                getattr(so, "head_token", None),
+            )
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "

@@ -714,13 +714,14 @@ class PassiveEngineCoreProc:
                     bt,
                     _dt_enqueue,
                 )
-            # For prefill and draft, POST_OUT must mean the cloud middle
+            # For prefill, POST_OUT must mean the cloud middle
             # segment has completed. Store the original SchedulerOutput here
             # and publish it from _drain_worker_completion_acks() after the
-            # worker reports done. Decode-last is prepared on the edge.
+            # worker reports done. Decode-last and Draft-last are prepared on
+            # the edge (self-posting), so they are not pending here.
             if (
                 batch.scheduler_output.batch_type
-                in (BatchType.PREFILL_FIRST, BatchType.DRAFT_FIRST)
+                == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
             ):
                 head_token = getattr(batch.scheduler_output, "head_token", None)
@@ -764,19 +765,15 @@ class PassiveEngineCoreProc:
             )
             return
         elif bt == BatchType.DRAFT_FIRST:
-            tail = replace(
-                scheduler_output, batch_type=BatchType.DRAFT_LAST
+            # The edge pre-generates DRAFT_LAST (self-posting, same as
+            # DECODE_FIRST -> DECODE_LAST), so the cloud does not publish
+            # POST_OUT for DRAFT_FIRST.
+            logger.debug(
+                "[Cloud] Skipping POST_OUT for DRAFT_FIRST "
+                "head_token=%s (edge pre-generates DRAFT_LAST)",
+                scheduler_output.head_token,
             )
-            if not tail.head_token:
-                raise RuntimeError("DRAFT_LAST POST_OUT missing head_token")
-            if not tail.draft_task_id:
-                raise RuntimeError(
-                    "DRAFT_LAST POST_OUT missing draft_task_id"
-                )
-            if tail.draft_step_idx is None:
-                raise RuntimeError(
-                    "DRAFT_LAST POST_OUT missing draft_step_idx"
-                )
+            return
         else:
             return
         # Echo the head_token back so the edge can correlate the tail

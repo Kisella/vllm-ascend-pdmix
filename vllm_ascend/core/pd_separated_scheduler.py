@@ -175,10 +175,8 @@ class PDSeparatedScheduler(Scheduler):
             self.scheduler_config, "pd_prefill_inflight_limit", 1
         )
         self.prefill_inflight_count: int = 0
-        self.decode_inflight_limit: int = 1
-        self.decode_inflight_count: int = 0
-        self.draft_inflight_limit: int = 1
-        self.draft_inflight_count: int = 0
+        self.decode_or_draft_inflight_limit: int = 1
+        self.decode_or_draft_inflight_count: int = 0
         self.draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager.  Two prefill hidden channels are
@@ -244,16 +242,19 @@ class PDSeparatedScheduler(Scheduler):
         # D首 调度后置 True，D尾 调度后置 False。
         # True 时禁止调度 D首，严格保证 DF -> DL 交替时序。
         self._force_decode_last: bool = False
+        self._force_draft_last: bool = False
 
         self._layer_slice_config_path: str | None = None
         self._layer_slice_config_mtime: float = 0.0
         self._load_layer_slice_config()
-        # After scheduling a DECODE_LAST, briefly reserve the next scheduling
-        # opportunity for DECODE_FIRST only.  This keeps decode middle work fed
-        # without blocking; if no decode head can be scheduled within the window,
-        # normal scheduling resumes.
-        self._decode_first_only_start_ts: float | None = None
-        self._decode_first_only_window_ms: int = 10
+        # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
+        # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
+        self._decode_or_draft_first_only_start_ts: float | None = None
+        self._decode_or_draft_first_only_window_ms: int = 10
+
+        # [MTP] DRAFT_LAST delay scheduling (mirrors decode_last_delay).
+        self._draft_last_delay_start_ts: float | None = None
+        self._draft_last_delay_schedule_ms: int = 10
 
     # ------------------------------------------------------------------ #
     # Chunk-prefill-prior helpers                                         #
@@ -469,55 +470,52 @@ class PDSeparatedScheduler(Scheduler):
             self._log_scheduler_state(state, scheduler_output.batch_type)
         return scheduler_output
 
-    def _decode_first_only_active(self) -> bool:
-        started_at = self._decode_first_only_start_ts
+    def _decode_or_draft_first_only_active(self) -> bool:
+        started_at = self._decode_or_draft_first_only_start_ts
         if started_at is None:
             return False
         elapsed_ms = (time.monotonic() - started_at) * 1000
-        if elapsed_ms >= self._decode_first_only_window_ms:
-            self._decode_first_only_start_ts = None
+        if elapsed_ms >= self._decode_or_draft_first_only_window_ms:
+            self._decode_or_draft_first_only_start_ts = None
             return False
         return True
 
-    def _start_decode_first_only_window(self) -> None:
-        self._decode_first_only_start_ts = time.monotonic()
+    def _start_decode_or_draft_first_only_window(self) -> None:
+        self._decode_or_draft_first_only_start_ts = time.monotonic()
 
-    def _clear_decode_first_only_window(self) -> None:
-        self._decode_first_only_start_ts = None
+    def _clear_decode_or_draft_first_only_window(self) -> None:
+        self._decode_or_draft_first_only_start_ts = None
 
-    def _pick_decode_first_only_or_empty(self) -> SchedulerOutput | None:
-        if not self._decode_first_only_active():
+    def _pick_decode_or_draft_first_only_or_empty(self) -> SchedulerOutput | None:
+        if not self._decode_or_draft_first_only_active():
             return None
+        # Window: allow Draft首 (priority) or Decode首
+        if self._can_schedule_draft_first():
+            self._clear_decode_or_draft_first_only_window()
+            return self._pick_draft_first_batch()
         if self._can_schedule_decode_first():
-            self._clear_decode_first_only_window()
+            self._clear_decode_or_draft_first_only_window()
             return self._pick_decode_first_batch()
         return self._make_empty_batch()
 
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
-        decode_first_only = self._pick_decode_first_only_or_empty()
-        if decode_first_only is not None:
-            return decode_first_only
+        first_only = self._pick_decode_or_draft_first_only_or_empty()
+        if first_only is not None:
+            return first_only
 
-        # D尾必须无条件优先于 D首，防止 decode_inflight_count 在 D首
-        # 完成后立即释放导致 D尾 starvation。
         if state == PrefillState.IDLE:
-            # IDLE: P首/chunk0首 > D尾 > D首 > Empty.
+            # IDLE: P首/chunk0首 > Draft尾 > Draft首 > Decode尾 > Decode首 > Empty
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
                     return so
-                # P首 returned empty (e.g. KV cache exhausted). Preserve
-                # finished_req_ids and fall through to decode tasks to avoid
-                # a tight busy-loop where the edge spins on empty prefill.
                 logger.warning(
                     "PREFILL_FIRST returned empty batch (total_num_scheduled_tokens=0). "
                     "This usually means KV cache blocks are exhausted by running decode "
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.prefills_last_ready:
-                return self._pick_prefill_last_batch()
-            if self.drafts_last_ready:
+            if self.drafts_last_ready and self._can_schedule_draft_last():
                 return self._pick_draft_last_batch()
             if self._can_schedule_draft_first():
                 return self._pick_draft_first_batch()
@@ -528,7 +526,7 @@ class PDSeparatedScheduler(Scheduler):
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: chunk/P首(when slot available) > D尾 > D首 > P尾 > Empty.
+            # LOW: P首 > Draft尾 > Draft首 > D尾 > D首 > P尾 > Empty
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -539,29 +537,29 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.decodes_last_ready and self._can_schedule_decode_last():
-                return self._pick_decode_last_batch()
-            if self.prefills_last_ready:
-                return self._pick_prefill_last_batch()
-            if self.drafts_last_ready:
+            if self.drafts_last_ready and self._can_schedule_draft_last():
                 return self._pick_draft_last_batch()
             if self._can_schedule_draft_first():
                 return self._pick_draft_first_batch()
+            if self.decodes_last_ready and self._can_schedule_decode_last():
+                return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
+            if self.prefills_last_ready:
+                return self._pick_prefill_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
-        if self.decodes_last_ready and self._can_schedule_decode_last():
-            return self._pick_decode_last_batch()
-        if self.prefills_last_ready:
-            return self._pick_prefill_last_batch()
-        if self.drafts_last_ready:
+        # HIGH: Draft尾 > Draft首 > D尾 > D首 > P尾 > Empty
+        if self.drafts_last_ready and self._can_schedule_draft_last():
             return self._pick_draft_last_batch()
         if self._can_schedule_draft_first():
             return self._pick_draft_first_batch()
+        if self.decodes_last_ready and self._can_schedule_decode_last():
+            return self._pick_decode_last_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
+        if self.prefills_last_ready:
+            return self._pick_prefill_last_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -574,8 +572,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             (
                 self.prefill_inflight_count > 0
-                or self.decode_inflight_count > 0
-                or self.draft_inflight_count > 0
+                or self.decode_or_draft_inflight_count > 0
                 or self.draft_remote_pending_count > 0
             )
             and not self.prefills_last_ready
@@ -615,12 +612,12 @@ class PDSeparatedScheduler(Scheduler):
     def _can_schedule_decode_first(self) -> bool:
         return bool(
             self.running
-            and self.decode_inflight_count < self.decode_inflight_limit
-            and self.draft_inflight_count == 0
+            and self.decode_or_draft_inflight_count == 0
             and self.draft_remote_pending_count == 0
             and not self.drafts_first_ready
             and not self.drafts_last_ready
             and not self._force_decode_last
+            and not self._force_draft_last
         )
 
     def _can_schedule_draft_first(self) -> bool:
@@ -630,11 +627,11 @@ class PDSeparatedScheduler(Scheduler):
         # for the opposite-direction send before posting the matching recv.
         return bool(
             self.drafts_first_ready
-            and self.draft_inflight_count < self.draft_inflight_limit
+            and self.decode_or_draft_inflight_count == 0
             and self.draft_remote_pending_count == 0
             and not self.drafts_last_ready
-            and self.decode_inflight_count == 0
             and not self._force_decode_last
+            and not self._force_draft_last
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -651,8 +648,8 @@ class PDSeparatedScheduler(Scheduler):
                 f"drafts_last_ready[]: {len(self.drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
-                f"draft_inflight: {self.draft_inflight_count}/{self.draft_inflight_limit}, "
-                f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}, "
+                f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}, "
                 f"chunk_flights: {len(self._prefill_flight_by_token)}, "
                 f"pending_tails: {self._total_pending_tails()}, "
                 f"ahead_chunks: {sum(self._ahead_chunk_count.values())}",
@@ -669,8 +666,8 @@ class PDSeparatedScheduler(Scheduler):
                 f"drafts_last_ready[]: {len(self.drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
-                f"draft_inflight: {self.draft_inflight_count}/{self.draft_inflight_limit}, "
-                f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
+                f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
 
     # ------------------------------------------------------------------ #
@@ -709,6 +706,20 @@ class PDSeparatedScheduler(Scheduler):
                         "Invalid %s value %r in %s; keeping %d",
                         _key, raw[_key], yaml_path,
                         self._decode_last_delay_schedule_ms,
+                    )
+            _draft_key = "draft_last_delay_schedule_ms"
+            if _draft_key in raw:
+                try:
+                    self._draft_last_delay_schedule_ms = int(raw[_draft_key])
+                    logger.info(
+                        "[PDSeparatedScheduler] %s set to %d from %s",
+                        _draft_key, self._draft_last_delay_schedule_ms, yaml_path,
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid %s value %r in %s; keeping %d",
+                        _draft_key, raw[_draft_key], yaml_path,
+                        self._draft_last_delay_schedule_ms,
                     )
             self._layer_slice_config_path = yaml_path
             self._layer_slice_config_mtime = os.path.getmtime(yaml_path)
@@ -755,6 +766,23 @@ class PDSeparatedScheduler(Scheduler):
             "[PD] DECODE_LAST delayed: elapsed=%.1f ms < limit=%d ms",
             elapsed_ms, self._decode_last_delay_schedule_ms,
         )
+        return False
+
+    # ------------------------------------------------------------------ #
+    # DRAFT_LAST delay scheduling                                         #
+    # ------------------------------------------------------------------ #
+    def _start_draft_last_delay(self) -> None:
+        """Draft首 pick 后启动，Draft尾 在延迟到期前不可被调度。"""
+        self._draft_last_delay_start_ts = time.monotonic()
+
+    def _can_schedule_draft_last(self) -> bool:
+        """Return True if the delay since DRAFT_FIRST has elapsed."""
+        if self._draft_last_delay_start_ts is None:
+            return True
+        elapsed_ms = (time.monotonic() - self._draft_last_delay_start_ts) * 1000
+        if elapsed_ms >= self._draft_last_delay_schedule_ms:
+            self._draft_last_delay_start_ts = None
+            return True
         return False
 
     def _pick_prefill_first_batch(self) -> SchedulerOutput:
@@ -1100,18 +1128,31 @@ class PDSeparatedScheduler(Scheduler):
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
         scheduler_output.hidden_channel = HiddenChannelType.DECODE
-        self.draft_inflight_count += 1
+        self.decode_or_draft_inflight_count += 1
         self.draft_remote_pending_count += 1
+        self._force_draft_last = True
+        self._start_draft_last_delay()
+
+        # === Draft 尾自发布 ===
+        # 与 Decode 尾自发布同理：边侧预生成 DRAFT_LAST 并入
+        # drafts_last_ready，调度 DRAFT_LAST 无需 POST_OUT 往返。
+        # 云侧对 DRAFT_FIRST 跳过 POST_OUT 发布。
+        from dataclasses import replace
+        draft_last = replace(
+            scheduler_output,
+            batch_type=BatchType.DRAFT_LAST,
+        )
+        self.drafts_last_ready.append(draft_last)
         logger.info(
             "[MTP-DEBUG] scheduler picked DRAFT_FIRST: task_id=%s, "
             "parent_req_id=%s, draft_step_idx=%s, head_token=%s, "
-            "remaining_ready=%d, draft_inflight=%d, draft_remote_pending=%d",
+            "remaining_ready=%d, decode_or_draft_inflight=%d, draft_remote_pending=%d",
             scheduler_output.draft_task_id,
             scheduler_output.parent_req_id,
             scheduler_output.draft_step_idx,
             scheduler_output.head_token,
             len(self.drafts_first_ready),
-            self.draft_inflight_count,
+            self.decode_or_draft_inflight_count,
             self.draft_remote_pending_count,
         )
         return scheduler_output
@@ -1135,6 +1176,8 @@ class PDSeparatedScheduler(Scheduler):
                     scheduler_output.draft_step_idx,
                 )
                 continue
+            self._force_draft_last = False
+            self._start_decode_or_draft_first_only_window()
             return scheduler_output
         return self._make_empty_batch()
 
@@ -1187,7 +1230,7 @@ class PDSeparatedScheduler(Scheduler):
             f"decodes_last_ready expects DECODE_LAST, got {so.batch_type}"
         )
         self._validate_decode_tail_channel(so)
-        self._start_decode_first_only_window()
+        self._start_decode_or_draft_first_only_window()
         self._force_decode_last = False
         return so
 
@@ -1222,7 +1265,7 @@ class PDSeparatedScheduler(Scheduler):
             cached_reqs.req_ids,
             cached_reqs.num_output_tokens,
         ):
-            if num_output_tokens > 0 and req_id not in cached_reqs.all_token_ids:
+            if req_id not in cached_reqs.all_token_ids:
                 # Use the Request-level cached np.ndarray to avoid repeated
                 # np.asarray() conversion of the Python list (dominant
                 # bottleneck on long-sequence decode batches).
@@ -1260,7 +1303,7 @@ class PDSeparatedScheduler(Scheduler):
                         self.hidden_channel_manager.decode_channel()
                     )
                     self._ensure_cached_all_token_ids(scheduler_output)
-                    self.decode_inflight_count += 1
+                    self.decode_or_draft_inflight_count += 1
                     self._force_decode_last = True
                     self._start_decode_last_delay()
 
@@ -1504,21 +1547,21 @@ class PDSeparatedScheduler(Scheduler):
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             # D首完成后立即释放 inflight 计数，使下一个 D首可以
             # 在 D尾仍在 batch_queue 中时就被调度，消除 Cloud idle gap。
-            if self.decode_inflight_count > 0:
-                self.decode_inflight_count -= 1
+            if self.decode_or_draft_inflight_count > 0:
+                self.decode_or_draft_inflight_count -= 1
             logger.info(
                 f"[PD] update_from_output DECODE_FIRST done, "
-                f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
+                f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
         if scheduler_output.batch_type == BatchType.DRAFT_FIRST:
-            self.draft_inflight_count = max(
-                0, self.draft_inflight_count - 1
+            self.decode_or_draft_inflight_count = max(
+                0, self.decode_or_draft_inflight_count - 1
             )
             logger.info(
                 "[PD] update_from_output DRAFT_FIRST done, "
-                "draft_inflight: %d/%d",
-                self.draft_inflight_count,
-                self.draft_inflight_limit,
+                "decode_or_draft_inflight: %d/%d",
+                self.decode_or_draft_inflight_count,
+                self.decode_or_draft_inflight_limit,
             )
         if scheduler_output.batch_type == BatchType.DRAFT_LAST:
             self.draft_remote_pending_count = max(
@@ -1530,11 +1573,11 @@ class PDSeparatedScheduler(Scheduler):
                 self.draft_remote_pending_count,
             )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
-            # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output
+            # decode_or_draft_inflight_count 已在 DECODE_FIRST 的 update_from_output
             # 中释放，此处不再重复减 1。
             logger.info(
                 f"[PD] update_from_output DECODE_LAST done, "
-                f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
+                f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
         outputs = super().update_from_output(scheduler_output, model_runner_output)
         self.chunk_prefill_first = [
@@ -1591,7 +1634,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.drafts_first_ready
             or self.drafts_last_ready
-            or self.draft_inflight_count > 0
+            or self.decode_or_draft_inflight_count > 0
             or self.draft_remote_pending_count > 0
         )
 
