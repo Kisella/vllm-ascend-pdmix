@@ -581,6 +581,12 @@ def _patched_step_with_batch_queue(self):
 
     # Block until the next result is available.
     future, scheduler_output, exec_model_fut = batch_queue.pop()
+    bt = scheduler_output.batch_type
+    vllm_logger.info(
+        "[PD] EngineCore blocking on future.result(): "
+        "batch_type=%s total_tokens=%d",
+        bt.value if bt else "N/A",
+        scheduler_output.total_num_scheduled_tokens)
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
