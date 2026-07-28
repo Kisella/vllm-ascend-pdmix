@@ -359,9 +359,9 @@ def _trim_scheduler_output_for_worker_enqueue(
 
     Cloud worker ``_update_states`` only needs ``all_token_ids`` for cached
     requests that are not already in its persistent batch and have output
-    tokens.  The best local approximation is the previous cloud dispatch batch:
-    continuously dispatched requests can drop ``all_token_ids`` while newly
-    appearing / resumed requests keep it.
+    tokens.  The best local approximation is the most recent cloud dispatch
+    that ran ``_update_states``: continuously resident requests can drop
+    ``all_token_ids`` while newly appearing / resumed requests keep it.
     """
     cached = scheduler_output.scheduled_cached_reqs
     if cached is None:
@@ -430,6 +430,18 @@ def _trim_scheduler_output_for_worker_enqueue(
     cached_copy.all_token_ids = trimmed_all_token_ids
     so_copy.scheduled_cached_reqs = cached_copy
     return so_copy
+
+
+def _updates_worker_persistent_batch(
+    scheduler_output: SchedulerOutput,
+    slice_info,
+) -> bool:
+    """Whether this dispatch runs ``_update_states`` on the cloud worker."""
+    return (
+        scheduler_output.batch_type != BatchType.DRAFT_FIRST
+        and scheduler_output.total_num_scheduled_tokens > 0
+        and (slice_info is None or slice_info.is_first_slice)
+    )
 
 
 class PassiveEngineCoreProc:
@@ -522,7 +534,7 @@ class PassiveEngineCoreProc:
         self._published_post_out_tokens: set[str] = set()
 
     def _drain_worker_completion_acks(self) -> None:
-        """Publish POST_OUT only after cloud workers complete the middle segment."""
+        """Publish prefill POST_OUT after cloud workers finish the middle."""
         for mq in getattr(self.executor, "response_mqs", []):
             while True:
                 try:
@@ -539,10 +551,10 @@ class PassiveEngineCoreProc:
                 ):
                     continue
 
-                if result.get("batch_type") not in (
-                    BatchType.PREFILL_FIRST,
-                    BatchType.DRAFT_FIRST,
-                ):
+                # Decode and draft tails are self-posted on the edge. Their
+                # worker acks are still drained from the response MQ, but do
+                # not drive a cloud -> edge POST_OUT control message.
+                if result.get("batch_type") != BatchType.PREFILL_FIRST:
                     continue
                 head_token = result.get("head_token")
                 if not head_token or head_token in self._published_post_out_tokens:
@@ -699,9 +711,12 @@ class PassiveEngineCoreProc:
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
-            self._prev_dispatch_req_ids = set(
-                batch.scheduler_output.num_scheduled_tokens.keys()
-            )
+            if _updates_worker_persistent_batch(
+                batch.scheduler_output, slice_info
+            ):
+                self._prev_dispatch_req_ids = set(
+                    batch.scheduler_output.num_scheduled_tokens.keys()
+                )
             _dt_enqueue = (time.monotonic() - _t0) * 1000
             if _dt_trim > 0.5 or _dt_enqueue > 0.5:
                 logger.info(
@@ -716,13 +731,11 @@ class PassiveEngineCoreProc:
                     bt,
                     _dt_enqueue,
                 )
-            # For prefill and draft, POST_OUT must mean the cloud middle
-            # segment has completed. Store the original SchedulerOutput here
-            # and publish it from _drain_worker_completion_acks() after the
-            # worker reports done. Decode-last is prepared on the edge.
+            # PREFILL_FIRST still needs a cloud-generated POST_OUT after the
+            # middle segment has completed and started sending hidden states
+            # back. Decode and draft tails are self-posted on the edge.
             if (
-                batch.scheduler_output.batch_type
-                in (BatchType.PREFILL_FIRST, BatchType.DRAFT_FIRST)
+                batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
             ):
                 head_token = getattr(batch.scheduler_output, "head_token", None)
@@ -740,8 +753,8 @@ class PassiveEngineCoreProc:
 
         Mapping (cloud-side):
             PREFILL_FIRST → PREFILL_LAST
-            DECODE_FIRST  → dropped (edge prepares DECODE_LAST)
-            DRAFT_FIRST   → DRAFT_LAST
+            DECODE_FIRST  → skipped (edge self-posts DECODE_LAST)
+            DRAFT_FIRST   → skipped (edge self-posts DRAFT_LAST)
             anything else → dropped (legacy PP batches don't trigger return)
 
         Uses a shallow copy via :py:func:`dataclasses.replace` so the original
@@ -766,19 +779,15 @@ class PassiveEngineCoreProc:
             )
             return
         elif bt == BatchType.DRAFT_FIRST:
-            tail = replace(
-                scheduler_output, batch_type=BatchType.DRAFT_LAST
+            # Draft-first self-posting optimization: the edge creates
+            # DRAFT_LAST together with DRAFT_FIRST, just like decode. Do not
+            # publish a second tail after the cloud worker ack.
+            logger.debug(
+                "[Cloud] Skipping POST_OUT for DRAFT_FIRST "
+                "head_token=%s (edge pre-generates DRAFT_LAST)",
+                scheduler_output.head_token,
             )
-            if not tail.head_token:
-                raise RuntimeError("DRAFT_LAST POST_OUT missing head_token")
-            if not tail.draft_task_id:
-                raise RuntimeError(
-                    "DRAFT_LAST POST_OUT missing draft_task_id"
-                )
-            if tail.draft_step_idx is None:
-                raise RuntimeError(
-                    "DRAFT_LAST POST_OUT missing draft_step_idx"
-                )
+            return
         else:
             return
         # Echo the head_token back so the edge can correlate the tail
