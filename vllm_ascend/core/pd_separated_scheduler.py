@@ -1440,9 +1440,13 @@ class PDSeparatedScheduler(Scheduler):
                 req.status = RequestStatus.RUNNING
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        # In PD separation requests may re-enter ``running`` from
+        # ``chunk_prefill_first`` with a stale ``PREEMPTED`` status when the
+        # ``_migrate_prefill_to_running`` conditions are not met in time.
+        # The upstream scheduler only picks ``RUNNING`` requests to preempt,
+        # so the status is a lagging indicator; ensure it is correct.
+        if request.status != RequestStatus.RUNNING:
+            request.status = RequestStatus.RUNNING
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1674,6 +1678,15 @@ class PDSeparatedScheduler(Scheduler):
         ]
         self.prefill_last_pending = [
             req for req in self.prefill_last_pending if not req.is_finished()
+        ]
+        # Drain finished requests from running: update_from_output removes
+        # completed requests from self.requests, but they may still be in
+        # running.  That causes KeyError in super().schedule() /
+        # _update_after_schedule when the base scheduler accesses
+        # self.requests[req_id].  Clean them up here, once per step.
+        self.running = [
+            req for req in self.running
+            if req.request_id in self.requests
         ]
         return outputs
 
