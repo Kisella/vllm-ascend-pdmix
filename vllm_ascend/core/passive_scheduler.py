@@ -586,20 +586,10 @@ class PassiveScheduler:
 
         ``EXPECT_ALTERNATION`` implements the Phase7 cloud-side EEP/EED state
         machine.  Sliced prefill-like batches are dispatched one slice per call
-        so decode batches can be interleaved between the remaining slices.
+        so decode/draft batches can be interleaved between the remaining
+        slices.  Draft priority is enforced inside the state machine, not via
+        an early out-of-band check.
         """
-        # Finish an active sliced prefill before switching work, but do not
-        # let queued prefills starve a scheduled draft. It owns the shared
-        # bidirectional DECODE channel until its tail is consumed on edge;
-        # delaying it behind a continuous prefill stream can block all decode
-        # progress.
-        if (
-            self.ready_drafts
-            and not self._active_prefill_slices
-        ):
-            self._clear_prefill_middle_throttle()
-            return self._build_batch(self.ready_drafts.popleft())
-
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
 
@@ -700,6 +690,10 @@ class PassiveScheduler:
         else:  # EXPECT_EXECUTE_DECODE_OR_DRAFT
             # Draft priority > Decode
             if self.ready_drafts:
+                self.cloud_scheduling_state = (
+                    CloudSchedulingState.EXPECT_EXECUTE_PREFILL
+                )
+                self._clear_prefill_middle_throttle()
                 return self._build_batch(self.ready_drafts.popleft())
             if self.ready_decodes:
                 self.cloud_scheduling_state = (
@@ -707,7 +701,9 @@ class PassiveScheduler:
                 )
                 self._clear_prefill_middle_throttle()
                 return self._build_batch(self.ready_decodes.popleft())
-            # No Draft/Decode: callback to Prefill
+            # No Draft/Decode: callback to Prefill.  Stay in the current
+            # state — the next schedule() call will check for drafts
+            # again at its earliest opportunity.
             if self._can_fallback_to_prefill_in_decode_state():
                 if self._active_prefill_slices:
                     self._start_prefill_middle_throttle()
