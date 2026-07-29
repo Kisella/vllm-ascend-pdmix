@@ -992,6 +992,13 @@ class NPUWorker(WorkerBase):
             layer_slice_info is None or layer_slice_info.is_first_slice
         )
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        # Always run _update_states for the first slice (or unsliced batch),
+        # even when total_num_scheduled_tokens==0.  Some requests may not
+        # contribute tokens to this slice but their state must still be
+        # initialised in the cloud worker's all_token_ids, otherwise a
+        # subsequent DECODE_FIRST / DRAFT_FIRST will KeyError in _update_states.
+        if is_first_slice:
+            self.model_runner.cloud_prepare_early(scheduler_output)
         if forward_pass and is_first_slice:
             # [CHER] Atomically reuse the guard thread's early-recv entry, or
             # post the irecv ourselves.  get_or_post_early_recv guarantees at
@@ -1015,10 +1022,6 @@ class NPUWorker(WorkerBase):
                 )
             if entry is not None:
                 logger.debug("[CHER] consume early-recv head_token=%s", _ht)
-                # cloud_prepare_early overlaps input prep with the (already
-                # in-flight or done) recv; run it before execute_model uses
-                # the intermediate tensors.
-                self.model_runner.cloud_prepare_early(scheduler_output)
                 intermediate_tensors = entry
                 # wait_for_comm() runs implicitly on first .tensors access
                 # inside execute_model (AsyncIntermediateTensors.__getattr__),
@@ -1058,7 +1061,6 @@ class NPUWorker(WorkerBase):
                 )
                 logger.info(f"Received intermediate tensors from edge, hidden_channel={channel.value}")
 
-                self.model_runner.cloud_prepare_early(scheduler_output)
                 if do_sp_chunk and not merge_payload:
                     tensor_dict = {
                         k: sequence_parallel_chunk(v)
