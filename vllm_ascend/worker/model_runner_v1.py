@@ -2880,6 +2880,16 @@ class NPUModelRunner(GPUModelRunner):
             if req_id_set.intersection(context.get("req_ids") or ())
         ]
         for task_id in stale_task_ids:
+            # Keep enqueued contexts whose draft is not yet complete:
+            # they have been converted to a DRAFT_FIRST SchedulerOutput
+            # and the worker will need the context when it executes that
+            # DRAFT_FIRST.  But if the draft IS already complete, the
+            # context was fully consumed and can safely be removed.
+            context = self._pending_edge_cloud_draft_contexts.get(task_id)
+            if context and context.get("enqueued") and not context.get(
+                "draft_complete"
+            ):
+                continue
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
 
     def _get_pending_edge_cloud_draft_context(
@@ -5374,6 +5384,12 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if not num_scheduled_tokens:
             self._cloud_prepare_cache = None
+            # Still run _update_states: a zero-token slice may be the first
+            # slice of a new request that just entered the cloud worker's
+            # batch.  _update_states must see the request at least once to
+            # populate req_data.all_token_ids; otherwise a later
+            # DECODE_FIRST / DRAFT_FIRST will KeyError.
+            self._update_states(scheduler_output)
             return
 
         # Replicate scheduler_output handling from execute_model

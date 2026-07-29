@@ -384,10 +384,8 @@ def _trim_scheduler_output_for_worker_enqueue(
         req_id
         for req_id in all_token_ids
         if req_id in resumed_req_ids
-        or (
-            req_id not in prev_dispatch_req_ids
-            and num_output_tokens_by_req.get(req_id, 0) > 0
-        )
+        or req_id not in prev_dispatch_req_ids
+        or num_output_tokens_by_req.get(req_id, 0) > 0
     }
     trimmed_all_token_ids = {}
     for req_id, token_ids in all_token_ids.items():
@@ -395,6 +393,10 @@ def _trim_scheduler_output_for_worker_enqueue(
             continue
         num_output_tokens = num_output_tokens_by_req.get(req_id, 0)
         if num_output_tokens <= 0:
+            # New request without output tokens yet: keep full token_ids.
+            # The cloud worker's _update_states must see it at least once
+            # to populate req_data.all_token_ids.
+            trimmed_all_token_ids[req_id] = token_ids
             continue
         keep_len = min(num_output_tokens, len(token_ids))
         if keep_len <= 0:
@@ -731,9 +733,11 @@ class PassiveEngineCoreProc:
                     bt,
                     _dt_enqueue,
                 )
-            # PREFILL_FIRST still needs a cloud-generated POST_OUT after the
-            # middle segment has completed and started sending hidden states
-            # back. Decode and draft tails are self-posted on the edge.
+            # For prefill, POST_OUT must mean the cloud middle
+            # segment has completed. Store the original SchedulerOutput here
+            # and publish it from _drain_worker_completion_acks() after the
+            # worker reports done. Decode-last and Draft-last are prepared on
+            # the edge (self-posting), so they are not pending here.
             if (
                 batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
@@ -779,9 +783,9 @@ class PassiveEngineCoreProc:
             )
             return
         elif bt == BatchType.DRAFT_FIRST:
-            # Draft-first self-posting optimization: the edge creates
-            # DRAFT_LAST together with DRAFT_FIRST, just like decode. Do not
-            # publish a second tail after the cloud worker ack.
+            # The edge pre-generates DRAFT_LAST (self-posting, same as
+            # DECODE_FIRST -> DECODE_LAST), so the cloud does not publish
+            # POST_OUT for DRAFT_FIRST.
             logger.debug(
                 "[Cloud] Skipping POST_OUT for DRAFT_FIRST "
                 "head_token=%s (edge pre-generates DRAFT_LAST)",
