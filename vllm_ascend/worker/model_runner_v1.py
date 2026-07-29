@@ -2985,6 +2985,15 @@ class NPUModelRunner(GPUModelRunner):
             if req_id_set.intersection(context.get("req_ids") or ())
         ]
         for task_id in stale_task_ids:
+            # Keep enqueued contexts: they have been converted to a
+            # DRAFT_FIRST SchedulerOutput that is already in the
+            # EngineCore's scheduler queue (drafts_first_ready) and is
+            # about to be dispatched to the worker.  Removing them now
+            # causes a "DRAFT batch has no pending draft context"
+            # RuntimeError when the worker executes the DRAFT_FIRST.
+            context = self._pending_edge_cloud_draft_contexts.get(task_id)
+            if context and context.get("enqueued", False):
+                continue
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
         if stale_task_ids:
             stale = set(stale_task_ids)
