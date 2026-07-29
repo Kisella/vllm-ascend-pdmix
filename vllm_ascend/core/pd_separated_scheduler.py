@@ -1430,6 +1430,14 @@ class PDSeparatedScheduler(Scheduler):
         for req in completed:
             self.chunk_prefill_first.remove(req)
             self.running.append(req)
+            # A preempted request lands in chunk_prefill_first (status
+            # stays PREEMPTED) and may be re-added to running here.  If
+            # super().schedule() later selects it for preemption again,
+            # _preempt_request asserts status == RUNNING.  Restore the
+            # status unconditionally: the request was fully prefilled and
+            # is entering decode — it must be RUNNING.
+            if req.status != RequestStatus.RUNNING:
+                req.status = RequestStatus.RUNNING
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         assert request.status == RequestStatus.RUNNING, (
