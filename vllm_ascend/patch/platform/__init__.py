@@ -21,6 +21,10 @@ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_pd_scheduler_shim  # noqa
 import vllm_ascend.patch.platform.patch_serve_headless  # noqa
+# Unconditional: must be in place before create_engine_config inspects model
+# architectures (e.g. the MTP draft model) in a subprocess. See the module
+# docstring for why ms_service_profiler must not auto-load there.
+import vllm_ascend.patch.platform.patch_registry_subprocess  # noqa
 from vllm_ascend import envs
 from vllm_ascend.utils import is_310p
 
