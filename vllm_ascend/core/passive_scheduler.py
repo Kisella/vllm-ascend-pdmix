@@ -575,7 +575,7 @@ class PassiveScheduler:
             )
             self._clear_prefill_middle_throttle()
             return True
-        logger.info(
+        logger.debug(
             f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / {limit_ms:.0f}ms, "
             f"still waiting for decode",
         )

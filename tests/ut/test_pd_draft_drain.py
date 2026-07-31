@@ -54,6 +54,7 @@ def _make_bare_scheduler():
     s.draft_remote_pending_count = 0
     s.decode_or_draft_inflight_count = 0
     s.decode_or_draft_inflight_limit = 1
+    s.decode_head_inflight_count = 0
     s._force_draft_last = False
     s._force_decode_last = False
     s.num_spec_tokens = 3
@@ -124,6 +125,33 @@ class TestCanScheduleDraftFirstForceGuard:
         s._force_draft_last = False
         s.drafts_last_ready.append(_make_draft_last())
         assert s._can_schedule_draft_first() is False
+
+    def test_preGen_blocked_when_decode_head_in_flight(self):
+        """Regression for decode_or_draft_inflight=2/1: DRAFT_FIRST and
+        DECODE_FIRST use different recv primitives but share the DECODE
+        stream, so a DRAFT_FIRST must not be dispatched while a DECODE_FIRST
+        head is in flight (the cloud's recv order could mismatch the edge's
+        send order).  Gate on decode heads, not total heads."""
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False
+        s.decode_head_inflight_count = 1  # a DECODE_FIRST in flight
+        assert s._can_schedule_draft_first() is False
+        s.decode_head_inflight_count = 0
+        assert s._can_schedule_draft_first() is True
+
+    def test_preGen_allows_draft_pipeline_while_draft_in_flight(self):
+        """The next DRAFT_FIRST MAY be dispatched while a previous DRAFT_FIRST
+        is still in flight (draft pipelining): DRAFT_FIRST is an edge->cloud
+        send while DRAFT_LAST is a cloud->edge recv (opposite stream
+        directions), and draft+draft uses the same recv primitive (FIFO).
+        Only a DECODE_FIRST head blocks it, not another DRAFT_FIRST."""
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False  # previous DRAFT_LAST already picked
+        s.drafts_last_ready = deque()  # previous DRAFT_LAST popped (in flight)
+        s.decode_head_inflight_count = 0  # no DECODE_FIRST in flight
+        s.decode_or_draft_inflight_count = 1  # a DRAFT_FIRST in flight
+        s.draft_remote_pending_count = 1  # under the pipeline credit (<2)
+        assert s._can_schedule_draft_first() is True
 
     def test_legacy_branch_also_blocked_by_force_draft_last(self):
         """Non-pre-generated branch already had the guard (unchanged)."""

@@ -238,6 +238,13 @@ class PDSeparatedScheduler(Scheduler):
         self.prefill_inflight_count: int = 0
         self.decode_or_draft_inflight_limit: int = 1
         self.decode_or_draft_inflight_count: int = 0
+        # DECODE_FIRST heads picked but not yet completed (update_from_output).
+        # DRAFT_FIRST and DECODE_FIRST use different recv primitives but share
+        # the DECODE stream, so they must not be in flight simultaneously
+        # (the cloud's recv order could mismatch the edge's send order).
+        # DRAFT_FIRST+DRAFT_FIRST is safe (same primitive, FIFO), so draft
+        # pipelining only needs to gate on decode heads, not total heads.
+        self.decode_head_inflight_count: int = 0
         self.draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager — per-dp_rank slice.
@@ -742,8 +749,17 @@ class PDSeparatedScheduler(Scheduler):
             # may not be picked until its DRAFT_LAST is picked (which clears
             # the flag).  Without it, a DRAFT_LAST dropped/drained without
             # clearing the flag would let a second DRAFT_FIRST through.
+            # `decode_head_inflight_count == 0` (not total inflight == 0)
+            # gates only on DECODE_FIRST heads: a DRAFT_FIRST is an edge->cloud
+            # send while a DRAFT_LAST is a cloud->edge recv, so a second
+            # DRAFT_FIRST may be dispatched while the previous DRAFT_LAST is
+            # still in flight (draft pipelining).  But DRAFT_FIRST and
+            # DECODE_FIRST use different recv primitives on the same stream,
+            # so they must never be in flight together -- hence gate on decode
+            # heads only, allowing draft+draft but not draft+decode.
             return bool(
-                self.draft_remote_pending_count
+                self.decode_head_inflight_count == 0
+                and self.draft_remote_pending_count
                 < self._draft_remote_pending_limit
                 and not self.drafts_last_ready
                 and not self._force_decode_last
@@ -1772,6 +1788,7 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self._ensure_cached_all_token_ids(scheduler_output)
                     self.decode_or_draft_inflight_count += 1
+                    self.decode_head_inflight_count += 1
                     self._force_decode_last = True
                     self._start_decode_last_delay()
 
@@ -2028,6 +2045,8 @@ class PDSeparatedScheduler(Scheduler):
             # 在 D尾仍在 batch_queue 中时就被调度，消除 Cloud idle gap。
             if self.decode_or_draft_inflight_count > 0:
                 self.decode_or_draft_inflight_count -= 1
+            if self.decode_head_inflight_count > 0:
+                self.decode_head_inflight_count -= 1
             logger.info(
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",

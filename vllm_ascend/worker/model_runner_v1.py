@@ -838,7 +838,13 @@ class NPUModelRunner(GPUModelRunner):
         self._cloud_spec_decode_metadata_by_task: dict[
             str, tuple[AscendCommonAttentionMetadata, int]
         ] = {}
-        self._cloud_spec_decode_metadata_cache_max: int = 8
+        # Bound sized for long-sequence (e.g. 64k) multi-request runs where the
+        # draft chain can legitimately lag several verify steps behind.  Too
+        # small a bound evicts an in-flight task's metadata; the matching
+        # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
+        # cloud never sends the DRAFT_LAST response, deadlocking the edge's
+        # matching recv on the shared DECODE channel.
+        self._cloud_spec_decode_metadata_cache_max: int = 32
         # Same per-task treatment for the verify step's scheduler_output:
         # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
