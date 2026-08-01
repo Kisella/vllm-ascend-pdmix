@@ -3663,6 +3663,22 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = cache["cudagraph_mode"]
             batch_desc = cache["batch_desc"]
             cudagraph_stats = cache["cudagraph_stats"]
+            # Restore this batch's discard state as well.  The fast path
+            # skips _prepare_inputs, and the shared discard buffers may have
+            # been overwritten by an interleaved head segment executing
+            # between this batch's head and tail (e.g. the last chunk's
+            # PREFILL_FIRST, which discards nothing, running before a
+            # mid-chunk PREFILL_LAST).  Without the restore, a mid-chunk PL
+            # returns its (prompt-predicting) sampled token to the
+            # scheduler, double-decrementing num_output_placeholders and
+            # tripping the assert in AsyncScheduler._update_request_with_output.
+            self.num_discarded_requests = cache["num_discarded_requests"]
+            self.discard_request_indices.np[: self.num_discarded_requests] = (
+                cache["discard_request_indices"]
+            )
+            self.discard_request_indices.copy_to_gpu(
+                self.num_discarded_requests
+            )
             # Re-sync num_computed_tokens from CPU: segment_a forward or
             # async state update may have modified the GPU buffer.
             # NOTE: In async speculative decoding, segment_a has already
@@ -3970,6 +3986,14 @@ class NPUModelRunner(GPUModelRunner):
                 "cudagraph_stats": cudagraph_stats,
                 "total_num_scheduled_tokens": total_num_scheduled_tokens,
                 "positions": positions,
+                # Discard state is part of the prepare results too: the
+                # segment_e fast path skips _prepare_inputs and must restore
+                # this batch's own values instead of inheriting whatever an
+                # interleaved head segment left in the shared buffers.
+                "num_discarded_requests": self.num_discarded_requests,
+                "discard_request_indices": self.discard_request_indices.np[
+                    : self.num_discarded_requests
+                ],
             }
             self._edge_prepare_cache_by_token[scheduler_output.head_token] = (
                 _freeze_scheduled_state(cache_entry)
