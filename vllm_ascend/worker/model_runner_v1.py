@@ -3466,6 +3466,38 @@ class NPUModelRunner(GPUModelRunner):
             )
         # --- End layer slice fast path ---
 
+        # [EDGE-SEGMENT-E LEAK FIX] Always consume this forward's segment_a
+        # cache entry on segment_e entry, regardless of which path segment_e
+        # takes below (fast-path, normal-path, or stale-tail discard).
+        #
+        # Before this, the entry was only popped on the fast path. When high
+        # concurrency interleaving (2P1D) made the fast-path req_ids check
+        # fail, segment_e fell through to the normal path WITHOUT popping ->
+        # the entry orphaned. Orphans steadily filled the bounded cache,
+        # forced eviction of LIVE entries, and their later segment_e
+        # cache-missed onto the (incorrect-for-tail) normal path ->
+        # _prepare_inputs recomputed against a modified input_batch ->
+        # wrong draft token ids -> acceptance cliff. Aborted/finished reqs
+        # (popped from self.requests during the head->tail window) hit the
+        # stale-tail early-return below, which also bypassed the pop.
+        #
+        # Popping once here covers every segment_e path. It is always safe:
+        # a head_token's segment_e runs at most once, and segment_a caches
+        # under the same head_token it will later pop. If the fast path
+        # cannot reuse the entry (req_ids mismatch / empty batch), the entry
+        # is discarded rather than leaked -- the normal path recomputes, as
+        # it did before, but the cache no longer fills.
+        _edge_cache_entry: dict[str, Any] | None = None
+        if (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and intermediate_tensors is not None
+            and scheduler_output.head_token is not None
+        ):
+            _edge_cache_entry = self._edge_prepare_cache_by_token.pop(
+                scheduler_output.head_token, None
+            )
+
         # Edge-cloud tail-segment validation: use the control-plane
         # head_token to resume the suspended HeadState. The scheduler and
         # hidden channel selection guarantee data-plane alignment.
@@ -3578,7 +3610,7 @@ class NPUModelRunner(GPUModelRunner):
             self._edge_cloud_enabled
             and self.edge_cloud_cfg.role == "edge"
             and intermediate_tensors is not None
-            and scheduler_output.head_token in self._edge_prepare_cache_by_token
+            and _edge_cache_entry is not None
             and self.input_batch.num_reqs > 0
             and tuple(self.input_batch.req_ids)
             == tuple(scheduler_output.num_scheduled_tokens)
@@ -3591,11 +3623,11 @@ class NPUModelRunner(GPUModelRunner):
             and self._cloud_prepare_cache is not None
         )
         if _fast_path:
-            # Pop this head_token's cache so a later segment_a (different
-            # head_token) does not hand the wrong attn_metadata to this PL.
-            cache = self._edge_prepare_cache_by_token.pop(
-                scheduler_output.head_token
-            )
+            # Entry already popped at segment_e entry (covers fast/normal/
+            # stale-tail paths uniformly, preventing orphan leaks). Reuse it
+            # so a later segment_a (different head_token) does not hand the
+            # wrong attn_metadata to this PL.
+            cache = _edge_cache_entry
             total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
             num_tokens_padded = cache["num_tokens_padded"]
             num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -3638,6 +3670,20 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 if not _fast_path and not _cloud_fast_path:
+                    # [EDGE-SEGMENT-E LEAK FIX] If we popped a segment_a entry
+                    # but cannot take the fast path (req_ids mismatch from
+                    # interleaving, or empty batch), the entry is discarded
+                    # here instead of orphaning. Log so the residual leak
+                    # rate can be confirmed on NPU (should be ~0 accumulation;
+                    # non-zero count = the normal-path corruption cases that
+                    # fix C would address).
+                    if _edge_cache_entry is not None:
+                        logger.debug(
+                            "[EDGE-SEGMENT-E] head_token=%s segment_a cache "
+                            "popped but fast-path skipped; entry discarded "
+                            "(previously this orphaned and leaked).",
+                            scheduler_output.head_token,
+                        )
                     # Fix up prev_req_id_to_index for requests that were discarded
                     # in the previous sample_tokens step. If a request has
                     # prev_num_draft_len > 0 but is missing from
