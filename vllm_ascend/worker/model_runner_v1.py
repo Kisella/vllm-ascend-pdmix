@@ -4983,10 +4983,40 @@ class NPUModelRunner(GPUModelRunner):
         return base_positions + draft_step_idx
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        # [edge-cloud fix] Preserve prev_sampled_token_ids mappings across
+        # PD-interleaving churn.  An interleaved prefill batch's
+        # _update_states evicts running decode requests from input_batch,
+        # and InputBatch.remove_request pops their prev_req_id_to_index
+        # entries.  The pending sampled token (still in flight under async
+        # scheduling) then becomes unreachable: when the next DF re-adds
+        # the request, _compute_prev_positions yields -1, the scatter in
+        # _prepare_input_ids skips it, and the embedding consumes a stale/0
+        # input id -> the whole decode batch diverges (confirmed by
+        # [EC-INV-C1] logs).  Finished/aborted requests are NOT restored:
+        # they are popped from self.requests at the top of the same
+        # _update_states call.  The prev_sampled buffer rows are not
+        # touched by _update_states, so the saved row indices stay valid;
+        # the next sampling's _merge_pending_prev_sampled carries the
+        # entries forward from there.  (cherry-picked from f2b9edeb,
+        # ported to the v0.20.2 _update_states that also purges
+        # invalidated cloud draft metadata.)
+        shelved_prev_map = None
+        if self._edge_cloud_enabled and self.use_async_scheduling:
+            prev_map = self.input_batch.prev_req_id_to_index
+            if prev_map:
+                shelved_prev_map = dict(prev_map)
+
         result = super()._update_states(scheduler_output)
         self._purge_invalidated_cloud_draft_metadata(
             getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
         )
+
+        if shelved_prev_map:
+            prev_map = self.input_batch.prev_req_id_to_index
+            if prev_map is not None:
+                for req_id, prev_index in shelved_prev_map.items():
+                    if req_id not in prev_map and req_id in self.requests:
+                        prev_map[req_id] = prev_index
         return result
 
     def _purge_invalidated_cloud_draft_metadata(
