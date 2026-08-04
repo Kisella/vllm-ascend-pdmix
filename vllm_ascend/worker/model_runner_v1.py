@@ -1783,11 +1783,35 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens, self.query_pos.np
         )
         positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
-        np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
-            self.query_pos.np[: cu_num_tokens[-1]],
-            out=positions_np,
-        )
+        if (
+            self._edge_cloud_enabled
+            and self.num_spec_tokens <= 0
+            and not with_prefill
+        ):
+            # [EC-FIX] PD-separated decode: num_computed_tokens_cpu lags the
+            # true sequence length by 1 (the D-head's schedule snapshot misses
+            # the D-tail's advancement), so positions would stay one step
+            # behind -> KV written over the previous step's slot -> the
+            # model's context corrupts from the tail -> repetition.  Use
+            # num_tokens_no_spec, which the D-tail advances per step, as the
+            # decode position base.  On the cloud (last PP rank) vLLM's
+            # _update_states does not advance num_tokens_no_spec, so advance
+            # it here per decode step to keep edge/cloud positions aligned.
+            if not is_edge_device():
+                self.input_batch.num_tokens_no_spec[:num_reqs] += (
+                    num_scheduled_tokens[:num_reqs]
+                )
+            np.add(
+                self.input_batch.num_tokens_no_spec[req_indices],
+                self.query_pos.np[: cu_num_tokens[-1]],
+                out=positions_np,
+            )
+        else:
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                self.query_pos.np[: cu_num_tokens[-1]],
+                out=positions_np,
+            )
 
         # [EC-DIAG] Cloud-side decode positions (KV write positions) vs the
         # edge's sequence advancement.  If positions skip/repeat or drift from
@@ -1897,7 +1921,24 @@ class NPUModelRunner(GPUModelRunner):
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
-        token_indices = positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+        # [EC-FIX] Decouple the INPUT token lookup from the KV position base.
+        # positions_np now uses num_tokens_no_spec (corrected KV position).
+        # The input token for this step is the D-tail's previous write-back,
+        # stored at (num_tokens_no_spec - 1) -- the write-back advances
+        # num_tokens_no_spec per step, so this reads the token generated last
+        # step, independent of whether num_computed_tokens_cpu advances.
+        token_base = positions_np
+        if (
+            self._edge_cloud_enabled
+            and self.num_spec_tokens <= 0
+            and not with_prefill
+        ):
+            token_base = (
+                self.input_batch.num_tokens_no_spec[req_indices]
+                - 1
+                + self.query_pos.np[: cu_num_tokens[-1]]
+            )
+        token_indices = token_base + req_indices * self.input_batch.token_ids_cpu.shape[1]
         token_indices_tensor = torch.from_numpy(token_indices)
         # Prepare input_ids.
         # NOTE(woosuk): We use torch.index_select instead of np.take here
@@ -1934,9 +1975,10 @@ class NPUModelRunner(GPUModelRunner):
                 ],
                 positions_np[:total_num_scheduled_tokens].tolist(),
             )
-            # [EC-DIAG] Assertion A: the D-head's sequence state must match the
-            # previous D-tail's write-back.  A lagging num_computed means the
-            # D-head is about to embed a stale/duplicate token -> repetition.
+            # [EC-DIAG] Assertion A: the D-head's num_tokens_no_spec (the
+            # corrected decode position base) must match the previous D-tail's
+            # write-back.  A mismatch means the per-step advancement is broken
+            # -> stale/duplicate input token -> repetition.
             last_tail = getattr(self, "_ec_last_tail_seq_len", None)
             if last_tail is not None:
                 for req_idx, rid in enumerate(self.input_batch.req_ids):
@@ -1944,22 +1986,23 @@ class NPUModelRunner(GPUModelRunner):
                     if last is None:
                         continue
                     cur = int(
-                        self.input_batch.num_computed_tokens_cpu[req_idx]
+                        self.input_batch.num_tokens_no_spec[req_idx]
                     )
                     if cur != last:
                         self._ec_diag_a_fails = (
                             getattr(self, "_ec_diag_a_fails", 0) + 1
                         )
                         logger.warning(
-                            "[EC-DIAG-A] D-head state LAGS D-tail: req=%s "
-                            "head_num_computed=%d tail_seq_len=%d (fail #%d)",
+                            "[EC-DIAG-A] D-head seq state LAGS D-tail: req=%s "
+                            "head_num_tokens_no_spec=%d tail_seq_len=%d "
+                            "(fail #%d)",
                             rid, cur, last, self._ec_diag_a_fails,
                         )
                         if self._ec_diag_a_fails >= 3:
                             raise AssertionError(
-                                "[EC-DIAG-A] D-head fed stale token state for "
-                                f"req={rid}: head num_computed={cur} != "
-                                f"tail seq_len={last}"
+                                "[EC-DIAG-A] D-head sequence advancement broken "
+                                f"for req={rid}: head num_tokens_no_spec={cur} "
+                                f"!= tail seq_len={last}"
                             )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
