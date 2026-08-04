@@ -1814,8 +1814,11 @@ class NPUModelRunner(GPUModelRunner):
             # the D-tail's advancement), so positions would stay one step
             # behind -> KV written over the previous step's slot -> the
             # model's context corrupts from the tail -> repetition.  Use
-            # num_tokens_no_spec, which the D-tail advances per step, as the
-            # decode position base.  On the cloud (last PP rank) vLLM's
+            # (num_tokens_no_spec - 1), the position of the INPUT token (the
+            # D-tail's previous write-back), as the decode position base: the
+            # KV slot for the first generated token (position prompt_len)
+            # would otherwise never be written, leaving a hole in the
+            # attention prefix.  On the cloud (last PP rank) vLLM's
             # _update_states does not advance num_tokens_no_spec, so advance
             # it here per decode step to keep edge/cloud positions aligned.
             if not is_edge_device():
@@ -1823,7 +1826,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens[:num_reqs]
                 )
             np.add(
-                self.input_batch.num_tokens_no_spec[req_indices],
+                self.input_batch.num_tokens_no_spec[req_indices] - 1,
                 self.query_pos.np[: cu_num_tokens[-1]],
                 out=positions_np,
             )
