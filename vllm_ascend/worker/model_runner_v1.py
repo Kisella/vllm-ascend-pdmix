@@ -1808,6 +1808,32 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens[:num_reqs].tolist(),
                 positions_np[:total_num_scheduled_tokens].tolist(),
             )
+            # [EC-DIAG] Assertion B: each decode step's starting position must
+            # advance by exactly 1 per request.  A skip/repeat here means the
+            # cloud writes KV at the wrong slots -> inconsistent prefix ->
+            # repetition.
+            last_pos = getattr(self, "_ec_last_cloud_pos", None)
+            if last_pos is None:
+                last_pos = {}
+                self._ec_last_cloud_pos = last_pos
+            for req_idx, rid in enumerate(self.input_batch.req_ids):
+                cur = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                prev = last_pos.get(rid)
+                if prev is not None and cur != prev + 1:
+                    self._ec_diag_b_fails = (
+                        getattr(self, "_ec_diag_b_fails", 0) + 1
+                    )
+                    logger.warning(
+                        "[EC-DIAG-B] cloud decode position drift: req=%s "
+                        "num_computed=%d prev=%d (fail #%d)",
+                        rid, cur, prev, self._ec_diag_b_fails,
+                    )
+                    if self._ec_diag_b_fails >= 3:
+                        raise AssertionError(
+                            "[EC-DIAG-B] cloud decode KV position drift for "
+                            f"req={rid}: num_computed={cur} != prev+1={prev + 1}"
+                        )
+                last_pos[rid] = cur
 
         # For PCP, compute slot_mapping on GPU using pre-PCP-split positions.
         # Use blocking .to(device) to ensure data lands on GPU before PCP
@@ -1908,6 +1934,33 @@ class NPUModelRunner(GPUModelRunner):
                 ],
                 positions_np[:total_num_scheduled_tokens].tolist(),
             )
+            # [EC-DIAG] Assertion A: the D-head's sequence state must match the
+            # previous D-tail's write-back.  A lagging num_computed means the
+            # D-head is about to embed a stale/duplicate token -> repetition.
+            last_tail = getattr(self, "_ec_last_tail_seq_len", None)
+            if last_tail is not None:
+                for req_idx, rid in enumerate(self.input_batch.req_ids):
+                    last = last_tail.get(rid)
+                    if last is None:
+                        continue
+                    cur = int(
+                        self.input_batch.num_computed_tokens_cpu[req_idx]
+                    )
+                    if cur != last:
+                        self._ec_diag_a_fails = (
+                            getattr(self, "_ec_diag_a_fails", 0) + 1
+                        )
+                        logger.warning(
+                            "[EC-DIAG-A] D-head state LAGS D-tail: req=%s "
+                            "head_num_computed=%d tail_seq_len=%d (fail #%d)",
+                            rid, cur, last, self._ec_diag_a_fails,
+                        )
+                        if self._ec_diag_a_fails >= 3:
+                            raise AssertionError(
+                                "[EC-DIAG-A] D-head fed stale token state for "
+                                f"req={rid}: head num_computed={cur} != "
+                                f"tail seq_len={last}"
+                            )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
@@ -5575,6 +5628,16 @@ class NPUModelRunner(GPUModelRunner):
                 ],
                 (_prev.cpu().tolist() if _prev is not None else None),
             )
+            # [EC-DIAG] Record the tail's advanced seq len per request; the
+            # next D-head's assertion (A) compares against this.
+            last_tail = getattr(self, "_ec_last_tail_seq_len", None)
+            if last_tail is None:
+                last_tail = {}
+                self._ec_last_tail_seq_len = last_tail
+            for req_idx, rid in enumerate(req_ids):
+                last_tail[rid] = int(
+                    self.input_batch.num_tokens_no_spec[req_idx]
+                )
 
         # logprobs_lists is already set above:
         # - max_gen_len == 1: logprobs_tensors.tolists() (no cu_num_tokens)
