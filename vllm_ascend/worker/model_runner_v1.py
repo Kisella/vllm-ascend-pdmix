@@ -1766,6 +1766,17 @@ class NPUModelRunner(GPUModelRunner):
         # request already overwrote -> normal.  Restore the upstream
         # zeroing guarantee here.
         if scheduler_output.new_block_ids_to_zero:
+            # [EC-DIAG] Confirm the zeroing actually runs for the first
+            # request (first-request-after-startup garbage).
+            if (
+                os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+                and self._edge_cloud_enabled
+            ):
+                logger.info(
+                    "[EC-ZERO] zeroing %d new KV blocks: %s",
+                    len(scheduler_output.new_block_ids_to_zero),
+                    scheduler_output.new_block_ids_to_zero[:8],
+                )
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
@@ -4399,6 +4410,29 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                # [EC-DIAG] lm_head input checksum: compare with [EC-HIDDEN]
+                # (D-tail recv, same step).  If they diverge from the normal
+                # (2nd request) values at the same position, the hidden
+                # feeding the lm_head is corrupted even though the raw recv
+                # looks fine.
+                if (
+                    os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+                    and self._edge_cloud_enabled
+                    and is_edge_device()
+                ):
+                    try:
+                        _h = sample_hidden_states.reshape(-1).float()
+                        logger.info(
+                            "[EC-LMHEAD-IN] req=%s hidden_checksum=%.6f "
+                            "norm=%.4f min=%.4f max=%.4f",
+                            list(self.input_batch.req_ids),
+                            float(_h[: min(_h.numel(), 4096)].sum().item()),
+                            float(_h.norm().item()),
+                            float(_h.min().item()),
+                            float(_h.max().item()),
+                        )
+                    except Exception:
+                        logger.info("[EC-LMHEAD-IN] <log error>")
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
