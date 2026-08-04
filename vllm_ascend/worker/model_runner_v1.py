@@ -1789,6 +1789,26 @@ class NPUModelRunner(GPUModelRunner):
             out=positions_np,
         )
 
+        # [EC-DIAG] Cloud-side decode positions (KV write positions) vs the
+        # edge's sequence advancement.  If positions skip/repeat or drift from
+        # the edge's [EC-DECODE-IN], the cloud writes KV at the wrong slots ->
+        # the model reads an inconsistent prefix -> repetition.
+        if (
+            os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+            and self._edge_cloud_enabled
+            and not is_edge_device()
+            and self.num_spec_tokens <= 0
+            and not with_prefill
+        ):
+            logger.info(
+                "[EC-CLOUD-POS] req=%s num_computed=%s num_scheduled=%s "
+                "positions=%s",
+                list(self.input_batch.req_ids),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                num_scheduled_tokens[:num_reqs].tolist(),
+                positions_np[:total_num_scheduled_tokens].tolist(),
+            )
+
         # For PCP, compute slot_mapping on GPU using pre-PCP-split positions.
         # Use blocking .to(device) to ensure data lands on GPU before PCP
         # modifies CPU position buffers. PCP and async spec decode are
@@ -1863,6 +1883,31 @@ class NPUModelRunner(GPUModelRunner):
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
+
+        # [EC-DIAG] Edge-side decode input preparation: the request's sequence
+        # state when the D-head plans its input token.  Compare against the
+        # previous [EC-DECODE-OUT] (sampled token + advanced seq_len): if the
+        # state here lags the tail's, the D-head fed a stale/duplicate token
+        # -> repetition (candidate A).
+        if (
+            os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+            and self._edge_cloud_enabled
+            and is_edge_device()
+            and self.num_spec_tokens <= 0
+            and not with_prefill
+        ):
+            logger.info(
+                "[EC-DECODE-IN] req=%s num_computed=%s num_tokens_no_spec=%s "
+                "out_len=%s positions=%s",
+                list(self.input_batch.req_ids),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                self.input_batch.num_tokens_no_spec[:num_reqs].tolist(),
+                [
+                    len(self.requests[rid].output_token_ids)
+                    for rid in self.input_batch.req_ids
+                ],
+                positions_np[:total_num_scheduled_tokens].tolist(),
+            )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
@@ -5507,6 +5552,29 @@ class NPUModelRunner(GPUModelRunner):
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+        # [EC-DIAG] Edge-side decode sampling result (after the write-back).
+        # The sampled token here must be fed to the NEXT D-head; if the next
+        # [EC-DECODE-IN] shows a lagging num_computed/out_len, the D-head read
+        # stale state -> repetition (candidate A).
+        if (
+            os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+            and self._edge_cloud_enabled
+            and is_edge_device()
+            and self.num_spec_tokens <= 0
+        ):
+            _prev = getattr(self.input_batch, "prev_sampled_token_ids", None)
+            logger.info(
+                "[EC-DECODE-OUT] req=%s num_tokens_no_spec=%s out_len=%s "
+                "prev_sampled=%s",
+                req_ids,
+                self.input_batch.num_tokens_no_spec[: self.input_batch.num_reqs].tolist(),
+                [
+                    len(self.requests[rid].output_token_ids)
+                    for rid in req_ids
+                ],
+                (_prev.cpu().tolist() if _prev is not None else None),
+            )
 
         # logprobs_lists is already set above:
         # - max_gen_len == 1: logprobs_tensors.tolists() (no cu_num_tokens)
