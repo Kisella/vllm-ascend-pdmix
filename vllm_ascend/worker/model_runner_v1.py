@@ -1965,7 +1965,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             logger.info(
                 "[EC-DECODE-IN] req=%s num_computed=%s num_tokens_no_spec=%s "
-                "out_len=%s positions=%s",
+                "out_len=%s positions=%s input_tokens=%s",
                 list(self.input_batch.req_ids),
                 self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
                 self.input_batch.num_tokens_no_spec[:num_reqs].tolist(),
@@ -1974,6 +1974,7 @@ class NPUModelRunner(GPUModelRunner):
                     for rid in self.input_batch.req_ids
                 ],
                 positions_np[:total_num_scheduled_tokens].tolist(),
+                self.input_ids.cpu[:total_num_scheduled_tokens].tolist(),
             )
             # [EC-DIAG] Assertion A: the D-head's num_tokens_no_spec (the
             # corrected decode position base) must match the previous D-tail's
@@ -5519,6 +5520,41 @@ class NPUModelRunner(GPUModelRunner):
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        # [EC-DIAG] Logits shape/tail check: logits here are the LOCAL TP
+        # partition (possibly padded, e.g. 131072 per rank for a 152064 vocab
+        # with TP=2).  If the padded tail beyond the real local vocab is not
+        # masked to -inf, argmax can land there and produce out-of-vocab
+        # global ids (garbage output).  First request after startup shows
+        # garbage ids (~248k); later requests are normal.
+        if (
+            os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+            and self._edge_cloud_enabled
+            and is_edge_device()
+            and logits is not None
+            and logits.dim() == 2
+        ):
+            try:
+                _vs = int(self.model_config.get_vocab_size())
+                _lg = logits
+                _argmax = int(_lg.argmax(dim=-1).item())
+                _low_max = float(_lg[:, :1000].max().item())
+                _low_arg = int(_lg[:, :1000].argmax(dim=-1).item())
+                _gmax, _garg = _lg.max(dim=-1)
+                logger.info(
+                    "[EC-LOGITS] req=%s logits_shape=%s global_vocab=%d "
+                    "argmax=%d low1000_max=%.4f low1000_argmax=%d "
+                    "global_max=%.4f global_argmax=%d",
+                    list(self.input_batch.req_ids),
+                    list(_lg.shape),
+                    _vs,
+                    _argmax,
+                    _low_max,
+                    _low_arg,
+                    float(_gmax.item()),
+                    int(_garg.item()),
+                )
+            except Exception:
+                logger.info("[EC-LOGITS] <log error>")
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:

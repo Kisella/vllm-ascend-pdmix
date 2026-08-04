@@ -22,6 +22,7 @@ from typing import Any
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 from types import NoneType
@@ -956,6 +957,42 @@ class NPUWorker(WorkerBase):
             comm_handles=comm_handles,
             comm_postprocess=comm_postprocess,
         )
+
+        # [EC-DIAG] Hidden checksum per D-tail step: if a request's hidden
+        # states repeat across steps (same norm/checksum) while the input
+        # tokens advance, the cloud->edge hidden transfer is returning stale
+        # data -> the edge lm_head sees the same input -> repetition.
+        # NOTE: tensor_dict may be populated lazily by comm_postprocess
+        # (merge_payload path), so read through intermediate_tensors.tensors
+        # to force the comm wait.
+        if os.environ.get("VLLM_ASCEND_EC_DIAG") == "1":
+            try:
+                _hd = intermediate_tensors.tensors.get("hidden_states")
+                if _hd is not None and _hd.numel() > 0:
+                    _flat = _hd.reshape(-1).float()
+                    logger.info(
+                        "[EC-HIDDEN] req=%s batch=%s keys=%s hidden_norm=%.4f "
+                        "min=%.4f max=%.4f checksum=%.6f",
+                        list(scheduler_output.num_scheduled_tokens.keys()),
+                        scheduler_output.batch_type,
+                        list(tensor_dict.keys()),
+                        float(_flat.norm().item()),
+                        float(_flat.min().item()),
+                        float(_flat.max().item()),
+                        float(_flat[: min(_flat.numel(), 4096)].sum().item()),
+                    )
+                else:
+                    logger.info(
+                        "[EC-HIDDEN] req=%s batch=%s keys=%s NO hidden_states",
+                        list(scheduler_output.num_scheduled_tokens.keys()),
+                        scheduler_output.batch_type,
+                        list(tensor_dict.keys()),
+                    )
+            except Exception:
+                logger.info(
+                    "[EC-HIDDEN] <log error> batch=%s",
+                    scheduler_output.batch_type,
+                )
 
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
