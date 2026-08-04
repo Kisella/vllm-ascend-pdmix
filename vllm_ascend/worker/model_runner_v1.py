@@ -1837,6 +1837,39 @@ class NPUModelRunner(GPUModelRunner):
                 out=positions_np,
             )
 
+        # [EC-DIAG] KV slot content for this step's positions (read BEFORE the
+        # forward writes them = previous step's residue or zero).  If the
+        # first request after startup sees nonzero garbage in slots that
+        # later requests see as 0, the zeroing did not reach the physical
+        # blocks attention actually reads (block-id mapping edge vs cloud).
+        if (
+            os.environ.get("VLLM_ASCEND_EC_DIAG") == "1"
+            and self._edge_cloud_enabled
+            and not is_edge_device()
+            and not with_prefill
+            and self.num_spec_tokens <= 0
+        ):
+            try:
+                _kv = None
+                for _ln, _attn in self.compilation_config.static_forward_context.items():
+                    if _ln.endswith("self_attn"):
+                        _kv = getattr(_attn, "kv_cache", None)
+                        break
+                if _kv is not None and len(_kv) >= 2:
+                    _kc = _kv[0]
+                    for _i in range(min(total_num_scheduled_tokens, 4)):
+                        _p = int(positions_np[_i])
+                        _blk = _p // 128
+                        _slt = _p % 128
+                        _val = _kc[_blk, _slt, 0, :4].cpu().tolist()
+                        logger.info(
+                            "[EC-KV] req=%s pos=%d block=%d slot=%d kv_head0=%s",
+                            list(self.input_batch.req_ids),
+                            _p, _blk, _slt, _val,
+                        )
+            except Exception:
+                logger.info("[EC-KV] <log error>")
+
         # [EC-DIAG] Cloud-side decode positions (KV write positions) vs the
         # edge's sequence advancement.  If positions skip/repeat or drift from
         # the edge's [EC-DECODE-IN], the cloud writes KV at the wrong slots ->

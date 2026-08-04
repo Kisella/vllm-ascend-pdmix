@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
+import os
 from collections import defaultdict
 from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
+from vllm.logger import logger
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
@@ -37,6 +39,34 @@ def _ascend_resolve_kv_cache_block_sizes(
     with the pre-PR-#40860 behavior of block_size * dcp * pcp.
     """
     cache_config = vllm_config.cache_config
+    # [EC-DIAG] Block-size consistency: cache_config.block_size (set by
+    # verify_and_update_config, possibly via 39c4e9ea's canonical-TP page
+    # computation) vs the ACTUAL kv_cache_config group block sizes
+    # (post-unify) that workers index.  Mismatch => scheduler/worker block
+    # granularity divergence (39c4e9ea's premise); canonical-TP-derived
+    # values while the local TP differs => cloud page/layout mismatch (the
+    # precision regression it introduced).
+    if os.environ.get("VLLM_ASCEND_EC_DIAG") == "1":
+        try:
+            logger.info(
+                "[EC-BLOCK] tp=%d edge_cloud=%s cache_config.block_size=%s "
+                "mamba_page_size_padded=%s mamba_block_size=%s "
+                "kv_group_block_sizes=%s num_groups=%d",
+                vllm_config.parallel_config.tensor_parallel_size,
+                getattr(vllm_config.parallel_config, "enable_edge_cloud", None),
+                getattr(cache_config, "block_size", None),
+                getattr(cache_config, "mamba_page_size_padded", None),
+                getattr(cache_config, "mamba_block_size", None),
+                [
+                    getattr(g.kv_cache_spec, "block_size", None)
+                    for g in kv_cache_config.kv_cache_groups
+                ],
+                len(kv_cache_config.kv_cache_groups),
+            )
+        except Exception:
+            logger.error(
+                "[EC-BLOCK] <log error>"
+            )
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups

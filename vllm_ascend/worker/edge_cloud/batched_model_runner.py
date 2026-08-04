@@ -20,6 +20,7 @@ base runner keeps its single-DP semantics.
 from __future__ import annotations
 
 import time
+import os
 from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -180,6 +181,35 @@ class BatchedModelRunner(NPUModelRunner):
         - ``mode != "embedding_only"`` (i.e. ``head_tail``)
         - ``is_shared_model_edge`` (single-NPU multi-DP edge layout)
         """
+        # [EC-DIAG] Block-size consistency check: cache_config.block_size (set
+        # by verify_and_update_config, possibly via the canonical-TP page
+        # computation in 39c4e9ea) vs the ACTUAL kv_cache_config group block
+        # sizes (post-unify).  Mismatch => scheduler block granularity differs
+        # from what workers index -> cross-request KV/mamba corruption
+        # (39c4e9ea's premise); canonical-TP-derived value while local TP
+        # differs => cloud page/layout mismatch (the precision regression).
+        if os.environ.get("VLLM_ASCEND_EC_DIAG") == "1":
+            try:
+                _cc = self.vllm_config.cache_config
+                _tps = self.vllm_config.parallel_config.tensor_parallel_size
+                _gbs = [
+                    getattr(g.kv_cache_spec, "block_size", None)
+                    for g in kv_cache_config.kv_cache_groups
+                ]
+                logger.info(
+                    "[EC-BLOCK] role=%s tp=%d cache_config.block_size=%s "
+                    "mamba_page_size_padded=%s mamba_block_size=%s "
+                    "kv_group_block_sizes=%s num_blocks=%s",
+                    getattr(self.edge_cloud_cfg, "role", "?"),
+                    _tps,
+                    getattr(_cc, "block_size", None),
+                    getattr(_cc, "mamba_page_size_padded", None),
+                    getattr(_cc, "mamba_block_size", None),
+                    _gbs,
+                    kv_cache_config.num_blocks,
+                )
+            except Exception:
+                logger.info("[EC-BLOCK] <log error>")
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
