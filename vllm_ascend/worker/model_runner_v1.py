@@ -1758,6 +1758,16 @@ class NPUModelRunner(GPUModelRunner):
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # [EC-FIX] Ascend runners override execute_model and never call the
+        # parent's new-block zeroing (GPUModelRunner._zero_block_ids), so KV
+        # blocks reused from a previous request (including startup warmup)
+        # retain stale data.  The first request after startup reads that
+        # garbage -> garbage output; later requests reuse blocks the first
+        # request already overwrote -> normal.  Restore the upstream
+        # zeroing guarantee here.
+        if scheduler_output.new_block_ids_to_zero:
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
         # Get the attention state.
