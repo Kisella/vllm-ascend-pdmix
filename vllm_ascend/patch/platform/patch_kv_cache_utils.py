@@ -72,7 +72,13 @@ def _ascend_resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp * pcp
+        # [EC-FIX] Use the authoritative kv_cache_config group block size
+        # (post-unify) instead of cache_config.block_size: the latter is
+        # derived from a single TP (engine/edge/cloud differ in edge-cloud
+        # mode), so it can diverge from the unified spec the workers index,
+        # causing scheduler/worker block-granularity mismatch.  The group
+        # block size is what the KV tensors/block tables actually use.
+        bs = groups[0].kv_cache_spec.block_size * dcp * pcp
         return bs, bs
 
     if dcp != 1 or pcp != 1:

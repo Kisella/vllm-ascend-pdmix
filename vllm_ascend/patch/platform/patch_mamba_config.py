@@ -39,31 +39,16 @@ def verify_and_update_config(cls, vllm_config) -> None:
         model_config=model_config,
     )
 
-    # In edge-cloud mode the edge and cloud sides shard the model with
-    # different TP sizes, so TP-dependent cache page sizes (attention KV
-    # and mamba states, both ∝ 1/TP) would differ between the two sides.
-    # The engine merges both sides' kv cache specs and
-    # unify_kv_cache_spec_page_size() would then silently scale the
-    # smaller-page side's block_size to unify page sizes. The scheduler
-    # allocates blocks with the scaled granularity while that side's
-    # workers index blocks with their own unscaled block_size, causing
-    # cross-request KV / mamba state corruption under concurrency.
-    # Derive all TP-dependent page sizes from a canonical TP (the smaller
-    # of the two sides, i.e. the side with the larger page) so both sides
-    # produce identical page sizes and block_size stays uniform across
-    # workers. Physical sharding still uses each side's local TP; the
-    # resulting padded page only over-provisions the accounting page on
-    # the larger-TP side.
-    orig_tp = None
-    if parallel_config.enable_edge_cloud:
-        canonical_tp = min(
-            parallel_config.edge_npu_count,
-            parallel_config.cloud_npu_count,
-        )
-        if canonical_tp != parallel_config.tensor_parallel_size:
-            orig_tp = parallel_config.tensor_parallel_size
-            parallel_config.tensor_parallel_size = canonical_tp
-
+    # NOTE: the previous canonical-TP page unification (commit 39c4e9ea) was
+    # REVERTED: verify_and_update_config runs on every worker too, so the
+    # cloud worker (TP=8) computed mamba_page_size_padded with canonical_tp
+    # (= min(edge, cloud) = 2), 4x larger than its real per-worker state
+    # (global / 8).  The mamba cache was then indexed at the wrong granularity
+    # -> GatedDeltaNet state corruption -> first-token / first-benchmark
+    # garbage after every startup.  Page sizes must follow each side's real
+    # TP; scheduler/worker block-granularity consistency is instead handled
+    # by _ascend_resolve_kv_cache_block_sizes (single-group branch uses the
+    # authoritative kv_cache_config group block size).
     # get mamba block size
     mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
     mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
@@ -93,9 +78,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_head_size = model_config.get_head_size()
         attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
-
-        if orig_tp is not None:
-            parallel_config.tensor_parallel_size = orig_tp
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
     assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
