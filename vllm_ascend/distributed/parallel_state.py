@@ -1383,24 +1383,41 @@ def edge_cloud_irecv_tensor_dict(
             full_tensor.zero_()
         tensor_dict[key] = full_tensor
 
-    # Cross-stream dependency (edge-cloud recv): make the consuming
-    # default/compute stream wait on the hidden-channel stream that posted
-    # the irecv(s) above.  handle.wait() blocks the host, but for an irecv
-    # posted on a non-default stream it does not reliably make the received
-    # buffer device-visible to kernels launched afterwards on the default
-    # stream -- the consumer copy in sync_and_slice_intermediate_tensors
-    # could read stale/partially-written data (occasional repeated/wrong
-    # tokens).  wait_stream() is a no-op when the irecv has already
-    # completed, so this costs ~nothing when Work.wait() semantics are
-    # correct.  Insert FIRST so it runs before the split/broadcast
-    # postprocesses that read the received buffer.
-    if (envs.VLLM_ASCEND_EDGE_CLOUD_CROSS_STREAM_SYNC
-            and channel is not None and handles):
-        def _sync_irecv_stream_to_default(ch=channel) -> None:
-            torch.npu.current_stream().wait_stream(
-                _get_hidden_channel_stream(ch)
-            )
-        postprocess.insert(0, _sync_irecv_stream_to_default)
+    # Diagnostic cross-stream synchronization (edge-cloud recv).  Runs inside
+    # AsyncIntermediateTensors.wait_for_comm() right after the irecv handles
+    # are waited (this postprocess is inserted FIRST, before the split/
+    # broadcast postprocesses that read the received buffer).
+    #
+    # Empirical finding: "stream" mode (default stream waits on the channel
+    # stream) does NOT fix the occasional repeated-token precision issue, so
+    # the recv data IS ready when the consumer runs -- mechanism A (irecv vs
+    # this iteration's consumer) is ruled out.  The remaining modes bisect
+    # WHERE the stale/racing work lives that the debug-print's device-wide
+    # synchronize() happens to drain:
+    #   none      - no extra sync (original behavior)
+    #   stream    - current_stream().wait_stream(channel)   (A/B test: FAILED)
+    #   default   - current_stream().synchronize()          (prior default-stream work)
+    #   channel   - channel_stream.synchronize()            (prior channel-stream work)
+    #   device    - torch.npu.synchronize()                 (all streams; matches print fix)
+    _recv_sync_mode = envs.VLLM_ASCEND_EDGE_CLOUD_RECV_SYNC
+    if _recv_sync_mode not in ("none", "stream", "default", "channel",
+                               "device"):
+        logger.warning(
+            "[edge-cloud] unknown VLLM_ASCEND_EDGE_CLOUD_RECV_SYNC=%r, "
+            "treating as 'none'", _recv_sync_mode)
+        _recv_sync_mode = "none"
+    if (_recv_sync_mode != "none" and channel is not None and handles):
+        def _sync_recv_to_consumer(mode=_recv_sync_mode, ch=channel) -> None:
+            if mode == "device":
+                torch.npu.synchronize()
+            elif mode == "channel":
+                _get_hidden_channel_stream(ch).synchronize()
+            elif mode == "default":
+                torch.npu.current_stream().synchronize()
+            else:  # "stream"
+                torch.npu.current_stream().wait_stream(
+                    _get_hidden_channel_stream(ch))
+        postprocess.insert(0, _sync_recv_to_consumer)
 
     return tensor_dict, handles, postprocess
 
