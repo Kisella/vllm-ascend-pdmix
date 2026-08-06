@@ -121,6 +121,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD": lambda: bool(
         int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD", "1"))
     ),
+    # Edge-cloud: after an irecv completes, make the consuming
+    # default/compute stream wait on the hidden-channel stream that posted
+    # the irecv.  handle.wait() blocks the host but, for an irecv posted on a
+    # non-default stream, does not reliably make the received buffer
+    # device-visible to kernels launched afterwards on the default stream --
+    # the consumer copy could read stale/partially-written data (occasional
+    # repeated/wrong tokens).  wait_stream() is a no-op when the irecv has
+    # already completed, so this costs ~nothing when Work.wait() semantics are
+    # correct.  Default 1 (enabled).  Set to 0 to disable.
+    "VLLM_ASCEND_EDGE_CLOUD_CROSS_STREAM_SYNC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CROSS_STREAM_SYNC", "1"))
+    ),
     # Edge-cloud: pre-establish all hidden-channel P2P links (PREFILL_1 /
     # PREFILL_2 / DECODE, both directions) at startup.  The first
     # isend/irecv on a channel rendezvous the two sides (gloo metadata

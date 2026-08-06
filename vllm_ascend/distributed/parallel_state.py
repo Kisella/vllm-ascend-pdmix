@@ -1383,6 +1383,25 @@ def edge_cloud_irecv_tensor_dict(
             full_tensor.zero_()
         tensor_dict[key] = full_tensor
 
+    # Cross-stream dependency (edge-cloud recv): make the consuming
+    # default/compute stream wait on the hidden-channel stream that posted
+    # the irecv(s) above.  handle.wait() blocks the host, but for an irecv
+    # posted on a non-default stream it does not reliably make the received
+    # buffer device-visible to kernels launched afterwards on the default
+    # stream -- the consumer copy in sync_and_slice_intermediate_tensors
+    # could read stale/partially-written data (occasional repeated/wrong
+    # tokens).  wait_stream() is a no-op when the irecv has already
+    # completed, so this costs ~nothing when Work.wait() semantics are
+    # correct.  Insert FIRST so it runs before the split/broadcast
+    # postprocesses that read the received buffer.
+    if (envs.VLLM_ASCEND_EDGE_CLOUD_CROSS_STREAM_SYNC
+            and channel is not None and handles):
+        def _sync_irecv_stream_to_default(ch=channel) -> None:
+            torch.npu.current_stream().wait_stream(
+                _get_hidden_channel_stream(ch)
+            )
+        postprocess.insert(0, _sync_irecv_stream_to_default)
+
     return tensor_dict, handles, postprocess
 
 
