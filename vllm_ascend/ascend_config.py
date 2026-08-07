@@ -756,15 +756,17 @@ class PDSeparationConfig:
         self.enable_edge_hidden_early_recv: bool = user_config.get(
             "enable_edge_hidden_early_recv", True
         )
-        # [EHER §十五] P-tail scheduling gate on hidden-arrival. When True, a
-        # PREFILL_LAST is NOT scheduled until the early-recv completes (ack) --
-        # preventing the edge worker from being scheduled onto a P-tail whose
-        # hidden is still in flight (which would block the single-threaded
-        # busy_loop on a fallback sync recv and stall the pipeline). Requires
-        # `enable_edge_hidden_early_recv` (gating without early-recv would gate
-        # on an irecv that is never posted). Default True (gating is the whole
-        # point of EHER once the early-recv machinery exists); set False to run
-        # the non-gating baseline.
+        # [EHER §十五] P-tail scheduling gate on hidden-arrival.  When True,
+        # a PREFILL_LAST is NOT scheduled until the early-recv completes (ack)
+        # or the decode-count threshold is met -- preventing the edge worker
+        # from being scheduled onto a P-tail whose hidden is still in flight.
+        # Requires `enable_edge_hidden_early_recv` (gating without early-recv
+        # would gate on an irecv that is never posted).  Default True.
+        # NOTE: the edge early-recv cache cap MUST match prefill_inflight_limit
+        # (see worker.py _early_recv_max_inflight) so that ALL in-flight P-tails'
+        # irecvs are posted by the guard thread.  Otherwise the second P-tail
+        # waits 500ms for timeout, during which the cloud's _wait_pp_send_work
+        # blocks (no timeout) -> deadlock on long sequences.
         self.enable_edge_hidden_early_recv_gating: bool = user_config.get(
             "enable_edge_hidden_early_recv_gating", True
         )

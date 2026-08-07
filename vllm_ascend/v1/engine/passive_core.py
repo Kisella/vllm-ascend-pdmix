@@ -532,48 +532,25 @@ class PassiveEngineCoreProc:
         self._idle_sleep_seconds = 0.001
 
         self._prev_dispatch_req_ids: set[str] = set()
-        self._pending_post_out_by_head_token: dict[str, SchedulerOutput] = {}
-        self._published_post_out_tokens: set[str] = set()
 
     def _drain_worker_completion_acks(self) -> None:
-        """Publish prefill POST_OUT after cloud workers finish the middle."""
+        """Drain ``__pp_scheduler_ack__`` messages from worker response MQs.
+        These acks are emitted by cloud workers after every batch.  POST_OUT
+        is now published immediately on last-slice dispatch (see ``step``), so
+        this method only needs to drain the acks to prevent them from
+        accumulating and blocking the workers.  Non-blocking.
+        """
         for mq in getattr(self.executor, "response_mqs", []):
             while True:
                 try:
-                    _status, result = mq.dequeue(timeout=0)
+                    mq.dequeue(timeout=0)
                 except TimeoutError:
                     break
                 except Exception:
                     logger.exception("Failed to drain cloud worker completion ack")
                     break
-
-                if not (
-                    isinstance(result, dict)
-                    and result.get("__pp_scheduler_ack__")
-                ):
-                    continue
-
-                # Decode and draft tails are self-posted on the edge. Their
-                # worker acks are still drained from the response MQ, but do
-                # not drive a cloud -> edge POST_OUT control message.
-                if result.get("batch_type") != BatchType.PREFILL_FIRST:
-                    continue
-                head_token = result.get("head_token")
-                if not head_token or head_token in self._published_post_out_tokens:
-                    continue
-                scheduler_output = self._pending_post_out_by_head_token.pop(
-                    head_token, None
-                )
-                if scheduler_output is None:
-                    continue
-                self._published_post_out_tokens.add(head_token)
-                logger.info(
-                    "[CLOUD-POST-OUT] Publishing tail for %s after worker "
-                    "done, head_token=%s",
-                    scheduler_output.batch_type.value,
-                    head_token,
-                )
-                self._maybe_publish_post_out(scheduler_output)
+                # Discard - POST_OUT is already published at dispatch time.
+                continue
 
     def step(self) -> bool:
         """Single tick: poll ZMQ → pick batches → enqueue worker payloads.
@@ -733,20 +710,18 @@ class PassiveEngineCoreProc:
                     bt,
                     _dt_enqueue,
                 )
-            # For prefill, POST_OUT must mean the cloud middle
-            # segment has completed. Store the original SchedulerOutput here
-            # and publish it from _drain_worker_completion_acks() after the
-            # worker reports done. Decode-last and Draft-last are prepared on
-            # the edge (self-posting), so they are not pending here.
-            if (
-                batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
-                and (slice_info is None or slice_info.is_last_slice)
-            ):
-                head_token = getattr(batch.scheduler_output, "head_token", None)
-                if head_token:
-                    self._pending_post_out_by_head_token[head_token] = (
-                        batch.scheduler_output
-                    )
+            # PD-separation: publish POST_OUT (PREFILL_LAST / DECODE_LAST)
+            # when the cloud has dispatched the work that produces the
+            # middle-segment hidden state.  For slice-aware prefill this is the
+            # LAST slice of PREFILL_FIRST -- dispatching the last slice means
+            # the cloud is about to compute + isend the hidden back, so the
+            # edge can start its P-tail early-recv in parallel.  (We do NOT
+            # wait for the worker to fully complete: that delays the edge
+            # P-tail by a full step and was the cause of the earlier
+            # regression.  The EHER early-recv + count-gating on the edge
+            # handles the overlap without a completion ack.)
+            if slice_info is None or slice_info.is_last_slice:
+                self._maybe_publish_post_out(batch.scheduler_output)
         return True
 
     def _maybe_publish_post_out(
