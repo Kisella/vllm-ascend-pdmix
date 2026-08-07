@@ -78,6 +78,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import (
     BatchType,
+    CachedRequestData,
     HiddenChannelType,
     SchedulerOutput,
 )
@@ -104,6 +105,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.worker.utils import select_common_block_size
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_ascend.utils import vllm_version_is
 
@@ -3623,18 +3625,31 @@ class NPUModelRunner(GPUModelRunner):
                     self._tail_segment_discarded = True
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 if stale:
-                    # Partial-stale: alive reqs need the step, stale reqs would
-                    # crash. Cannot safely discard nor proceed. Full fix needs
-                    # per-req hidden slicing -- not yet implemented.
-                    logger.error(
+                    # Partial-stale: alive reqs still need this decode step,
+                    # while the stale reqs finished during the head->tail
+                    # window and were already popped from self.requests (their
+                    # KV cache blocks freed).  Filter the stale reqs out of
+                    # the batch and slice the cloud-returned hidden tensors to
+                    # the surviving token rows, then fall through to the
+                    # normal path.  The whole-batch segment_a cache (keyed by
+                    # head_token) is no longer valid -- discard it so
+                    # _prepare_inputs recomputes the attention metadata for
+                    # the filtered batch.  update_from_output's finished
+                    # request guard skips the discarded rows' output.
+                    alive = [r for r in tail_req_ids if r in self.requests]
+                    logger.warning(
                         "[EDGE-TAIL-PARTIAL-STALE] batch_type=%s "
-                        "head_token=%s req_ids=%s stale=%s alive=%s; "
-                        "NOT handled, will crash.",
+                        "head_token=%s stale=%s alive=%s; dropping %d stale "
+                        "req(s) from the tail batch and re-slicing hidden.",
                         scheduler_output.batch_type,
                         scheduler_output.head_token,
-                        tail_req_ids,
                         stale,
-                        [r for r in tail_req_ids if r in self.requests],
+                        alive,
+                        len(stale),
+                    )
+                    _edge_cache_entry = None  # whole-batch cache no longer valid
+                    scheduler_output = self._purge_stale_tail_requests(
+                        scheduler_output, intermediate_tensors, stale, alive
                     )
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
@@ -6334,6 +6349,146 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output=scheduler_output,
             req_ids=tuple(self.input_batch.req_ids),
         )
+
+    def _purge_stale_tail_requests(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: Any,
+        stale: list[str],
+        alive: list[str],
+    ) -> SchedulerOutput:
+        """Drop requests that finished during the head->tail window from a
+        PL/DL batch, and re-slice the cloud-returned hidden tensors.
+
+        PL/DL SchedulerOutputs are pre-generated at PF/DF schedule time
+        (``dataclasses.replace`` in ``_pick_decode_first_batch``), so they can
+        still reference a request that finished (EOS / max_tokens sampled by
+        an earlier tail) and was already popped from ``self.requests`` by an
+        intervening batch's ``_update_states``.  The ALL-stale case is handled
+        by the caller (returns EMPTY).  Here we handle the PARTIAL-stale case:
+        the alive requests still need their decode step, and the cloud-returned
+        hidden rows for the stale requests must NOT reach the model forward
+        (their KV cache blocks were freed when the request finished).  We
+        therefore filter the SchedulerOutput down to the alive requests and
+        slice the hidden tensors to the surviving token rows.  The caller must
+        also discard the whole-batch segment_a cache entry so the tail
+        recomputes its attention metadata for the filtered batch.
+        """
+        stale_set = set(stale)
+
+        # Compute the surviving token rows in the original full-sequence
+        # layout: req_ids in scheduler order, each contributing
+        # num_scheduled_tokens[req] contiguous rows.
+        original_total = scheduler_output.total_num_scheduled_tokens
+        keep_rows: list[int] = []
+        offset = 0
+        for req_id, num_tok in scheduler_output.num_scheduled_tokens.items():
+            if req_id not in stale_set:
+                keep_rows.extend(range(offset, offset + num_tok))
+            offset += num_tok
+
+        new_num_scheduled_tokens = {
+            r: n for r, n in scheduler_output.num_scheduled_tokens.items()
+            if r not in stale_set
+        }
+        new_total = sum(new_num_scheduled_tokens.values())
+
+        cached = scheduler_output.scheduled_cached_reqs
+        keep_idx = [
+            i for i, r in enumerate(cached.req_ids) if r not in stale_set
+        ]
+
+        # Filter a per-request list by keep_idx, but only when it is actually
+        # aligned with req_ids.  new_token_ids is list[list[int]] that is left
+        # EMPTY unless `use_pp and not async_scheduling` (scheduler.py:1088);
+        # the edge-cloud path is PP + async scheduling, so it stays [] while
+        # req_ids has len > 0.  Indexing it by keep_idx would raise IndexError.
+        def _filter_list(values: list) -> list:
+            if len(values) == len(cached.req_ids):
+                return [values[i] for i in keep_idx]
+            return values
+
+        new_cached = CachedRequestData(
+            req_ids=[cached.req_ids[i] for i in keep_idx],
+            resumed_req_ids={
+                r for r in cached.resumed_req_ids if r not in stale_set
+            },
+            new_token_ids=_filter_list(cached.new_token_ids),
+            all_token_ids={
+                r: cached.all_token_ids[r]
+                for r in cached.req_ids
+                if r not in stale_set and r in cached.all_token_ids
+            },
+            new_block_ids=_filter_list(cached.new_block_ids),
+            num_computed_tokens=_filter_list(cached.num_computed_tokens),
+            num_output_tokens=_filter_list(cached.num_output_tokens),
+        )
+
+        self._slice_tail_hidden_tensors(
+            intermediate_tensors, keep_rows, original_total
+        )
+
+        return replace(
+            scheduler_output,
+            num_scheduled_tokens=new_num_scheduled_tokens,
+            total_num_scheduled_tokens=new_total,
+            scheduled_cached_reqs=new_cached,
+            scheduled_spec_decode_tokens={
+                r: v
+                for r, v in scheduler_output.scheduled_spec_decode_tokens.items()
+                if r not in stale_set
+            },
+            scheduled_encoder_inputs={
+                r: v
+                for r, v in scheduler_output.scheduled_encoder_inputs.items()
+                if r not in stale_set
+            },
+        )
+
+    def _slice_tail_hidden_tensors(
+        self,
+        intermediate_tensors: Any,
+        keep_rows: list[int],
+        original_total: int,
+    ) -> None:
+        """Slice token-aligned tensors in ``intermediate_tensors`` in place.
+
+        ``keep_rows`` are the row indices (in the original full-sequence
+        layout) to keep.  Handles both full-sequence tensors (no SP) and
+        SP-chunked tensors (all-gather -> drop tp-multiple padding -> slice ->
+        re-chunk).  Tensors whose dim-0 does not match either the full
+        sequence or the SP chunk length are left untouched.
+        """
+        if not keep_rows or not isinstance(
+            intermediate_tensors, IntermediateTensors
+        ):
+            return
+        # Materialize lazy cross-node comm before slicing.
+        wait_comm = getattr(intermediate_tensors, "wait_for_comm", None)
+        if wait_comm is not None:
+            wait_comm()
+
+        tp_size = get_tensor_model_parallel_world_size()
+        chunk_len = (original_total + tp_size - 1) // tp_size
+        keep_tensor = torch.tensor(keep_rows, dtype=torch.long)
+        for key, tensor in list(intermediate_tensors.tensors.items()):
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                continue
+            if tensor.shape[0] == original_total:
+                # Full-sequence layout on this rank (no SP chunking).
+                intermediate_tensors.tensors[key] = tensor[
+                    keep_tensor.to(tensor.device)
+                ]
+            elif tensor.shape[0] == chunk_len and enable_sp():
+                # SP-chunked: gather to the full sequence (tp-multiple
+                # padded), drop the padding, drop the stale rows, re-chunk.
+                gathered = get_tp_group().all_gather(tensor, dim=0)
+                gathered = gathered[:original_total]
+                gathered = gathered[keep_tensor.to(gathered.device)]
+                intermediate_tensors.tensors[key] = sequence_parallel_chunk(
+                    gathered
+                )
+            # Any other dim-0 (scalar/aux, non-token-aligned) is untouched.
 
     def _resume_and_validate_head_state(
         self,
