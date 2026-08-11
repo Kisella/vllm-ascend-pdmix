@@ -185,7 +185,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
     else:
         self._eher_enabled = False
         self._eher_gating_enabled = False
-        self._ha_fallback_timeout_ms = 500.0
+        self._ha_fallback_timeout_ms = 1000.0
     # Gating pending set + ack-ready set (populated by _drain_ha_acks_edge).
     self._prefills_last_ha_pending: deque = deque()
     self._prefills_last_ha_pending_ts: dict[str, float] = {}
@@ -237,7 +237,7 @@ def _drain_pd_channel_inbox(self) -> None:
     if not hasattr(self, "_eher_enabled"):
         self._eher_enabled = False
         self._eher_gating_enabled = False
-        self._ha_fallback_timeout_ms = 500.0
+        self._ha_fallback_timeout_ms = 1000.0
         self._prefills_last_ha_pending = deque()
         self._prefills_last_ha_pending_ts = {}
         self._ha_ready_head_tokens = set()
@@ -262,7 +262,7 @@ def _drain_pd_channel_inbox(self) -> None:
                     )
                 ) and self._eher_enabled
                 self._ha_fallback_timeout_ms = float(
-                    _pd_cfg.get("ha_fallback_timeout_ms", 500.0)
+                    _pd_cfg.get("ha_fallback_timeout_ms", 1000.0)
                 )
             logger.info(
                 "[EHER] init (lazy from additional_config): "
@@ -297,28 +297,24 @@ def _drain_pd_channel_inbox(self) -> None:
             if getattr(self, "_eher_enabled", False) and getattr(
                 so, "head_token", None
             ):
-                # Gating only when decode work is available to fill the
-                # bubble.  For pure-prefill workloads (no decode in flight),
-                # gating only adds delay -- P_tail has nothing to overlap
-                # with, and the delay cascades into an HCCL communication
-                # deadlock (cloud's _wait_pp_send_work blocks waiting for
-                # the edge to irecv, but the edge worker is stuck on an
-                # NPU stream dependency caused by the delayed irecv).
-                _has_decode_work = bool(
-                    self.scheduler.decodes_last_ready
-                    or getattr(self.scheduler, "running", None)
-                )
-                if (
-                    getattr(self, "_eher_gating_enabled", False)
-                    and _has_decode_work
-                ):
-                    # Gating on + decode available: park in pending + fire
-                    # hint; unlock on ack/count/timeout.
+                # Gating is UNCONDITIONAL (regardless of decode work): the
+                # edge worker is single-threaded, so an eagerly-scheduled
+                # P-tail whose c2e hidden has not yet arrived occupies the
+                # worker and starves the ahead-scheduled P首
+                # (max_chunk_prefill_ahead=1).  With the cloud already
+                # dispatched on that P首's PRE_OUT, the P首's e2c isend never
+                # fires and the cloud blocks forever in its e2c recv -- a
+                # full-pipeline deadlock (the be7c7039 regression; d46b0dc5
+                # gated unconditionally and worked).  Parking the P-tail keeps
+                # the worker free for P首s; it is unlocked on the ha_ack (c2e
+                # irecv completed) or by the idle-only fallback in
+                # _unlock_prefills_last_with_ha.
+                if getattr(self, "_eher_gating_enabled", False):
                     self._enqueue_prefill_last_ha_pending(so)
                 else:
-                    # No decode work (pure prefill) or gating off: fire the
-                    # hint (guard thread posts irecv early for overlap) but
-                    # keep P-tail immediately schedulable.
+                    # Gating off: fire the hint (guard thread posts irecv
+                    # early for overlap) but keep P-tail immediately
+                    # schedulable.
                     self._send_eher_recv_hint(so)
                     self.scheduler.prefills_last_ready.append(so)
             else:
@@ -471,6 +467,7 @@ def _unlock_prefills_last_with_ha(self) -> None:
     ``prefills_last_ready`` so the scheduler may pick them."""
     if not self._prefills_last_ha_pending:
         return
+
     ready: list[SchedulerOutput] = []
     for so in list(self._prefills_last_ha_pending):
         ht = so.head_token
@@ -1093,7 +1090,7 @@ def _patched_step_with_batch_queue(self):
     # Block until the next result is available.
     future, scheduler_output, exec_model_fut = batch_queue.pop()
     bt = scheduler_output.batch_type
-    vllm_logger.info(
+    logger.info(
         "[PD] EngineCore blocking on future.result(): "
         "batch_type=%s total_tokens=%d",
         bt.value if bt else "N/A",

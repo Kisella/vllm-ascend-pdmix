@@ -201,6 +201,22 @@ class NPUWorker(WorkerBase):
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
         self._pp_send_work_by_channel: dict[str, list[Handle]] = {}
+        # [EHER FIX] Edge: per-hidden-channel set of head_tokens whose
+        # edge->cloud (e2c) isend the busy_loop has already submitted during
+        # PREFILL_FIRST execute_model.  The EHER guard waits for this signal
+        # before posting the matching cloud->edge (c2e) irecv on the SAME
+        # channel stream.  Ordering the isend before the irecv on a channel
+        # stream is mandatory: an [irecv, isend] order -- the POST_OUT /
+        # recv-hint arrives at cloud-dispatch time under be7c7039, so the
+        # guard can beat the busy_loop's isend submission -- makes HCCL issue
+        # the isend only after the preceding irecv completes, but that irecv
+        # needs the c2e data, which needs the cloud's middle compute, which
+        # needs the very e2c data this isend would deliver -> the gated P-tail
+        # is never acked and the pipeline deadlocks (edge prefill_2 stream in
+        # the 07:16 run: [irecv c2e1, isend e2c1] vs chunk 0's safe [isend
+        # e2c0, irecv c2e0]).
+        self._e2c_isend_submitted: dict[str, set[str]] = {}
+        self._e2c_isend_submitted_cv = threading.Condition()
 
         # [CHER/EHER] Cloud-side hidden early-receive (and its edge-side
         # mirror) cache.  The guard thread posts irecv ahead of the batch's
@@ -673,6 +689,47 @@ class NPUWorker(WorkerBase):
         )
         return entry
 
+    def _wait_e2c_isend_submitted(
+        self, ht: str, channel_str: str, timeout_s: float = 5.0,
+    ) -> None:
+        """[EHER FIX] Wait (bounded) for the busy_loop's e2c isend submission.
+
+        Called by the EHER guard thread before posting the c2e irecv on
+        *channel_str*'s hidden stream.  The busy_loop records the head_token
+        in ``_e2c_isend_submitted`` immediately after submitting the e2c isend
+        for the chunk's PREFILL_FIRST; the guard must not post the c2e irecv
+        before that, or the channel stream sees [irecv, isend] and HCCL
+        deadlocks (isend waits on the pending irecv, which needs the c2e data,
+        which needs the cloud's middle compute, which needs the very e2c data
+        this isend would send).  Returns as soon as the signal is set, or after
+        *timeout_s* (posting anyway, best-effort) with an ERROR log.
+        """
+        if not ht or not channel_str:
+            return
+        deadline = time.monotonic() + timeout_s
+        warned = False
+        with self._e2c_isend_submitted_cv:
+            while ht not in self._e2c_isend_submitted.get(channel_str, ()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        "[EHER] timed out after %.1fs waiting for busy_loop "
+                        "e2c isend submission head_token=%s channel=%s; "
+                        "posting c2e irecv anyway (best-effort; risks HCCL "
+                        "stream-order deadlock).",
+                        timeout_s, ht, channel_str,
+                    )
+                    return
+                if not warned and time.monotonic() > deadline - timeout_s + 1.0:
+                    warned = True
+                    logger.warning(
+                        "[EHER] guard waited >1s for busy_loop e2c isend "
+                        "submission head_token=%s channel=%s; check the "
+                        "prefill pipeline.",
+                        ht, channel_str,
+                    )
+                self._e2c_isend_submitted_cv.wait(remaining)
+
     def start_early_irecv(self, hint: dict) -> None:
         """Post an irecv for the hinted hidden tensors and cache it.
 
@@ -702,6 +759,13 @@ class NPUWorker(WorkerBase):
                 channel_str,
             )
             return
+        # [EHER FIX] On the edge, never post the c2e irecv before the busy_loop
+        # has submitted the matching e2c isend on this channel (an [irecv,
+        # isend] channel-stream order deadlocks HCCL -- see
+        # _wait_e2c_isend_submitted).  Bounded wait; the signal is set in
+        # _execute_model_edge_head right after the isend submission.
+        if getattr(self, "_edge_hidden_early_recv_enabled", False):
+            self._wait_e2c_isend_submitted(ht, channel_str)
         with self._early_recv_lock:
             if ht in self._early_recv_handles:
                 return  # idempotent: another thread already posted
@@ -998,6 +1062,20 @@ class NPUWorker(WorkerBase):
                 channel=channel,
             )
             logger.info(f"Send intermediate tensors to cloud, hidden_channel: {channel.value}")
+            # [EHER FIX] Signal the guard that this chunk's e2c isend has been
+            # submitted on this channel, so it can safely post the matching c2e
+            # irecv on the same channel stream (isend first, then irecv).  See
+            # the __init__ note on _e2c_isend_submitted.
+            if (
+                getattr(self, "_edge_hidden_early_recv_enabled", False)
+                and scheduler_output.batch_type == BatchType.PREFILL_FIRST
+            ):
+                _e2c_ht = getattr(scheduler_output, "head_token", None)
+                if _e2c_ht:
+                    with self._e2c_isend_submitted_cv:
+                        self._e2c_isend_submitted.setdefault(
+                            channel.value, set()).add(_e2c_ht)
+                        self._e2c_isend_submitted_cv.notify_all()
         # Return a placeholder output that carries the request IDs so the
         # scheduler can correlate the batch, but contains no sampled tokens
         # because sampling happens in the tail segment (PL/DL).
@@ -1051,6 +1129,18 @@ class NPUWorker(WorkerBase):
                 "[EHER] consume early-recv head_token=%s channel=%s",
                 ht, channel.value,
             )
+            # [EHER FIX] The guard has already posted (and we've consumed) the
+            # c2e irecv for this head_token, so its e2c isend-submission signal
+            # is no longer needed -- drop it to bound _e2c_isend_submitted.
+            # The guard's wait for this token always precedes the ack (which
+            # precedes this P-tail), so this cannot race the guard's check.
+            if getattr(self, "_edge_hidden_early_recv_enabled", False):
+                with self._e2c_isend_submitted_cv:
+                    _e2c_hts = self._e2c_isend_submitted.get(channel.value)
+                    if _e2c_hts is not None:
+                        _e2c_hts.discard(ht)
+                        if not _e2c_hts:
+                            self._e2c_isend_submitted.pop(channel.value, None)
         else:
             # Fallback: EHER off / hint not yet processed / guard thread down
             # -> synchronous recv (equivalent to the pre-EHER path).

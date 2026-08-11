@@ -773,8 +773,11 @@ class PDSeparationConfig:
         # [EHER §十五] Force-unlock a gated P-tail whose ack never arrives
         # (guard thread dead / hint lost / HCCL test unsupported). The worker
         # then falls back to the synchronous recv path. Prevents deadlock.
+        # Default 1000ms: a chunk of cloud middle compute + c2e transfer can
+        # legitimately exceed 500ms (observed 919.7ms ack on a 65518-token
+        # sequence), so the fallback must not fire spuriously.
         self.ha_fallback_timeout_ms: float = float(
-            user_config.get("ha_fallback_timeout_ms", 500.0)
+            user_config.get("ha_fallback_timeout_ms", 1000.0)
         )
 
     @property
