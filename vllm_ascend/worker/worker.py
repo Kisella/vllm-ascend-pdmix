@@ -509,7 +509,13 @@ class NPUWorker(WorkerBase):
                 getattr(_pc, "enable_edge_cloud", False)
                 and getattr(_pc, "is_edge_node", True)
                 and _pd.get("enabled", False)
-                and _pd.get("enable_edge_hidden_early_recv", False)
+                # Default True mirrors PDSeparationConfig
+                # (enable_edge_hidden_early_recv default True).  The executor
+                # (guard thread + hint/ack MQs) and EngineCore (gating) read
+                # the same key, so all processes must agree on the default or
+                # the edge consumes no cached entries while the guard posts
+                # irecvs for a worker that sync-recv's instead.
+                and _pd.get("enable_edge_hidden_early_recv", True)
                 and self.local_rank == 0
             )
             if self._edge_hidden_early_recv_enabled:
@@ -631,24 +637,102 @@ class NPUWorker(WorkerBase):
         else:
             logger.info("[PD] _record_pp_send_work: channel=%s handles=%d",
                         channel.value, len(handles))
-            self._pp_send_work_by_channel[channel.value] = handles
+            # Phase B: prefill_draft rides the parent chunk's prefill channel,
+            # so a channel can carry several outstanding sends at once (the
+            # PF-middle send-back plus draft-middle send-backs).  Track ALL of
+            # them, not just the latest, so _wait_pp_send_work can wait every
+            # prior send before the channel is reused.  Overwriting here would
+            # silently drop the earlier handles: their completion would never
+            # be awaited and the "one outstanding send per channel" invariant
+            # would be violated while the draft chain is in flight.
+            self._pp_send_work_by_channel.setdefault(
+                channel.value, []
+            ).extend(handles)
 
-    def _wait_pp_send_work(self, channel: HiddenChannelType | None = None) -> None:
+    def _should_wait_channel_prior_sends(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Whether this batch must wait the channel's prior sends first.
+
+        Only SEND-posting batches wait.  A batch that posts an irecv must post
+        it unconditionally: that irecv is the consumer of the peer's
+        outstanding send, so gating it behind the local prior-send wait forms a
+        cross-node send-wait cycle -- the edge's DECODE_LAST waits its e2c
+        isend for the cloud's DECODE_FIRST irecv, while the cloud's DECODE_FIRST
+        waits its c2e send-back for the edge's DECODE_LAST irecv, each irecv
+        posted only after the local wait returns.  Both sides stall forever
+        (surfaced by _bounded_wait_send_handle's 10s TIMEOUT).  The hidden-
+        channel stream is FIFO, so posting the irecv before the prior send
+        completes pairs correctly and breaks the cycle.
+        """
+        bt = scheduler_output.batch_type
+        if is_cloud_device():
+            # The cloud only executes middle segments: every batch first posts
+            # an e2c irecv (then a c2e send-back).  Never gate that irecv on
+            # the prior send-back's completion.
+            return False
+        # Edge (head/tail node): FIRST types isend (e2c), LAST types irecv (c2e).
+        return bt in (
+            BatchType.PREFILL_FIRST,
+            BatchType.DECODE_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        )
+
+    def _wait_pp_send_work(
+        self,
+        channel: HiddenChannelType | None = None,
+        wait: bool = True,
+    ) -> None:
         if channel is None:
             for handle in self._pp_send_work:
-                handle.wait()
+                self._bounded_wait_send_handle(handle, None)
             self._pp_send_work = []
             for handles in self._pp_send_work_by_channel.values():
                 for handle in handles:
-                    handle.wait()
+                    self._bounded_wait_send_handle(handle, None)
             self._pp_send_work_by_channel.clear()
             return
 
         handles = self._pp_send_work_by_channel.pop(channel.value, [])
-        logger.info("[PD] _wait_pp_send_work: channel=%s handles=%d",
-                    channel.value, len(handles))
+        logger.info(
+            "[PD] _wait_pp_send_work: channel=%s handles=%d%s",
+            channel.value, len(handles), "" if wait else " (skip wait)",
+        )
+        if not wait:
+            return
         for handle in handles:
-            handle.wait()
+            self._bounded_wait_send_handle(handle, channel.value)
+
+    # Hard bound on each per-channel prior-send wait.  A peer that never
+    # recv's the isend must not freeze this worker forever -- and because the
+    # cloud dispatches synchronously, a frozen cloud worker freezes the whole
+    # cloud control plane (POST_OUT recv for every other request) with it.
+    _PP_SEND_WAIT_TIMEOUT_S = 10.0
+
+    def _bounded_wait_send_handle(
+        self, handle: Handle, channel: str | None
+    ) -> None:
+        """Wait a cross-node send handle with a hard bound.
+
+        ``handle.wait()`` is not interruptible (torch-npu HCCL waits block the
+        calling thread), so poll ``is_completed()`` instead.  On timeout,
+        proceed anyway: the hidden-channel stream is FIFO, so this batch's ops
+        simply queue behind the pending send and pairing stays correct; the
+        send buffers stay pinned until the peer consumes them.  The ERROR log
+        is the signal that a peer-side stall is underway.
+        """
+        deadline = time.monotonic() + self._PP_SEND_WAIT_TIMEOUT_S
+        while not handle.is_completed():
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "[PD] _wait_pp_send_work TIMEOUT channel=%s: prior send "
+                    "not completed within %.0fs; proceeding (stream FIFO "
+                    "preserves ordering, send buffers stay pinned)",
+                    channel, self._PP_SEND_WAIT_TIMEOUT_S,
+                )
+                return
+            time.sleep(0.05)
 
     # ------------------------------------------------------------------ #
     # [CHER/EHER] Cloud/edge hidden early-receive primitives             #
@@ -941,7 +1025,14 @@ class NPUWorker(WorkerBase):
                 BatchType.PREFILL_DRAFT_LAST,
                 BatchType.DECODE_DRAFT_LAST,
             ):
-                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
+                # Recv-posting batches skip the prior-send wait (see
+                # _should_wait_channel_prior_sends): waiting there is what
+                # forms the cross-node send-wait cycle on the hidden channel.
+                self._wait_pp_send_work(
+                    self._hidden_channel_for(scheduler_output),
+                    wait=self._should_wait_channel_prior_sends(
+                        scheduler_output),
+                )
             else:
                 self._wait_pp_send_work()
         else:

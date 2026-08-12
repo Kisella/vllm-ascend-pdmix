@@ -640,7 +640,12 @@ class _LastRoundMarker(_BatchedExecuteMarker):
         # (mirrors NPUWorker.execute_model L564-576).
         channel = self.worker._hidden_channel_for(
             self.bundle.scheduler_output)
-        self.worker._wait_pp_send_work(channel)
+        # LAST recv: post the irecv unconditionally (skip the prior-send
+        # wait) to avoid the cross-node send-wait cycle on this channel.
+        self.worker._wait_pp_send_work(
+            channel,
+            wait=self.worker._should_wait_channel_prior_sends(
+                self.bundle.scheduler_output))
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv(
                 num_tokens=num_tokens,

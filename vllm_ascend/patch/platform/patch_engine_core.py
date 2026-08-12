@@ -66,6 +66,7 @@ from __future__ import annotations
 import functools
 import time
 from collections import deque
+import threading
 from concurrent.futures import Future
 from typing import cast
 from uuid import uuid4
@@ -265,7 +266,12 @@ def _drain_pd_channel_inbox(self) -> None:
                 and getattr(_pc, "is_edge_node", False)
             ):
                 self._eher_enabled = bool(
-                    _pd_cfg.get("enable_edge_hidden_early_recv", False)
+                    # Default True matches PDSeparationConfig
+                    # (enable_edge_hidden_early_recv default True).  The raw
+                    # additional_config read must mirror the dataclass default,
+                    # or the EngineCore gates P-tails while no guard thread /
+                    # hint MQ exist (the executor reads the same key).
+                    _pd_cfg.get("enable_edge_hidden_early_recv", True)
                 )
                 self._eher_gating_enabled = bool(
                     _pd_cfg.get(
@@ -986,7 +992,7 @@ def _patched_step(self):
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
     ):
-        model_output = future.result()
+        model_output = _wait_worker_result_with_drain(self, future)
         if model_output is None:
             model_output = self.model_executor.sample_tokens(grammar_output)
 
@@ -1006,6 +1012,45 @@ def _patched_step(self):
         engine_core_outputs,
         scheduler_output.total_num_scheduled_tokens > 0,
     )
+
+
+def _wait_worker_result_with_drain(self, future: Future,
+                                   poll_s: float = 0.05) -> ModelRunnerOutput:
+    """Bounded wait for a worker result, draining the PD channel between polls.
+
+    [PD deadlock hardening] A bare ``future.result()`` freezes the EngineCore
+    for as long as the worker batch takes -- and while frozen,
+    ``_drain_pd_channel_inbox`` never runs.  That drain is the only path that
+    moves cloud POST_OUTs into the scheduler's ready queues and fires the EHER
+    fallback unlock, so a slow (or stalled) worker batch would deadlock the
+    whole prefill channel: PLs never arrive, ``prefills_last_ready`` stays
+    empty, the cloud's next send-back on the channel blocks forever, and the
+    edge can never issue the PF the cloud is waiting on.  Keeping the drain
+    alive on a poll cadence lets the P-tail return path survive transient
+    worker stalls and keeps the EHER 1s fallback firing.
+
+    The multiproc ``FutureWrapper.result()`` (vllm/v1/executor/multiproc_
+    executor.py) raises ``RuntimeError("timeout not implemented")`` for any
+    non-None timeout, and with none it blocks draining the shared
+    ``futures_queue`` on the response MQ -- so resolve the future on a daemon
+    thread and poll ``done()`` on this thread instead.  ``FutureWrapper``
+    extends ``concurrent.futures.Future``, so ``set_result`` (called from the
+    waiter) is lock-protected and ``done()`` is visible here.  Exactly one
+    waiter is active at a time -- the collect loop resolves batches strictly in
+    queue order and the fill loop is idle during the wait -- so the
+    ``futures_queue`` pop inside ``FutureWrapper.result`` cannot race another
+    resolver.  On the hard-stall path the waiter parks in the MQ dequeue
+    forever (a daemon thread), while this thread keeps draining.
+    """
+    waiter = threading.Thread(
+        target=future.result, daemon=True, name="pd-result-waiter"
+    )
+    waiter.start()
+    while not future.done():
+        time.sleep(poll_s)
+        self._drain_pd_channel_inbox()
+    waiter.join()
+    return future.result()
 
 
 # =======================================================================#
@@ -1131,7 +1176,7 @@ def _patched_step_with_batch_queue(self):
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
     ):
-        model_output = future.result()
+        model_output = _wait_worker_result_with_drain(self, future)
         if model_output is None:
             exec_model_fut.result()
             raise RuntimeError("unexpected error")

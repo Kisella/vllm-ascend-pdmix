@@ -1048,12 +1048,20 @@ class PDSeparatedScheduler(Scheduler):
         # channel, so DECODE_FIRST is gated only by the decode domain.
         # The prefill domain (queues / flags / remote-pending) never blocks
         # it — the two domains are independent scheduling domains.
+        # Channel mirror invariant (2026-08-12 positional-pairing deadlock):
+        # DECODE-channel P2P ops pair positionally between edge and cloud
+        # (edge [S,R,S,R,...] vs cloud [R,S,R,S,...]).  A decode head must
+        # never be dispatched while a decode-domain tail (self-posted
+        # DECODE_LAST or decode_draft_last) is still unpicked: the tail's R
+        # op would land *after* the new head's S op, skewing the sequence
+        # into pos-k S<->S / pos-(k+1) R<->R permanent deadlock.
         return bool(
             self.running
             and self.decode_or_draft_inflight_count == 0
             and self.decode_draft_remote_pending_count == 0
             and not self.decode_drafts_first_ready
             and not self.decode_drafts_last_ready
+            and not self.decodes_last_ready
             and not self._force_decode_last
             and not self._force_decode_draft_last
         )
@@ -1126,10 +1134,15 @@ class PDSeparatedScheduler(Scheduler):
         # Do not start another head while an earlier head is still remote or
         # its tail is ready locally: otherwise edge and cloud can each wait
         # for the opposite-direction send before posting the matching recv.
+        # ``not decodes_last_ready`` — channel mirror invariant (see
+        # _can_schedule_decode_first): a decode_draft head is an edge->cloud
+        # send on the same channel, so it may not jump ahead of a self-posted
+        # DECODE_LAST whose R op is still pending.
         return bool(
             self.decode_or_draft_inflight_count == 0
             and self._draft_remote_pending(kind) == 0
             and not self._drafts_last_ready(kind)
+            and not self.decodes_last_ready
             and not self._force_decode_last
             and not self._force_draft_last(kind)
         )
@@ -2219,6 +2232,15 @@ class PDSeparatedScheduler(Scheduler):
             # A chain pre-generated from the final PREFILL_LAST can reach its
             # final DRL before EngineCore has applied the prefill result. Retry
             # on the next schedule turn after that request moves to running.
+            return
+        if not self._can_schedule_decode_first():
+            # Channel mirror invariant (see _can_schedule_decode_first): the
+            # placeholder head must not jump ahead of a pending decode tail or
+            # a still-in-flight head — its isend would land before the tail's
+            # irecv and skew the positional P2P pairing into an S<->S / R<->R
+            # deadlock.  Keep the parent set and retry on a later schedule
+            # turn (2026-08-12 run 2/3: this path dispatched a DECODE_FIRST
+            # while two decode batches were already in flight).
             return
 
         next_decode = self._pick_decode_first_batch()

@@ -69,7 +69,11 @@ def _edge_eher_enabled(vllm_config: VllmConfig) -> bool:
     pd = ec.get("pd_separation", {}) if isinstance(ec, dict) else {}
     if not bool(pd.get("enabled", False)):
         return False
-    return bool(pd.get("enable_edge_hidden_early_recv", False))
+    # Default True must match PDSeparationConfig.enable_edge_hidden_early_recv
+    # (ascend_config.py).  A default mismatch here builds no hint MQ / guard
+    # thread / ack MQ while the EngineCore still gates P-tails -> every P-tail
+    # parks for the ha_fallback_timeout and the hint path is dead.
+    return bool(pd.get("enable_edge_hidden_early_recv", True))
 
 
 def _edge_eher_gating_enabled(vllm_config: VllmConfig) -> bool:
