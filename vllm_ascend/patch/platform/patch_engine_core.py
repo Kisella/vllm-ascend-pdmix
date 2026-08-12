@@ -88,8 +88,10 @@ _INSTALLED_FLAG = "_vllm_ascend_engine_core_patched"
 # Draft-chain head batches — the two per-domain variants
 # (PREFILL_DRAFT_FIRST / DECODE_DRAFT_FIRST). Both share the same
 # control-plane treatment: deferred PRE_OUT while the chain is being
-# pre-generated, and no POST_OUT return (the edge self-posts the matching
-# draft tail).
+# pre-generated.  Since 2026-08-12 the POST_OUT return differs per domain:
+# the cloud publishes PREFILL_DRAFT_LAST back for prefill_draft heads,
+# while DECODE_DRAFT_FIRST still gets no return (the edge self-posts the
+# decode draft tail).
 _DRAFT_HEAD_BATCH_TYPES = (
     BatchType.PREFILL_DRAFT_FIRST,
     BatchType.DECODE_DRAFT_FIRST,
@@ -340,15 +342,22 @@ def _drain_pd_channel_inbox(self) -> None:
                 self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
-        elif bt in (BatchType.PREFILL_DRAFT_LAST,
-                    BatchType.DECODE_DRAFT_LAST):
-            # The draft tail is self-posted by _pick_draft_first_batch (like
-            # DECODE_LAST). If it arrives via POST_OUT (e.g. from an older
-            # cloud that still publishes it), drop it -- the edge already has
-            # its own copy in the matching domain last queue.
+        elif bt == BatchType.PREFILL_DRAFT_LAST:
+            # 2026-08-12: the cloud publishes PREFILL_DRAFT_LAST via POST_OUT
+            # after executing the head — the edge no longer self-posts the
+            # prefill_draft tail (the cloud copied the per-request
+            # draft_output_req_ids / is_last_prefill_chunk metadata onto the
+            # echo).  The scheduler picks it like any other draft tail.
+            self.scheduler.prefill_drafts_last_ready.append(so)
+        elif bt == BatchType.DECODE_DRAFT_LAST:
+            # The decode_draft tail is still self-posted by
+            # _pick_draft_first_batch (like DECODE_LAST). If it arrives via
+            # POST_OUT (e.g. from an older cloud that still publishes it),
+            # drop it -- the edge already has its own copy in the decode
+            # draft last queue.
             logger.debug(
                 "Dropping POST_OUT %s head_token=%s "
-                "(edge self-posts the draft tail)",
+                "(edge self-posts the decode draft tail)",
                 bt.value,
                 getattr(so, "head_token", None),
             )

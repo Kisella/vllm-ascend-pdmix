@@ -737,10 +737,15 @@ class PassiveEngineCoreProc:
         on the POST_OUT (cloud → edge) channel.
 
         Mapping (cloud-side):
-            PREFILL_FIRST → PREFILL_LAST
-            DECODE_FIRST  → skipped (edge self-posts DECODE_LAST)
-            draft heads   → skipped (edge self-posts the draft tail)
-            anything else → dropped (legacy PP batches don't trigger return)
+            PREFILL_FIRST          → PREFILL_LAST
+            PREFILL_DRAFT_FIRST    → PREFILL_DRAFT_LAST (2026-08-12: the
+                                     prefill_draft tail is published back to
+                                     the edge; the edge no longer self-posts it)
+            DECODE_FIRST           → skipped (edge self-posts DECODE_LAST)
+            DECODE_DRAFT_FIRST     → skipped (edge self-posts the decode
+                                     draft tail)
+            anything else          → dropped (legacy PP batches don't
+                                     trigger return)
 
         Uses a shallow copy via :py:func:`dataclasses.replace` so the original
         SchedulerOutput (still about to be enqueued for the local executor)
@@ -754,6 +759,24 @@ class PassiveEngineCoreProc:
             tail = replace(
                 scheduler_output, batch_type=BatchType.PREFILL_LAST
             )
+        elif bt == BatchType.PREFILL_DRAFT_FIRST:
+            # The edge waits for this POST_OUT to post the matching recv
+            # (the cloud round trip replaces the edge's self-posted
+            # prefill_draft tail + artificial tail delay).  The edge derives
+            # per-request draft-output metadata from the head, so carry the
+            # dynamic SchedulerOutput attributes over explicitly —
+            # dataclasses.replace() would drop them.
+            tail = replace(
+                scheduler_output, batch_type=BatchType.PREFILL_DRAFT_LAST
+            )
+            tail.is_last_prefill_chunk = getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            )
+            tail.draft_output_req_ids = getattr(
+                scheduler_output,
+                "draft_output_req_ids",
+                tuple(scheduler_output.num_scheduled_tokens),
+            )
         elif bt == BatchType.DECODE_FIRST:
             # The edge pre-generates DECODE_LAST, so the cloud does not
             # publish another control-plane response for DECODE_FIRST.
@@ -763,15 +786,13 @@ class PassiveEngineCoreProc:
                 scheduler_output.head_token,
             )
             return
-        elif bt in _DRAFT_HEAD_BATCH_TYPES:
-            # The edge pre-generates the matching draft tail (self-posting,
+        elif bt == BatchType.DECODE_DRAFT_FIRST:
+            # The edge pre-generates the decode_draft tail (self-posting,
             # same as DECODE_FIRST -> DECODE_LAST), so the cloud does not
-            # publish POST_OUT for any draft head batch — the prefill and
-            # decode-domain variants alike.
+            # publish POST_OUT for a decode_draft head.
             logger.debug(
-                "[Cloud] Skipping POST_OUT for %s "
-                "head_token=%s (edge pre-generates the draft tail)",
-                bt.value,
+                "[Cloud] Skipping POST_OUT for DECODE_DRAFT_FIRST "
+                "head_token=%s (edge self-posts the decode draft tail)",
                 scheduler_output.head_token,
             )
             return

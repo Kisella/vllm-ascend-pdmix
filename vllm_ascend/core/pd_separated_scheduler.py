@@ -392,6 +392,13 @@ class PDSeparatedScheduler(Scheduler):
         self._draft_first_dispatched: bool = False
         self._pregenerated_draft_task_ids: set[str] = set()
         self._pregenerated_draft_req_ids: dict[str, set[str]] = {}
+        # 2026-08-12 running-gate: per-request count of not-yet-completed
+        # prefill_draft steps whose draft tokens are published (final prefill
+        # chunk only).  A request may enter ``running`` (and therefore decode)
+        # only after ALL of its prefill_draft steps have executed; the count
+        # is incremented at chain creation, decremented per
+        # PREFILL_DRAFT_LAST completion, and zeroed when the chain is dropped.
+        self._req_pending_prefill_draft_steps: dict[str, int] = {}
         # Phase C (§7.7): per-domain remote-pending credits, threaded by
         # platform._configure_pd_separation_scheduler from
         # pd_separation.prefill_draft_remote_pending_limit /
@@ -559,11 +566,17 @@ class PDSeparatedScheduler(Scheduler):
             self._decode_draft_last_delay_start_ts = time.monotonic()
 
     def _can_schedule_draft_last(self, kind: str) -> bool:
-        """Return True if the delay since the <kind> draft head has elapsed."""
+        """Return True if the delay since the <kind> draft head has elapsed.
+
+        2026-08-12: the prefill_draft tail is no longer self-posted by the
+        edge — the cloud publishes PREFILL_DRAFT_LAST back via POST_OUT after
+        executing the head, so the cloud round trip bounds the pacing and no
+        artificial delay applies.  The decode_draft domain keeps its
+        self-posted tail + delay timer.
+        """
         if kind == _DRAFT_KIND_PREFILL:
-            start_ts = self._prefill_draft_last_delay_start_ts
-        else:
-            start_ts = self._decode_draft_last_delay_start_ts
+            return True
+        start_ts = self._decode_draft_last_delay_start_ts
         if start_ts is None:
             return True
         elapsed_ms = (time.monotonic() - start_ts) * 1000
@@ -1777,6 +1790,15 @@ class PDSeparatedScheduler(Scheduler):
                                 )
                             ):
                                 self._finalize_prefill_slot(head)
+                        # 2026-08-12 running-gate: the chain is cut (its
+                        # requests finished), so the request-level gate must
+                        # not keep waiting on the never-executing steps.
+                        for rid in getattr(
+                            scheduler_output, "draft_output_req_ids", ()
+                        ):
+                            self._req_pending_prefill_draft_steps.pop(
+                                rid, None
+                            )
                 if scheduler_output is self._draft_first_cloud_publish_pending:
                     self._draft_first_cloud_publish_pending = None
                     self._draft_first_scalars_patched = False
@@ -1819,40 +1841,47 @@ class PDSeparatedScheduler(Scheduler):
             scheduler_output.hidden_channel = inherited
         else:
             scheduler_output.hidden_channel = HiddenChannelType.DECODE
-        # Draft-first self-posting mirrors the decode path below. Every
-        # field needed by the tail is already known on the edge; the cloud
-        # used to echo the same SchedulerOutput back through POST_OUT only
-        # after its worker acked the draft head. Pre-generating the tail here
-        # removes that per-draft-step control-plane round trip and lets the
-        # edge post the matching receive as soon as the draft head has
-        # completed locally. Worker FIFO ordering plus the per-channel
-        # send-work wait preserves FIRST -> LAST data-plane ordering.
-        draft_last = replace(
-            scheduler_output,
-            batch_type=last_type,
-            num_accepted_tokens=None,
-            valid_sampled_token_count=None,
-        )
-        # is_last_prefill_chunk is a downstream dynamic SchedulerOutput
-        # attribute, so dataclasses.replace() does not preserve it.
-        draft_last.is_last_prefill_chunk = getattr(
-            scheduler_output, "is_last_prefill_chunk", True
-        )
-        draft_last.draft_output_req_ids = getattr(
-            scheduler_output,
-            "draft_output_req_ids",
-            tuple(scheduler_output.num_scheduled_tokens),
-        )
-        self._validate_draft_tail_channel(kind, draft_last)
-        last_ready.append(draft_last)
+        if kind == _DRAFT_KIND_DECODE:
+            # Draft-first self-posting mirrors the DECODE_FIRST -> DECODE_LAST
+            # path. Every field needed by the tail is already known on the
+            # edge; the cloud used to echo the same SchedulerOutput back
+            # through POST_OUT only after its worker acked the draft head.
+            # Pre-generating the tail here removes that per-draft-step
+            # control-plane round trip and lets the edge post the matching
+            # receive as soon as the draft head has completed locally. Worker
+            # FIFO ordering plus the per-channel send-work wait preserves
+            # FIRST -> LAST data-plane ordering.
+            draft_last = replace(
+                scheduler_output,
+                batch_type=last_type,
+                num_accepted_tokens=None,
+                valid_sampled_token_count=None,
+            )
+            # is_last_prefill_chunk is a downstream dynamic SchedulerOutput
+            # attribute, so dataclasses.replace() does not preserve it.
+            draft_last.is_last_prefill_chunk = getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            )
+            draft_last.draft_output_req_ids = getattr(
+                scheduler_output,
+                "draft_output_req_ids",
+                tuple(scheduler_output.num_scheduled_tokens),
+            )
+            self._validate_draft_tail_channel(kind, draft_last)
+            last_ready.append(draft_last)
+            self.decode_or_draft_inflight_count += 1
+            self._start_draft_last_delay(kind)
         # Phase B (§5.4): only the decode domain shares the DECODE channel
         # credit.  prefill_draft rides the inherited prefill channel and is
         # bounded by the slot refcount + its own remote-pending credit.
-        if kind == _DRAFT_KIND_DECODE:
-            self.decode_or_draft_inflight_count += 1
+        # 2026-08-12: the prefill_draft tail is NOT generated here anymore —
+        # the cloud publishes PREFILL_DRAFT_LAST via POST_OUT after executing
+        # the head (round-trip replaces the artificial tail delay), so the
+        # edge only posts the matching recv once the cloud has dispatched the
+        # work.  The alternation flag below still guards the prefill channel:
+        # the next prefill_draft head must wait for the published tail's pick.
         self._incr_draft_remote_pending(kind)
         self._set_force_draft_last(kind, True)
-        self._start_draft_last_delay(kind)
 
         logger.info(
             "[MTP-DEBUG] scheduler picked %s: task_id=%s, "
@@ -1983,6 +2012,15 @@ class PDSeparatedScheduler(Scheduler):
 
         self._pregenerated_draft_task_ids.add(task_id)
         self._pregenerated_draft_req_ids[task_id] = set(req_ids)
+        if kind == _DRAFT_KIND_PREFILL:
+            # 2026-08-12 running-gate: the requests whose draft tokens are
+            # published (final prefill chunk) may enter running only after
+            # the whole chain has executed; account every step now.
+            for rid in getattr(target_tail, "draft_output_req_ids", ()):
+                self._req_pending_prefill_draft_steps[rid] = (
+                    self._req_pending_prefill_draft_steps.get(rid, 0)
+                    + self.num_spec_tokens
+                )
         logger.info(
             "[PD] pre-generated async MTP placeholders kind=%s task_id=%s steps=%d",
             kind,
@@ -2096,6 +2134,12 @@ class PDSeparatedScheduler(Scheduler):
             self._prefill_slot_pending[draft_task_id] = (
                 self._prefill_slot_pending.get(draft_task_id, 0) + 1
             )
+            # 2026-08-12 running-gate (fallback chain path): one more
+            # pending step for the requests whose draft tokens are published.
+            for rid in getattr(source, "draft_output_req_ids", ()):
+                self._req_pending_prefill_draft_steps[rid] = (
+                    self._req_pending_prefill_draft_steps.get(rid, 0) + 1
+                )
         draft_first = replace(
             source,
             batch_type=first_type,
@@ -2157,15 +2201,17 @@ class PDSeparatedScheduler(Scheduler):
                 )
             self._validate_draft_tail_channel(kind, scheduler_output)
             # A tail here always has its matching first already dispatched
-            # to the cloud (it was self-posted in _pick_draft_first_batch when
-            # the head was picked).  The cloud does not track request
-            # lifecycle, so it will isend a response even if the owning
-            # request has since finished/aborted.  The edge MUST still execute
-            # this tail (recv) to keep its hidden channel (prefill or DECODE,
-            # Phase B) paired -- never drop it.  When the request is gone the
-            # worker drains the recv and skips the tail-segment compute (see
-            # _run_edge_cloud_draft_last_segment); we also must not spawn a
-            # verify placeholder for a dead request.
+            # to the cloud: decode_draft tails were self-posted in
+            # _pick_draft_first_batch when the head was picked; prefill_draft
+            # tails are published back by the cloud via POST_OUT after it
+            # executed the head (2026-08-12).  The cloud does not track
+            # request lifecycle, so it will isend a response even if the
+            # owning request has since finished/aborted.  The edge MUST still
+            # execute this tail (recv) to keep its hidden channel (prefill or
+            # DECODE, Phase B) paired -- never drop it.  When the request is
+            # gone the worker drains the recv and skips the tail-segment
+            # compute (see _run_edge_cloud_draft_last_segment); we also must
+            # not spawn a verify placeholder for a dead request.
             self._set_force_draft_last(kind, False)
             if kind == _DRAFT_KIND_DECODE:
                 # Phase B (§6.3): the first-only window is decode-domain
@@ -2382,6 +2428,10 @@ class PDSeparatedScheduler(Scheduler):
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
             return
+        # 2026-08-12 running-gate: finished requests no longer need their
+        # pending prefill_draft step count (their chain may be cut early).
+        for rid in req_ids:
+            self._req_pending_prefill_draft_steps.pop(rid, None)
         # Aligned with the model runner's deferred-draft policy: a draft
         # batch is dropped only when EVERY request it covers has finished.
         # Partial finishes keep the draft — the cloud-side cached
@@ -2395,6 +2445,9 @@ class PDSeparatedScheduler(Scheduler):
             # Phase B (§5.2): per-parent count of committed chain steps
             # dropped here, so the slot refcount stays consistent.
             dropped_steps: dict[str, int] = {}
+            # 2026-08-12 running-gate: per-parent member requests of the
+            # dropped chain, so their pending-step counters can be cleared.
+            dropped_steps_reqs: dict[str, set[str]] = {}
             for output in first_ready:
                 if (
                     self._scheduler_output_intersects_req_ids(output, req_ids)
@@ -2408,6 +2461,9 @@ class PDSeparatedScheduler(Scheduler):
                         if kind == _DRAFT_KIND_PREFILL:
                             dropped_steps[task_id] = (
                                 dropped_steps.get(task_id, 0) + 1
+                            )
+                            dropped_steps_reqs.setdefault(task_id, set()).update(
+                                getattr(output, "draft_output_req_ids", ())
                             )
                     if output is self._draft_first_cloud_publish_pending:
                         self._draft_first_cloud_publish_pending = None
@@ -2425,6 +2481,11 @@ class PDSeparatedScheduler(Scheduler):
                             and self._prefill_slot_pl_done.get(task_id, False)
                         ):
                             self._finalize_prefill_slot(task_id)
+                    # 2026-08-12 running-gate: every member request of a
+                    # dropped chain must clear its pending-step counter
+                    # (their remaining steps will never execute).
+                    for rid in dropped_steps_reqs.get(task_id, ()):
+                        self._req_pending_prefill_draft_steps.pop(rid, None)
             else:
                 self.decode_drafts_first_ready = kept_first
 
@@ -2643,6 +2704,11 @@ class PDSeparatedScheduler(Scheduler):
             req for req in self.chunk_prefill_first
             if not req.is_prefill_chunk
             and self._pending_tail_count.get(req.request_id, 0) == 0
+            # 2026-08-12 running-gate: the request may only enter decode
+            # after ALL of its prefill_draft steps have executed.
+            and self._req_pending_prefill_draft_steps.get(
+                req.request_id, 0
+            ) == 0
         ]
         for req in completed:
             self.chunk_prefill_first.remove(req)
@@ -2655,6 +2721,43 @@ class PDSeparatedScheduler(Scheduler):
             # is entering decode — it must be RUNNING.
             if req.status != RequestStatus.RUNNING:
                 req.status = RequestStatus.RUNNING
+
+    def _migrate_ready_prefill_pending(self) -> None:
+        """Move prefilled requests whose prefill_draft chain has fully
+        executed into running.
+
+        2026-08-12 running-gate: a request may only advance to decode after
+        ALL of its prefill_draft steps have completed.  Chunk-prior requests
+        wait in ``chunk_prefill_first`` and are picked up by
+        ``_migrate_prefill_to_running``; legacy requests wait in
+        ``prefill_last_pending`` and are scanned here.  Called from the
+        PREFILL_DRAFT_LAST completion handler when a pending-step counter
+        reaches zero.
+        """
+        self._migrate_prefill_to_running()
+        migrated: list[Request] = []
+        remaining = []
+        for req in self.prefill_last_pending:
+            if (
+                not req.is_prefill_chunk
+                and self._req_pending_prefill_draft_steps.get(
+                    req.request_id, 0
+                ) == 0
+            ):
+                self.running.append(req)
+                migrated.append(req)
+                if req.status != RequestStatus.RUNNING:
+                    req.status = RequestStatus.RUNNING
+            else:
+                remaining.append(req)
+        if migrated:
+            self.prefill_last_pending = remaining
+            logger.info(
+                "[PD] prefill_draft chain done; moved %d reqs to running[], "
+                "running[]: %d",
+                len(migrated),
+                len(self.running),
+            )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         # In PD separation requests may re-enter ``running`` from
@@ -2709,9 +2812,28 @@ class PDSeparatedScheduler(Scheduler):
                 if req.is_prefill_chunk:
                     self.chunk_prefill_first.append(req)
                     newly_chunked.append(req)
-                else:
+                elif (
+                    self._req_pending_prefill_draft_steps.get(
+                        req.request_id, 0
+                    ) == 0
+                    # 2026-08-12 running-gate: a worker-created fallback
+                    # chain is enqueued by the engine core AFTER
+                    # update_from_output (_advance_edge_cloud_draft), so its
+                    # step counter is not visible yet — the draft-task
+                    # registration performed before update_from_output is
+                    # the pending-chain signal (see _pregenerate_draft_chain
+                    # / enqueue_draft_first for the counter).
+                    and scheduler_output.head_token
+                    not in self._edge_cloud_draft_task_reqs
+                ):
                     self.running.append(req)
                     newly_running.append(req)
+                else:
+                    # 2026-08-12 running-gate: the request's prefill_draft
+                    # chain is still executing; defer until the final
+                    # PREFILL_DRAFT_LAST completes (see
+                    # _migrate_ready_prefill_pending).
+                    remaining_pending.append(req)
             else:
                 remaining_pending.append(req)
         self.prefill_last_pending = remaining_pending
@@ -2778,9 +2900,26 @@ class PDSeparatedScheduler(Scheduler):
         )
 
         if flight.is_last_chunk and remaining == 0:
-            # All chunks complete → request enters decode.
+            # All chunks complete → request enters decode — but only after
+            # its prefill_draft chain has fully executed (2026-08-12
+            # running-gate).  Deferred requests wait in chunk_prefill_first
+            # and are moved by _migrate_prefill_to_running once the final
+            # PREFILL_DRAFT_LAST completes.
             if req is not None:
-                self.running.append(req)
+                if (
+                    self._req_pending_prefill_draft_steps.get(req_id, 0)
+                    == 0
+                    # 2026-08-12 running-gate: same fallback-chain window as
+                    # the legacy router — a worker-created chain enqueued
+                    # after update_from_output is not yet visible in the
+                    # step counter; the pre-update draft-task registration
+                    # is its pending signal.
+                    and head_token
+                    not in self._edge_cloud_draft_task_reqs
+                ):
+                    self.running.append(req)
+                else:
+                    self.chunk_prefill_first.append(req)
             self._cleanup_request_flight_state(req_id)
             logger.info(
                 "[PD-CHUNK-PRIOR] Request %s all chunks done, "
@@ -2924,6 +3063,22 @@ class PDSeparatedScheduler(Scheduler):
                 head = scheduler_output.draft_task_id
                 if head in self._prefill_slot_pending:
                     self._prefill_slot_pending[head] -= 1
+                # 2026-08-12 running-gate: one prefill_draft step finished —
+                # release the request-level gate; when the final step lands,
+                # the deferred requests may enter running.
+                chain_done = False
+                for rid in getattr(
+                    scheduler_output, "draft_output_req_ids", ()
+                ):
+                    pending = self._req_pending_prefill_draft_steps.get(rid, 0)
+                    if pending > 0:
+                        self._req_pending_prefill_draft_steps[rid] = (
+                            pending - 1
+                        )
+                        if pending - 1 == 0:
+                            chain_done = True
+                if chain_done:
+                    self._migrate_ready_prefill_pending()
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_or_draft_inflight_count 已在 DECODE_FIRST 的 update_from_output
             # 中释放，此处不再重复减 1。

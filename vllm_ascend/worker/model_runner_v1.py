@@ -2839,7 +2839,18 @@ class NPUModelRunner(GPUModelRunner):
             # Spec tokens occupy the last draft_len positions of the
             # request's scheduled tokens (mirrors the upstream scatter).
             end = int(cu_num_tokens[cur_index])
-            take = min(draft_len, entry.shape[0])
+            # 2026-08-12: clamp the scatter width to the request's
+            # scheduled token count.  Upstream guarantees len(spec) <=
+            # budget by truncation (Scheduler.schedule), but the
+            # edge-cloud chain gate freezes the request's computed tokens
+            # while its prefill_draft chain runs, so the first verify
+            # after the chain can schedule fewer positions than draft_len
+            # — writing more rows than the request occupies would index
+            # out of bounds (empty slice vs 3-row tensor).  Rows beyond
+            # the budget keep their placeholder (-1) value and are
+            # rejected at sample time, same as
+            # update_draft_token_ids_in_output's trim/pad.
+            take = min(draft_len, entry.shape[0], end)
             if take <= 0:
                 continue
             self.input_ids.gpu[end - take:end] = entry[:take].to(
