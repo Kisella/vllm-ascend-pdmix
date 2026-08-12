@@ -298,12 +298,21 @@ class PassiveScheduler:
                     )
                 self._last_decode_first_arrival_ts = now
                 self.ready_decodes.append(scheduler_output)
-            elif bt == BatchType.DRAFT_FIRST:
+            elif bt in (
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
+            ):
+                # Both draft-head types execute the same cloud-side draft
+                # middle segment; the hidden channel is carried on the
+                # SchedulerOutput.  Both draft domains share ready_drafts (the
+                # cloud routes by hidden channel, no per-domain split needed —
+                # design §7.4).
                 self.ready_drafts.append(scheduler_output)
             elif bt in (
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
-                BatchType.DRAFT_LAST,
+                BatchType.PREFILL_DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
             ):
                 # Tail-segment batches are edge-only and must never be
                 # dispatched on the cloud. If one shows up here it is a
@@ -495,11 +504,13 @@ class PassiveScheduler:
     ) -> list["LayerSliceInfo | None"]:
         # Decode-like and empty batches are never sliced. DECODE_FIRST is the
         # edge-cloud head segment of a decode step — same per-token shape as
-        # PURE_DECODE, so it follows the same no-slice rule.
+        # PURE_DECODE, so it follows the same no-slice rule.  Draft heads of
+        # both domains are single-token steps, never sliced either.
         if so.batch_type in (
             BatchType.PURE_DECODE,
             BatchType.DECODE_FIRST,
-            BatchType.DRAFT_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
         ):
             return [None]
 
@@ -663,16 +674,27 @@ class PassiveScheduler:
     def _pick_decode_or_draft_by_arrival(self) -> ScheduledBatch:
         """Pick between the head decode and head draft by arrival order.
 
-        DECODE_FIRST and DRAFT_FIRST payloads share the DECODE hidden
-        channel, and the edge publishes control messages in exactly the
-        order its data plane requires.  Letting a later-arrived draft
-        overtake an earlier decode (unconditional draft priority) makes
-        the cloud post a recv for the draft payload while the edge's
-        next in-flight message is a decode payload of a different size;
-        the cloud then never produces the decode response the edge is
-        blocked on, and the edge never sends the draft payload the cloud
-        is blocked on -- a cross-side deadlock.  Fall back to draft
-        priority only when an arrival seq is unavailable.
+        Phase B (§4.1) split the channels: DECODE_FIRST and
+        DECODE_DRAFT_FIRST share the DECODE hidden channel, while
+        PREFILL_DRAFT_FIRST rides the inherited prefill channel.  The
+        shared-channel deadlock below therefore applies strictly to the
+        decode domain; a prefill_draft could in principle overtake an
+        earlier decode without deadlocking.  The cloud keeps a single
+        arrival-ordered ``ready_drafts`` queue anyway (design §7.4 -- no
+        per-domain split): arrival order never lets anything overtake, so
+        it is always safe on every channel, and a draft head on a fresh
+        channel must not jump the queue ahead of an already-arrived
+        decode step on the busy DECODE channel (latency fairness).
+
+        Deadlock rationale (decode domain): the edge publishes control
+        messages in exactly the order its data plane requires.  Letting a
+        later-arrived draft overtake an earlier decode (unconditional
+        draft priority) makes the cloud post a recv for the draft payload
+        while the edge's next in-flight message is a decode payload of a
+        different size; the cloud then never produces the decode response
+        the edge is blocked on, and the edge never sends the draft payload
+        the cloud is blocked on -- a cross-side deadlock.  Fall back to
+        draft priority only when an arrival seq is unavailable.
 
         Caller must ensure at least one of the two queues is non-empty.
         """
@@ -710,11 +732,13 @@ class PassiveScheduler:
             if self.ready_drafts
             else None
         )
-        # Decodes and drafts share the DECODE hidden channel, so the
+        # DECODE_FIRST and DECODE_DRAFT_FIRST share the DECODE hidden
+        # channel; PREFILL_DRAFT_FIRST rides its own prefill channel
+        # (Phase B §4.1).  Arrival order is safe on every channel, so the
         # "channel work" competing with prefill slice-0 is whichever of
-        # the two arrived first -- an earlier draft must not be
-        # overtaken by a later decode either (same deadlock hazard as
-        # the reverse, see _pick_decode_or_draft_by_arrival).
+        # decode/draft arrived first -- an earlier draft must not be
+        # overtaken by a later decode either (same deadlock hazard as the
+        # reverse, see _pick_decode_or_draft_by_arrival).
         channel_seq = decode_seq
         if draft_seq is not None and (
             channel_seq is None or draft_seq < channel_seq
@@ -767,13 +791,16 @@ class PassiveScheduler:
                     self._start_prefill_middle_throttle()
                 return self._pick_prefill_batch()
             # No Prefill: callback to Decode/Draft.  Arrival order is
-            # mandatory here (shared DECODE channel), not a preference.
+            # mandatory here (decode-domain heads share the DECODE channel;
+            # prefill_draft rides its own channel but stays in the same
+            # single arrival-ordered queue per design §7.4), not a preference.
             if self.ready_drafts or self.ready_decodes:
                 self._clear_prefill_middle_throttle()
                 return self._pick_decode_or_draft_by_arrival()
         else:  # EXPECT_EXECUTE_DECODE_OR_DRAFT
-            # Decode/Draft in arrival order (shared DECODE channel --
-            # see _pick_decode_or_draft_by_arrival).
+            # Decode/Draft in arrival order (decode heads share the DECODE
+            # channel; prefill_draft rides its own channel -- single queue
+            # per design §7.4, see _pick_decode_or_draft_by_arrival).
             if self.ready_drafts or self.ready_decodes:
                 self.cloud_scheduling_state = (
                     CloudSchedulingState.EXPECT_EXECUTE_PREFILL

@@ -885,8 +885,8 @@ class NPUModelRunner(GPUModelRunner):
         # Bound sized for long-sequence (e.g. 64k) multi-request runs where the
         # draft chain can legitimately lag several verify steps behind.  Too
         # small a bound evicts an in-flight task's metadata; the matching
-        # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
-        # cloud never sends the DRAFT_LAST response, deadlocking the edge's
+        # draft head then raises in _reconstruct_cloud_draft_positions and the
+        # cloud never sends the draft tail response, deadlocking the edge's
         # matching recv on the shared DECODE channel.
         self._cloud_spec_decode_metadata_cache_max: int = 32
         # Same per-task treatment for the verify step's scheduler_output:
@@ -3106,10 +3106,10 @@ class NPUModelRunner(GPUModelRunner):
 
         ``force_drop_task_ids`` carries chains the scheduler cut from its
         ready queues (all requests finished): their contexts are dropped
-        unconditionally.  Dropping a context whose DRAFT_FIRST already
-        executed is safe — the matching DRAFT_LAST drains through the
+        unconditionally.  Dropping a context whose draft head already
+        executed is safe — the matching draft tail drains through the
         context-is-None path in _run_edge_cloud_draft_last_segment, and
-        worker FIFO ordering guarantees an already-dispatched DRAFT_FIRST
+        worker FIFO ordering guarantees an already-dispatched draft head
         ran before this RPC arrives.
         """
         req_id_set = set(req_ids)
@@ -3299,16 +3299,16 @@ class NPUModelRunner(GPUModelRunner):
         )
         if context is None:
             # Drain: the owning request finished/aborted after its
-            # DRAFT_FIRST was already dispatched to the cloud.  The cloud
+            # draft head was already dispatched to the cloud.  The cloud
             # does not track request lifecycle, so it still ran the draft
-            # middle segment and isend the DRAFT_LAST response; the recv in
+            # middle segment and isend the draft tail response; the recv in
             # _execute_model_edge_draft_tail already consumed it to keep the
             # DECODE hidden channel paired.  With no draft context there is
             # no tail-segment compute to run (the result would be discarded
             # anyway), so return a token-less placeholder and let
             # update_from_output skip the gone request.
             logger.info(
-                "[PD] drain stale DRAFT_LAST task_id=%s step=%s "
+                "[PD] drain stale draft tail task_id=%s step=%s "
                 "(request gone, draft context cleared)",
                 task_id,
                 scheduler_output.draft_step_idx,
@@ -3323,7 +3323,7 @@ class NPUModelRunner(GPUModelRunner):
         if positions is None:
             positions = intermediate_tensors.tensors.get("positions")
         if positions is None:
-            raise RuntimeError("DRAFT_LAST missing positions")
+            raise RuntimeError("draft tail missing positions")
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         intermediate_tensors = (
             self._sync_edge_cloud_draft_intermediate_tensors(
@@ -3331,8 +3331,8 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
         segment = self._edge_cloud_draft_segments["e"]
-        # DRAFT_LAST is dispatched independently as well, so it needs the
-        # same explicit eager context as DRAFT_FIRST.
+        # The draft tail is dispatched independently as well, so it needs the
+        # same explicit eager context as the draft head.
         with set_ascend_forward_context(
             attn_metadata=None,
             vllm_config=self.vllm_config,
@@ -3403,8 +3403,8 @@ class NPUModelRunner(GPUModelRunner):
         completed_draft_token_ids = None
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
-            # DRAFT_LAST completion is the readiness signal for the next
-            # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
+            # Draft tail completion is the readiness signal for the next
+            # step. PDSeparatedScheduler derives the next draft head locally
             # from this completed SchedulerOutput, so no worker-side pending
             # task or follow-up control RPC is needed.
         elif context.get("draft_output_req_ids"):
@@ -4681,7 +4681,7 @@ class NPUModelRunner(GPUModelRunner):
                     # host. EngineCore derives both accepted-count fields from
                     # that existing result. Do not add another synchronous
                     # D2H here: the edge does not consume these cloud-only
-                    # scalars, and the next local DRAFT_FIRST is already queued.
+                    # scalars, and the next local draft head is already queued.
                     task_id = scheduler_output.head_token
                     context = (
                         self._pending_edge_cloud_draft_contexts.get(task_id)
@@ -5326,8 +5326,8 @@ class NPUModelRunner(GPUModelRunner):
         communication stays in the worker layer, consistent with the
         non-draft ``_execute_model_cloud`` path.
 
-        The edge self-posts DRAFT_LAST together with DRAFT_FIRST, so the
-        matching receive does not depend on a cloud worker ack or POST_OUT.
+        The edge self-posts the draft tail together with the draft head, so
+        the matching receive does not depend on a cloud worker ack or POST_OUT.
         The worker records (rather than waits for) the cloud->edge send,
         exactly like ``_execute_model_cloud``.
         """
@@ -5916,7 +5916,7 @@ class NPUModelRunner(GPUModelRunner):
             # slice of a new request that just entered the cloud worker's
             # batch.  _update_states must see the request at least once to
             # populate req_data.all_token_ids; otherwise a later
-            # DECODE_FIRST / DRAFT_FIRST will KeyError.
+            # DECODE_FIRST / a draft head will KeyError.
             self._update_states(scheduler_output)
             return
 

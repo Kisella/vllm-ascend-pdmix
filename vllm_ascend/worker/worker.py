@@ -934,10 +934,12 @@ class NPUWorker(WorkerBase):
             if bt in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
-                BatchType.DRAFT_FIRST,
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
-                BatchType.DRAFT_LAST,
+                BatchType.PREFILL_DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
             ):
                 self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
             else:
@@ -949,14 +951,25 @@ class NPUWorker(WorkerBase):
         if self.model_runner._edge_cloud_enabled:
             bt = scheduler_output.batch_type
             if is_cloud_device():
-                if bt == BatchType.DRAFT_FIRST:
+                # Both draft domains execute the same cloud-side draft step;
+                # the SchedulerOutput carries the hidden channel on the wire.
+                if bt in (
+                    BatchType.PREFILL_DRAFT_FIRST,
+                    BatchType.DECODE_DRAFT_FIRST,
+                ):
                     return self._execute_model_cloud_draft(scheduler_output)
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
-            if bt == BatchType.DRAFT_FIRST:
+            if bt in (
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
+            ):
                 return self._execute_model_edge_draft_head(scheduler_output)
-            if bt == BatchType.DRAFT_LAST:
+            if bt in (
+                BatchType.PREFILL_DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
+            ):
                 return self._execute_model_edge_draft_tail(scheduler_output)
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
                 return self._execute_model_edge_head(
@@ -981,7 +994,16 @@ class NPUWorker(WorkerBase):
             return HiddenChannelType.PREFILL_1
         if bt in (BatchType.DECODE_FIRST, BatchType.DECODE_LAST):
             return HiddenChannelType.DECODE
-        if bt in (BatchType.DRAFT_FIRST, BatchType.DRAFT_LAST):
+        if bt in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.PREFILL_DRAFT_LAST,
+            BatchType.DECODE_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_LAST,
+        ):
+            # Phase B: prefill_draft rides the inherited prefill channel and
+            # decode_draft rides DECODE — the scheduler always stamps
+            # hidden_channel on draft outputs, so this fallback only covers
+            # legacy callers that never set it.
             return HiddenChannelType.DECODE
         raise RuntimeError(f"No hidden channel for batch_type={bt}")
 
@@ -1203,7 +1225,7 @@ class NPUWorker(WorkerBase):
         # even when total_num_scheduled_tokens==0.  Some requests may not
         # contribute tokens to this slice but their state must still be
         # initialised in the cloud worker's all_token_ids, otherwise a
-        # subsequent DECODE_FIRST / DRAFT_FIRST will KeyError in _update_states.
+        # subsequent DECODE_FIRST / draft head will KeyError in _update_states.
         if is_first_slice:
             self.model_runner.cloud_prepare_early(scheduler_output)
         if forward_pass and is_first_slice:
@@ -1333,16 +1355,21 @@ class NPUWorker(WorkerBase):
         ``_execute_model_cloud``: recv the edge->cloud draft payload, run
         the cloud target/C segment forward (in the model_runner), then send
         the cloud->edge result. The send is recorded (not waited); the edge
-        self-posts DRAFT_LAST when it schedules DRAFT_FIRST, so its matching
-        receive can be posted without a worker-ack/POST_OUT round trip.
+        self-posts the draft tail when it schedules the draft head, so its
+        matching receive can be posted without a worker-ack/POST_OUT round trip.
         """
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        # Phase B: the channel is stamped on the SchedulerOutput —
+        # prefill_draft rides the parent chunk's prefill channel,
+        # decode_draft rides DECODE.
+        channel = self._hidden_channel_for(scheduler_output)
         recv_tensor_meta = self._scheduled_draft_tensor_meta(
             scheduler_output,
             "e2c",
         )
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_scheduled_draft(
+                channel=channel,
                 tensor_meta=recv_tensor_meta,
             )
         )
@@ -1369,13 +1396,14 @@ class NPUWorker(WorkerBase):
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict_scheduled_draft(
                     out_tensor_dict,
+                    channel=channel,
                     tensor_meta=send_tensor_meta,
                 ),
-                channel=HiddenChannelType.DECODE,
+                channel=channel,
             )
             logger.info(
                 "Send intermediate tensors to edge, "
-                f"hidden_channel: {HiddenChannelType.DECODE.value}"
+                f"hidden_channel: {channel.value}"
             )
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, after."
@@ -1395,7 +1423,7 @@ class NPUWorker(WorkerBase):
             scheduler_output
         )
         if not isinstance(output, IntermediateTensors):
-            raise RuntimeError("DRAFT_FIRST did not produce intermediates")
+            raise RuntimeError("draft head did not produce intermediates")
         if get_pp_group().world_size == 2:
             tensor_dict = {
                 key: value.contiguous()
@@ -1403,6 +1431,10 @@ class NPUWorker(WorkerBase):
                 else value
                 for key, value in output.items()
             }
+            # Phase B: the channel is stamped on the SchedulerOutput —
+            # prefill_draft rides the parent chunk's prefill channel,
+            # decode_draft rides DECODE.
+            channel = self._hidden_channel_for(scheduler_output)
             send_tensor_meta = self._scheduled_draft_tensor_meta(
                 scheduler_output,
                 "e2c",
@@ -1410,13 +1442,14 @@ class NPUWorker(WorkerBase):
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict_scheduled_draft(
                     tensor_dict,
+                    channel=channel,
                     tensor_meta=send_tensor_meta,
                 ),
-                channel=HiddenChannelType.DECODE,
+                channel=channel,
             )
             logger.info(
                 "Send intermediate tensors to cloud, "
-                f"hidden_channel: {HiddenChannelType.DECODE.value}"
+                f"hidden_channel: {channel.value}"
             )
         req_ids = list(scheduler_output.num_scheduled_tokens)
         return ModelRunnerOutput(
@@ -1429,12 +1462,18 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput:
         """Receive and finish one edge-side scheduled draft step."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        # Phase B: the tail recvs on the same channel its head was sent on —
+        # the parent chunk's prefill channel for prefill_draft, DECODE for
+        # decode_draft.  The per-channel stream + _wait_pp_send_work keep
+        # the channel's send/recv FIFO intact across the chain.
+        channel = self._hidden_channel_for(scheduler_output)
         recv_tensor_meta = self._scheduled_draft_tensor_meta(
             scheduler_output,
             "c2e",
         )
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_scheduled_draft(
+                channel=channel,
                 tensor_meta=recv_tensor_meta,
             )
         )
@@ -1444,7 +1483,7 @@ class NPUWorker(WorkerBase):
             postprocess()
         logger.info(
             "Receive intermediate tensors from cloud after, "
-            f"hidden_channel: {HiddenChannelType.DECODE.value}"
+            f"hidden_channel: {channel.value}"
         )
         assert tensor_dict is not None
         return self.model_runner._run_edge_cloud_draft_last_segment(

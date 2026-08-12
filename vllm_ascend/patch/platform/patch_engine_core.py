@@ -84,6 +84,17 @@ from vllm_ascend.v1.engine.passive_core import PPSchedulerZmqChannel
 _INSTALLED_FLAG = "_vllm_ascend_engine_core_patched"
 
 
+# Draft-chain head batches — the two per-domain variants
+# (PREFILL_DRAFT_FIRST / DECODE_DRAFT_FIRST). Both share the same
+# control-plane treatment: deferred PRE_OUT while the chain is being
+# pre-generated, and no POST_OUT return (the edge self-posts the matching
+# draft tail).
+_DRAFT_HEAD_BATCH_TYPES = (
+    BatchType.PREFILL_DRAFT_FIRST,
+    BatchType.DECODE_DRAFT_FIRST,
+)
+
+
 # -----------------------------------------------------------------------#
 # Original method handles captured before any wrapping happens.           #
 # -----------------------------------------------------------------------#
@@ -286,7 +297,8 @@ def _drain_pd_channel_inbox(self) -> None:
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
         and hasattr(self.scheduler, "decodes_last_ready")
-        and hasattr(self.scheduler, "drafts_last_ready")
+        and hasattr(self.scheduler, "prefill_drafts_last_ready")
+        and hasattr(self.scheduler, "decode_drafts_last_ready")
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
@@ -322,20 +334,22 @@ def _drain_pd_channel_inbox(self) -> None:
                 self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
-        elif bt == BatchType.DRAFT_LAST:
-            # DRAFT_LAST is self-posted by _pick_draft_first_batch (like
+        elif bt in (BatchType.PREFILL_DRAFT_LAST,
+                    BatchType.DECODE_DRAFT_LAST):
+            # The draft tail is self-posted by _pick_draft_first_batch (like
             # DECODE_LAST). If it arrives via POST_OUT (e.g. from an older
             # cloud that still publishes it), drop it -- the edge already has
-            # its own copy in drafts_last_ready.
+            # its own copy in the matching domain last queue.
             logger.debug(
-                "Dropping POST_OUT DRAFT_LAST head_token=%s "
-                "(edge self-posts DRAFT_LAST)",
+                "Dropping POST_OUT %s head_token=%s "
+                "(edge self-posts the draft tail)",
+                bt.value,
                 getattr(so, "head_token", None),
             )
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "
-                "expected PREFILL_LAST, DECODE_LAST, or DRAFT_LAST. "
+                "expected PREFILL_LAST, DECODE_LAST, or a draft LAST. "
                 "Dropping.",
                 bt.value if bt is not None else "<none>",
             )
@@ -506,7 +520,16 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt == BatchType.DRAFT_FIRST:
+    if bt in _DRAFT_HEAD_BATCH_TYPES:
+        # Same deferral path for the per-domain variants: a pre-generated
+        # chain head must wait for its cloud control stream to open before
+        # its PRE_OUT fires.  The open/close bookkeeping
+        # (_pd_draft_pre_out_open_tasks / _pd_deferred_draft_pre_out) is
+        # keyed by draft_task_id, and task ids are globally unique, so the
+        # prefill and decode domains can never tangle here (design §7.6
+        # "按域拆分" is satisfied by task keying -- no per-domain set split
+        # needed); the open condition is the same for both domains (parent
+        # PL/DL tail finalize, see _advance_edge_cloud_draft).
         is_pregenerated = getattr(
             self.scheduler, "is_pre_generated_draft", lambda _so: False
         )(scheduler_output)
@@ -542,7 +565,6 @@ def _maybe_publish_pre_out(
         BatchType.EMPTY,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
-        BatchType.DRAFT_LAST,
     ):
         return
     else:
@@ -594,7 +616,7 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
     if scheduler_output.batch_type not in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
-        BatchType.DRAFT_FIRST,
+        *_DRAFT_HEAD_BATCH_TYPES,
     ):
         return
     if not scheduler_output.head_token:
@@ -764,7 +786,10 @@ def _advance_edge_cloud_draft(
         )
         return
 
-    if batch_type != BatchType.DRAFT_LAST:
+    if batch_type not in (
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
+    ):
         return
     draft_step_idx = int(completed_scheduler_output.draft_step_idx or 0)
     if draft_step_idx + 1 >= getattr(
@@ -775,7 +800,12 @@ def _advance_edge_cloud_draft(
         )
         # The draft chain has fully executed on the cloud; release the KV
         # blocks retained for requests that finished while the chain was
-        # in flight.
+        # in flight.  Both *_DRAFT_LAST kinds reach this branch and both
+        # are handled per-task (draft_task_id is globally unique), so the
+        # prefill-domain chain additionally unblocking its prefill slot
+        # (scheduler _finalize_prefill_slot on the edge, Phase B §5.2) is
+        # independent of this cloud-side retention release (design §7.6
+        # item 32 -- per-domain trigger is task-keyed, no shared state).
         release = getattr(
             self.scheduler, "release_draft_retained_blocks", None
         )
@@ -1016,7 +1046,9 @@ def _patched_step_with_batch_queue(self):
         # [ascend insert] Publish head-segment batches immediately at
         # schedule time to keep the pipeline full.
         if scheduler_output.batch_type in (
-            BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
+            BatchType.PREFILL_FIRST,
+            BatchType.DECODE_FIRST,
+            *_DRAFT_HEAD_BATCH_TYPES,
         ):
             self._maybe_publish_pre_out(scheduler_output)
 

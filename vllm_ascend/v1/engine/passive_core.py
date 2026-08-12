@@ -434,13 +434,19 @@ def _trim_scheduler_output_for_worker_enqueue(
     return so_copy
 
 
+_DRAFT_HEAD_BATCH_TYPES = (
+    BatchType.PREFILL_DRAFT_FIRST,
+    BatchType.DECODE_DRAFT_FIRST,
+)
+
+
 def _updates_worker_persistent_batch(
     scheduler_output: SchedulerOutput,
     slice_info,
 ) -> bool:
     """Whether this dispatch runs ``_update_states`` on the cloud worker."""
     return (
-        scheduler_output.batch_type != BatchType.DRAFT_FIRST
+        scheduler_output.batch_type not in _DRAFT_HEAD_BATCH_TYPES
         and scheduler_output.total_num_scheduled_tokens > 0
         and (slice_info is None or slice_info.is_first_slice)
     )
@@ -733,7 +739,7 @@ class PassiveEngineCoreProc:
         Mapping (cloud-side):
             PREFILL_FIRST → PREFILL_LAST
             DECODE_FIRST  → skipped (edge self-posts DECODE_LAST)
-            DRAFT_FIRST   → skipped (edge self-posts DRAFT_LAST)
+            draft heads   → skipped (edge self-posts the draft tail)
             anything else → dropped (legacy PP batches don't trigger return)
 
         Uses a shallow copy via :py:func:`dataclasses.replace` so the original
@@ -757,13 +763,15 @@ class PassiveEngineCoreProc:
                 scheduler_output.head_token,
             )
             return
-        elif bt == BatchType.DRAFT_FIRST:
-            # The edge pre-generates DRAFT_LAST (self-posting, same as
-            # DECODE_FIRST -> DECODE_LAST), so the cloud does not publish
-            # POST_OUT for DRAFT_FIRST.
+        elif bt in _DRAFT_HEAD_BATCH_TYPES:
+            # The edge pre-generates the matching draft tail (self-posting,
+            # same as DECODE_FIRST -> DECODE_LAST), so the cloud does not
+            # publish POST_OUT for any draft head batch — the prefill and
+            # decode-domain variants alike.
             logger.debug(
-                "[Cloud] Skipping POST_OUT for DRAFT_FIRST "
-                "head_token=%s (edge pre-generates DRAFT_LAST)",
+                "[Cloud] Skipping POST_OUT for %s "
+                "head_token=%s (edge pre-generates the draft tail)",
+                bt.value,
                 scheduler_output.head_token,
             )
             return

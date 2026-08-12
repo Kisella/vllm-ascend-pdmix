@@ -25,8 +25,8 @@
 # Default: 30 (ms).
 decode_last_delay_schedule_ms: 10
 
-# Edge-side DRAFT_LAST delay schedule time (milliseconds).
-# After DRAFT_FIRST is picked, DRAFT_LAST cannot be scheduled until
+# Edge-side draft-tail delay schedule time (milliseconds).
+# After a draft head is picked, its draft tail cannot be scheduled until
 # this delay has elapsed, giving Cloud Draft-middle + P2P transfer time.
 # Default: 5 (ms).
 draft_last_delay_schedule_ms: 5

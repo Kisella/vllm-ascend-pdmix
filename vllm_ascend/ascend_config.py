@@ -731,6 +731,10 @@ class PDSeparationConfig:
                     "next_prefill_prior_enable": true,
                     "chunk_prefill_prior_enable": true,
                     "max_chunk_prefill_ahead": 1,
+                    # Optional (defaults 2): per-domain draft remote-pending
+                    # credits (design §5.4 / Phase C §7.7).
+                    "prefill_draft_remote_pending_limit": 2,
+                    "decode_draft_remote_pending_limit": 2,
                 }
             }
         }
@@ -780,9 +784,31 @@ class PDSeparationConfig:
             user_config.get("ha_fallback_timeout_ms", 1000.0)
         )
 
+        # [MTP Phase C §7.7] Per-domain draft remote-pending credits (design
+        # §5.4): the max number of each domain's draft-head batches that may be
+        # dispatched to the cloud before their tails complete.  prefill_draft
+        # rides the inherited prefill channel (bounded also by the prefill slot
+        # refcount, §5.2), decode_draft rides the DECODE channel (bounded also
+        # by decode_or_draft_inflight_limit).  Default 2 per domain; consumed
+        # by PDSeparatedScheduler via scheduler_config.pd_*_draft_remote_pending_limit.
+        self.prefill_draft_remote_pending_limit: int = int(
+            user_config.get("prefill_draft_remote_pending_limit", 2)
+        )
+        self.decode_draft_remote_pending_limit: int = int(
+            user_config.get("decode_draft_remote_pending_limit", 2)
+        )
+
     @property
     def prefill_inflight_limit(self) -> int:
-        """Integer limit consumed by ``PDSeparatedScheduler``."""
+        """Integer limit consumed by ``PDSeparatedScheduler``.
+
+        Phase B (§5.2) semantics: a prefill slot now covers the whole
+        ``PREFILL_FIRST → PREFILL_LAST → prefill_draft chain`` span, i.e. the
+        prefill channel is held (and ``prefill_inflight_count`` stays elevated)
+        until the chunk's LAST prefill_draft_last completes.  The limit
+        therefore bounds concurrent *slots* (chunk + its draft chain), not
+        bare head-segment batches.
+        """
         return (
             _PD_PREFILL_INFLIGHT_WHEN_NEXT_PRIOR
             if self.next_prefill_prior_enable
@@ -797,7 +823,9 @@ class PDSeparationConfig:
             f"max_chunk_prefill_ahead={self.max_chunk_prefill_ahead}, "
             f"enable_edge_hidden_early_recv={self.enable_edge_hidden_early_recv}, "
             f"enable_edge_hidden_early_recv_gating={self.enable_edge_hidden_early_recv_gating}, "
-            f"ha_fallback_timeout_ms={self.ha_fallback_timeout_ms})"
+            f"ha_fallback_timeout_ms={self.ha_fallback_timeout_ms}, "
+            f"prefill_draft_remote_pending_limit={self.prefill_draft_remote_pending_limit}, "
+            f"decode_draft_remote_pending_limit={self.decode_draft_remote_pending_limit})"
         )
 
 

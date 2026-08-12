@@ -324,6 +324,18 @@ class NPUPlatform(Platform):
             pd.ha_fallback_timeout_ms
         )
 
+        # [MTP Phase C §7.7] Per-domain draft remote-pending credits (design
+        # §5.4) consumed by PDSeparatedScheduler.  Both default to 2; each
+        # domain is bounded independently -- prefill_draft by its own credit +
+        # the prefill slot refcount, decode_draft by its own credit + the
+        # DECODE-channel inflight limit.
+        scheduler_config.pd_prefill_draft_remote_pending_limit = (
+            pd.prefill_draft_remote_pending_limit
+        )
+        scheduler_config.pd_decode_draft_remote_pending_limit = (
+            pd.decode_draft_remote_pending_limit
+        )
+
         if getattr(scheduler_config, "async_scheduling", False):
             scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.pd_separated_scheduler.AsyncPDSeparatedScheduler"

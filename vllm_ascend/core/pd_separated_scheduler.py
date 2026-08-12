@@ -71,6 +71,13 @@ class PrefillChunkFlight:
 _PREFILL_CHANNELS_PER_DP = 2
 _DECODE_CHANNELS_PER_DP = 1
 
+# Draft scheduling domains (design §3).  Each draft chain is classified by its
+# parent tail batch type: PREFILL_LAST -> prefill_draft, DECODE_LAST ->
+# decode_draft.  Kind keys all per-domain state (queues, flags, timers,
+# remote-pending credits) via the _draft_* accessors below.
+_DRAFT_KIND_PREFILL = "prefill"
+_DRAFT_KIND_DECODE = "decode"
+
 
 class HiddenChannelManager:
     """Manages data-plane hidden tensor channels for edge-cloud PD separation.
@@ -225,8 +232,15 @@ class PDSeparatedScheduler(Scheduler):
         self.prefills_last_ready: deque[SchedulerOutput] = deque()
         self.decodes_first_ready: deque[SchedulerOutput] = deque()
         self.decodes_last_ready: deque[SchedulerOutput] = deque()
-        self.drafts_first_ready: deque[SchedulerOutput] = deque()
-        self.drafts_last_ready: deque[SchedulerOutput] = deque()
+        # Draft chains are split into two independent scheduling domains,
+        # each with its own ready queues / alternation flags / delay timers /
+        # remote-pending credits (design §3.2):
+        #   prefill_draft : spawned by PREFILL_LAST (MTP KV warm-up)
+        #   decode_draft  : spawned by DECODE_LAST (spec-decode speculation)
+        self.prefill_drafts_first_ready: deque[SchedulerOutput] = deque()
+        self.prefill_drafts_last_ready: deque[SchedulerOutput] = deque()
+        self.decode_drafts_first_ready: deque[SchedulerOutput] = deque()
+        self.decode_drafts_last_ready: deque[SchedulerOutput] = deque()
 
         self._step_counter: int = 0
 
@@ -239,13 +253,19 @@ class PDSeparatedScheduler(Scheduler):
         self.decode_or_draft_inflight_limit: int = 1
         self.decode_or_draft_inflight_count: int = 0
         # DECODE_FIRST heads picked but not yet completed (update_from_output).
-        # DRAFT_FIRST and DECODE_FIRST use different recv primitives but share
+        # A draft head and DECODE_FIRST use different recv primitives but share
         # the DECODE stream, so they must not be in flight simultaneously
         # (the cloud's recv order could mismatch the edge's send order).
-        # DRAFT_FIRST+DRAFT_FIRST is safe (same primitive, FIFO), so draft
+        # draft-head + draft-head is safe (same primitive, FIFO), so draft
         # pipelining only needs to gate on decode heads, not total heads.
         self.decode_head_inflight_count: int = 0
-        self.draft_remote_pending_count: int = 0
+        # Phase B (§5.4): per-domain remote-pending credits split the old
+        # single counter.  Only the decode domain shares
+        # decode_or_draft_inflight_count (limit 1) with DECODE_FIRST;
+        # prefill_draft rides the inherited prefill channel and is bounded
+        # by its slot refcount + its own remote-pending credit.
+        self.prefill_draft_remote_pending_count: int = 0
+        self.decode_draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager — per-dp_rank slice.
         dp_rank = getattr(self.vllm_config.parallel_config,
@@ -292,6 +312,24 @@ class PDSeparatedScheduler(Scheduler):
         # Populated on PF, consumed on PL.
         self._prefill_flight_by_token: dict[str, PrefillChunkFlight] = {}
 
+        # Phase B (design §5.2): a prefill slot is occupied from PREFILL_FIRST
+        # pick until the chunk's LAST prefill_draft_last completes.  The
+        # prefill channel allocated for the chunk is held for the whole
+        # PF → PL → draft-chain duration (design §4.1, 要点3), so
+        # release_prefill / prefill_inflight_count are deferred from PL
+        # completion to _finalize_prefill_slot.
+        #
+        # head_token -> outstanding slot units: 1 (the PL itself) + committed
+        # draft-chain steps that have not yet completed.  Chain steps are
+        # committed at chain creation (_pregenerate_draft_chain commits all
+        # steps at once; enqueue_draft_first commits one per step) and
+        # consumed one per PREFILL_DRAFT_LAST completion.
+        self._prefill_slot_pending: dict[str, int] = {}
+        # head_token -> whether the chunk's PL has completed.  Distinguishes
+        # a slot held by "waiting for PL" from one held by "waiting for the
+        # draft chain".
+        self._prefill_slot_pl_done: dict[str, bool] = {}
+
         # Per-request count of chunks still waiting for PL.
         # request_id → count.  When count reaches 0, the request is
         # eligible to enter decode.
@@ -322,19 +360,27 @@ class PDSeparatedScheduler(Scheduler):
         # D首 调度后置 True，D尾 调度后置 False。
         # True 时禁止调度 D首，严格保证 DF -> DL 交替时序。
         self._force_decode_last: bool = False
-        self._force_draft_last: bool = False
+        # Per-domain DF -> DL alternation (design §6.1).  A head sets its
+        # domain flag, the matching tail clears it; the strict alternation
+        # prevents two heads back-to-back on a shared hidden channel.
+        self._force_prefill_draft_last: bool = False
+        self._force_decode_draft_last: bool = False
 
         self._layer_slice_config_path: str | None = None
         self._layer_slice_config_mtime: float = 0.0
         self._load_layer_slice_config()
-        # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
-        # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
+        # After scheduling a DECODE_LAST or a draft tail, briefly reserve the
+        # next scheduling opportunity for DECODE_FIRST or a draft head only.
         self._decode_or_draft_first_only_start_ts: float | None = None
         self._decode_or_draft_first_only_window_ms: int = 30
 
-        # [MTP] DRAFT_LAST delay scheduling (mirrors decode_last_delay).
-        self._draft_last_delay_start_ts: float | None = None
-        self._draft_last_delay_schedule_ms: int = 10
+        # [MTP] Per-domain draft-tail delay scheduling (mirrors
+        # decode_last_delay).  Default 5ms per domain (design §6.2); yaml keys
+        # prefill_draft_last_delay_schedule_ms / decode_draft_last_delay_schedule_ms.
+        self._prefill_draft_last_delay_start_ts: float | None = None
+        self._prefill_draft_last_delay_schedule_ms: int = 5
+        self._decode_draft_last_delay_start_ts: float | None = None
+        self._decode_draft_last_delay_schedule_ms: int = 5
 
         # Async scheduled-MTP keeps real draft token IDs in the edge worker.
         # The scheduler only needs fixed-length placeholder SchedulerOutputs,
@@ -346,7 +392,21 @@ class PDSeparatedScheduler(Scheduler):
         self._draft_first_dispatched: bool = False
         self._pregenerated_draft_task_ids: set[str] = set()
         self._pregenerated_draft_req_ids: dict[str, set[str]] = {}
-        self._draft_remote_pending_limit: int = 2
+        # Phase C (§7.7): per-domain remote-pending credits, threaded by
+        # platform._configure_pd_separation_scheduler from
+        # pd_separation.prefill_draft_remote_pending_limit /
+        # decode_draft_remote_pending_limit (defaults 2).  Direct-construction
+        # call sites (tests) fall back to the default without setting config.
+        self._prefill_draft_remote_pending_limit: int = getattr(
+            self.scheduler_config,
+            "pd_prefill_draft_remote_pending_limit",
+            2,
+        )
+        self._decode_draft_remote_pending_limit: int = getattr(
+            self.scheduler_config,
+            "pd_decode_draft_remote_pending_limit",
+            2,
+        )
         self._decode_first_placeholder_parent: SchedulerOutput | None = None
 
         # ------------------------------------------------------------------ #
@@ -355,7 +415,7 @@ class PDSeparatedScheduler(Scheduler):
         # Non-edge-cloud proposes draft tokens inside the same execute_model
         # call, i.e. strictly BEFORE update_from_output frees the finished
         # requests' KV blocks.  Edge-cloud defers the draft to a later
-        # DRAFT_FIRST batch, so without retention the blocks could be freed
+        # draft-head batch, so without retention the blocks could be freed
         # and reused before the cloud-side draft steps read/write them.
         # The EngineCore registers each deferred task locally from the parent
         # SchedulerOutput's head_token before update_from_output. _free_request
@@ -387,6 +447,153 @@ class PDSeparatedScheduler(Scheduler):
             return
         self._pending_cloud_draft_invalidations.extend(task_ids)
 
+    # ------------------------------------------------------------------ #
+    # Draft-domain state accessors (design §3.2 / §5 / §6.1)             #
+    # ------------------------------------------------------------------ #
+    # Draft chains are classified by their parent tail batch type into
+    # ``prefill_draft`` or ``decode_draft``.  The two domains are independent
+    # scheduling domains, each with its own ready queues / alternation flags /
+    # delay timers / remote-pending credits.  The core draft pick logic below
+    # is kind-parameterized through these accessors.
+    #
+    # Phase B (§4.1/§6.1): prefill_draft rides the parent chunk's prefill
+    # channel and the decode domain rides DECODE — the domains only interact
+    # through the shared prefill slot accounting (see _prefill_slot_pending /
+    # _finalize_prefill_slot); the accessors keep the migration local.
+
+    @staticmethod
+    def _draft_kind_for_batch_type(batch_type: BatchType) -> str:
+        """Classify a draft batch (or a parent tail) into its draft domain."""
+        if batch_type in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.PREFILL_DRAFT_LAST,
+        ):
+            return _DRAFT_KIND_PREFILL
+        if batch_type in (
+            BatchType.DECODE_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_LAST,
+        ):
+            return _DRAFT_KIND_DECODE
+        # Parent tails: PREFILL_LAST spawns prefill_draft chains (MTP KV
+        # warm-up), DECODE_LAST spawns decode_draft chains (spec-decode).
+        if batch_type == BatchType.PREFILL_LAST:
+            return _DRAFT_KIND_PREFILL
+        return _DRAFT_KIND_DECODE
+
+    def _draft_first_type(self, kind: str) -> BatchType:
+        return (
+            BatchType.PREFILL_DRAFT_FIRST
+            if kind == _DRAFT_KIND_PREFILL
+            else BatchType.DECODE_DRAFT_FIRST
+        )
+
+    def _draft_last_type(self, kind: str) -> BatchType:
+        return (
+            BatchType.PREFILL_DRAFT_LAST
+            if kind == _DRAFT_KIND_PREFILL
+            else BatchType.DECODE_DRAFT_LAST
+        )
+
+    def _drafts_first_ready(self, kind: str) -> deque[SchedulerOutput]:
+        return (
+            self.prefill_drafts_first_ready
+            if kind == _DRAFT_KIND_PREFILL
+            else self.decode_drafts_first_ready
+        )
+
+    def _drafts_last_ready(self, kind: str) -> deque[SchedulerOutput]:
+        return (
+            self.prefill_drafts_last_ready
+            if kind == _DRAFT_KIND_PREFILL
+            else self.decode_drafts_last_ready
+        )
+
+    def _force_draft_last(self, kind: str) -> bool:
+        return (
+            self._force_prefill_draft_last
+            if kind == _DRAFT_KIND_PREFILL
+            else self._force_decode_draft_last
+        )
+
+    def _set_force_draft_last(self, kind: str, value: bool) -> None:
+        if kind == _DRAFT_KIND_PREFILL:
+            self._force_prefill_draft_last = value
+        else:
+            self._force_decode_draft_last = value
+
+    def _draft_remote_pending(self, kind: str) -> int:
+        return (
+            self.prefill_draft_remote_pending_count
+            if kind == _DRAFT_KIND_PREFILL
+            else self.decode_draft_remote_pending_count
+        )
+
+    def _draft_remote_pending_limit(self, kind: str) -> int:
+        return (
+            self._prefill_draft_remote_pending_limit
+            if kind == _DRAFT_KIND_PREFILL
+            else self._decode_draft_remote_pending_limit
+        )
+
+    def _incr_draft_remote_pending(self, kind: str) -> None:
+        if kind == _DRAFT_KIND_PREFILL:
+            self.prefill_draft_remote_pending_count += 1
+        else:
+            self.decode_draft_remote_pending_count += 1
+
+    def _decr_draft_remote_pending(self, kind: str) -> None:
+        if kind == _DRAFT_KIND_PREFILL:
+            self.prefill_draft_remote_pending_count = max(
+                0, self.prefill_draft_remote_pending_count - 1
+            )
+        else:
+            self.decode_draft_remote_pending_count = max(
+                0, self.decode_draft_remote_pending_count - 1
+            )
+
+    def _start_draft_last_delay(self, kind: str) -> None:
+        """Start the per-domain draft-tail delay timer (head was picked)."""
+        if kind == _DRAFT_KIND_PREFILL:
+            self._prefill_draft_last_delay_start_ts = time.monotonic()
+        else:
+            self._decode_draft_last_delay_start_ts = time.monotonic()
+
+    def _can_schedule_draft_last(self, kind: str) -> bool:
+        """Return True if the delay since the <kind> draft head has elapsed."""
+        if kind == _DRAFT_KIND_PREFILL:
+            start_ts = self._prefill_draft_last_delay_start_ts
+        else:
+            start_ts = self._decode_draft_last_delay_start_ts
+        if start_ts is None:
+            return True
+        elapsed_ms = (time.monotonic() - start_ts) * 1000
+        if elapsed_ms >= self._draft_last_delay_schedule_ms(kind):
+            if kind == _DRAFT_KIND_PREFILL:
+                self._prefill_draft_last_delay_start_ts = None
+            else:
+                self._decode_draft_last_delay_start_ts = None
+            return True
+        return False
+
+    def _draft_last_delay_schedule_ms(self, kind: str) -> int:
+        return (
+            self._prefill_draft_last_delay_schedule_ms
+            if kind == _DRAFT_KIND_PREFILL
+            else self._decode_draft_last_delay_schedule_ms
+        )
+
+    def _can_schedule_prefill_draft_first(self) -> bool:
+        return self._can_schedule_draft_first(_DRAFT_KIND_PREFILL)
+
+    def _can_schedule_decode_draft_first(self) -> bool:
+        return self._can_schedule_draft_first(_DRAFT_KIND_DECODE)
+
+    def _can_schedule_prefill_draft_last(self) -> bool:
+        return self._can_schedule_draft_last(_DRAFT_KIND_PREFILL)
+
+    def _can_schedule_decode_draft_last(self) -> bool:
+        return self._can_schedule_draft_last(_DRAFT_KIND_DECODE)
+
     def schedule(self) -> SchedulerOutput:
         scheduler_output = self._schedule_pd_separated()
         # Only FIRST-segment batches are published to the cloud over PRE_OUT
@@ -401,7 +608,8 @@ class PDSeparatedScheduler(Scheduler):
             in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
-                BatchType.DRAFT_FIRST,
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
             )
         ):
             scheduler_output.cloud_draft_invalidate_task_ids = (
@@ -601,6 +809,35 @@ class PDSeparatedScheduler(Scheduler):
         ]
         for token in to_remove:
             self._prefill_flight_by_token.pop(token, None)
+            # Phase B leak guard (design §9 risk 2): a flight removed here
+            # means this chunk's PL can never complete through the normal
+            # path, so its prefill slot would hold a channel forever.
+            # Force-close it; the PL/chain steps still in flight are drained
+            # by the workers (request gone) and their completion handlers
+            # skip the now-absent slot entry.
+            self._finalize_prefill_slot(token)
+
+    def _finalize_prefill_slot(self, head_token: str) -> None:
+        """Close a prefill slot whose chunk AND draft chain are both done.
+
+        Phase B (§5.2): the only place prefill_inflight_count is decremented
+        and the prefill channel released — deferred from PL completion to the
+        last prefill_draft_last completion (or to abort/finish cleanup).
+        """
+        if head_token not in self._prefill_slot_pending:
+            return
+        self._prefill_slot_pending.pop(head_token, None)
+        self._prefill_slot_pl_done.pop(head_token, None)
+        if self.prefill_inflight_count > 0:
+            self.prefill_inflight_count -= 1
+        self.hidden_channel_manager.release_prefill(head_token)
+        logger.info(
+            "[PD] finalize prefill slot head_token=%s "
+            "prefill_inflight: %d/%d",
+            head_token,
+            self.prefill_inflight_count,
+            self.prefill_inflight_limit,
+        )
 
     def _make_empty_batch(self) -> SchedulerOutput:
         scheduler_output = SchedulerOutput.make_empty()
@@ -615,7 +852,8 @@ class PDSeparatedScheduler(Scheduler):
         is_tail = scheduler_output.batch_type in (
             BatchType.PREFILL_LAST,
             BatchType.DECODE_LAST,
-            BatchType.DRAFT_LAST,
+            BatchType.PREFILL_DRAFT_LAST,
+            BatchType.DECODE_DRAFT_LAST,
         )
         if has_work or is_tail:
             self._log_scheduler_state(state, scheduler_output.batch_type)
@@ -647,10 +885,13 @@ class PDSeparatedScheduler(Scheduler):
             return None
         if not self._decode_or_draft_first_only_active():
             return None
-        # Window: allow Draft首 (priority) or Decode首
-        if self._can_schedule_draft_first():
+        # Window: allow Decode域 Draft首 (priority) or Decode首.  The window is
+        # decode-domain only (design §6.3): after a DECODE_LAST / decode_draft
+        # tail the next slot is reserved for a decode-domain head.  prefill_draft
+        # heads are never held back here -- _has_draft_work() already covers them.
+        if self._can_schedule_decode_draft_first():
             self._clear_decode_or_draft_first_only_window()
-            return self._pick_draft_first_batch()
+            return self._pick_decode_draft_first_batch()
         if self._can_schedule_decode_first():
             self._clear_decode_or_draft_first_only_window()
             return self._pick_decode_first_batch()
@@ -661,7 +902,7 @@ class PDSeparatedScheduler(Scheduler):
             self._prepare_next_decode_first_placeholder(
                 self._decode_first_placeholder_parent
             )
-        # A placeholder DECODE_FIRST prepared when the final DRAFT_LAST was
+        # A placeholder DECODE_FIRST prepared when the final draft tail was
         # dispatched must stay immediately behind that draft tail.  Its real
         # draft token IDs are filled from the worker-local _draft_token_ids
         # buffer when it executes, exactly like native async spec decode.
@@ -673,11 +914,13 @@ class PDSeparatedScheduler(Scheduler):
             return first_only
 
         if state == PrefillState.IDLE:
-            # IDLE: P首/chunk0首 > Draft尾 > Draft首 > Decode尾 > Decode首 > Empty
-            if self._can_schedule_draft_first():
-                return self._pick_draft_first_batch()
-            if self.drafts_last_ready and self._can_schedule_draft_last():
-                return self._pick_draft_last_batch()
+            # IDLE: prefill_draft首 > prefill_draft尾 > P首 > decode_draft首 >
+            #       decode_draft尾 > D首 > D尾 > Empty (design §6.3)
+            if self._can_schedule_prefill_draft_first():
+                return self._pick_prefill_draft_first_batch()
+            if (self.prefill_drafts_last_ready
+                    and self._can_schedule_prefill_draft_last()):
+                return self._pick_prefill_draft_last_batch()
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -688,6 +931,11 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            if self._can_schedule_decode_draft_first():
+                return self._pick_decode_draft_first_batch()
+            if (self.decode_drafts_last_ready
+                    and self._can_schedule_decode_draft_last()):
+                return self._pick_decode_draft_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
             if self.decodes_last_ready and self._can_schedule_decode_last():
@@ -695,11 +943,8 @@ class PDSeparatedScheduler(Scheduler):
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: chunk/P首(when slot available) > P尾 > Draft尾 > Draft首 > D尾 > D首 > Empty.
-            if self._can_schedule_draft_first():
-                return self._pick_draft_first_batch()
-            if self.drafts_last_ready and self._can_schedule_draft_last():
-                return self._pick_draft_last_batch()
+            # LOW: P首(when slot available) > P尾 > prefill_draft首 >
+            #      prefill_draft尾 > decode_draft首 > decode_draft尾 > D首 > D尾 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -712,19 +957,36 @@ class PDSeparatedScheduler(Scheduler):
                 self.finished_req_ids.update(so.finished_req_ids)
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
+            if self._can_schedule_prefill_draft_first():
+                return self._pick_prefill_draft_first_batch()
+            if (self.prefill_drafts_last_ready
+                    and self._can_schedule_prefill_draft_last()):
+                return self._pick_prefill_draft_last_batch()
+            if self._can_schedule_decode_draft_first():
+                return self._pick_decode_draft_first_batch()
+            if (self.decode_drafts_last_ready
+                    and self._can_schedule_decode_draft_last()):
+                return self._pick_decode_draft_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
             if self.decodes_last_ready and self._can_schedule_decode_last():
                 return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: P尾 > Draft尾 > Draft首 > D尾 > D首 > Empty. New P首 is forbidden.
-        if self._can_schedule_draft_first():
-            return self._pick_draft_first_batch()
-        if self.drafts_last_ready and self._can_schedule_draft_last():
-            return self._pick_draft_last_batch()
+        # HIGH: P尾 > prefill_draft首 > prefill_draft尾 > decode_draft首 >
+        #       decode_draft尾 > D首 > D尾 > Empty. New P首 is forbidden.
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
+        if self._can_schedule_prefill_draft_first():
+            return self._pick_prefill_draft_first_batch()
+        if (self.prefill_drafts_last_ready
+                and self._can_schedule_prefill_draft_last()):
+            return self._pick_prefill_draft_last_batch()
+        if self._can_schedule_decode_draft_first():
+            return self._pick_decode_draft_first_batch()
+        if (self.decode_drafts_last_ready
+                and self._can_schedule_decode_draft_last()):
+            return self._pick_decode_draft_last_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
         if self.decodes_last_ready and self._can_schedule_decode_last():
@@ -742,13 +1004,16 @@ class PDSeparatedScheduler(Scheduler):
             (
                 self.prefill_inflight_count > 0
                 or self.decode_or_draft_inflight_count > 0
-                or self.draft_remote_pending_count > 0
+                or self.prefill_draft_remote_pending_count > 0
+                or self.decode_draft_remote_pending_count > 0
             )
             and not self.prefills_last_ready
             and not self.decodes_last_ready
-            and not self.drafts_last_ready
+            and not self.prefill_drafts_last_ready
+            and not self.decode_drafts_last_ready
             and not self._can_schedule_prefill_first()
-            and not self._can_schedule_draft_first()
+            and not self._can_schedule_prefill_draft_first()
+            and not self._can_schedule_decode_draft_first()
             and not self._can_schedule_decode_first()
         )
 
@@ -779,49 +1044,82 @@ class PDSeparatedScheduler(Scheduler):
         )
 
     def _can_schedule_decode_first(self) -> bool:
+        # Phase B (§6.1): prefill_draft migrated to the inherited prefill
+        # channel, so DECODE_FIRST is gated only by the decode domain.
+        # The prefill domain (queues / flags / remote-pending) never blocks
+        # it — the two domains are independent scheduling domains.
         return bool(
             self.running
             and self.decode_or_draft_inflight_count == 0
-            and self.draft_remote_pending_count == 0
-            and not self.drafts_first_ready
-            and not self.drafts_last_ready
+            and self.decode_draft_remote_pending_count == 0
+            and not self.decode_drafts_first_ready
+            and not self.decode_drafts_last_ready
             and not self._force_decode_last
-            and not self._force_draft_last
+            and not self._force_decode_draft_last
         )
 
-    def _can_schedule_draft_first(self) -> bool:
-        if not self.drafts_first_ready:
+    def _can_schedule_draft_first(self, kind: str) -> bool:
+        """Gating for a <kind> draft head (kind in _DRAFT_KIND_*).
+
+        Phase B (§6.1): the prefill domain rides the inherited prefill
+        channel, so prefill_draft heads gate only on their own domain
+        (alternation flag / remote-pending credit / channel availability,
+        which the occupied parent slot guarantees).  The decode domain still
+        shares the DECODE channel with DECODE_FIRST, so decode_draft heads
+        additionally gate on ``_force_decode_last`` / decode inflight.
+        Cross-domain draft+draft pipelining remains safe (same send/recv
+        primitive, FIFO), so a domain only gates on its own alternation
+        flag, not the other domain's.
+        """
+        if not self._drafts_first_ready(kind):
             return False
-        next_output = self.drafts_first_ready[0]
+        next_output = self._drafts_first_ready(kind)[0]
         is_pregenerated = (
             next_output.draft_task_id in self._pregenerated_draft_task_ids
         )
+        if kind == _DRAFT_KIND_PREFILL:
+            # Phase B (§6.1): prefill_draft is bounded only by its own
+            # domain — the parent slot's occupied channel guarantees the
+            # prefill channel is available (verified at pick time), and it
+            # never contends with the DECODE channel.
+            if is_pregenerated:
+                return bool(
+                    self._draft_remote_pending(kind)
+                    < self._draft_remote_pending_limit(kind)
+                    and not self._drafts_last_ready(kind)
+                    and not self._force_draft_last(kind)
+                )
+            return bool(
+                self._draft_remote_pending(kind) == 0
+                and not self._drafts_last_ready(kind)
+                and not self._force_draft_last(kind)
+            )
         if is_pregenerated:
             # The edge and cloud workers consume the pre-generated chain in
-            # strict FIFO order.  Do not wait for a DRAFT_FIRST result merely
+            # strict FIFO order.  Do not wait for a draft head result merely
             # to decrement draft_inflight_count; bound the amount of queued
             # work using the remote-pending credit instead.
-            # `not self._force_draft_last` enforces the DRAFT_FIRST ->
-            # DRAFT_LAST alternation invariant the same way the legacy
-            # branch does: once a DRAFT_FIRST is picked, the next draft head
-            # may not be picked until its DRAFT_LAST is picked (which clears
-            # the flag).  Without it, a DRAFT_LAST dropped/drained without
-            # clearing the flag would let a second DRAFT_FIRST through.
+            # `not _force_draft_last(kind)` enforces the per-domain
+            # draft-head -> draft-tail alternation invariant: once a head is
+            # picked, the next head of the same domain may not be picked until
+            # its tail is picked (which clears the flag).  Without it, a tail
+            # dropped/drained without clearing the flag would let a second head
+            # through.
             # `decode_head_inflight_count == 0` (not total inflight == 0)
-            # gates only on DECODE_FIRST heads: a DRAFT_FIRST is an edge->cloud
-            # send while a DRAFT_LAST is a cloud->edge recv, so a second
-            # DRAFT_FIRST may be dispatched while the previous DRAFT_LAST is
-            # still in flight (draft pipelining).  But DRAFT_FIRST and
+            # gates only on DECODE_FIRST heads: a draft head is an edge->cloud
+            # send while a draft tail is a cloud->edge recv, so a second
+            # draft head may be dispatched while the previous draft tail is
+            # still in flight (draft pipelining).  But a draft head and
             # DECODE_FIRST use different recv primitives on the same stream,
             # so they must never be in flight together -- hence gate on decode
             # heads only, allowing draft+draft but not draft+decode.
             return bool(
                 self.decode_head_inflight_count == 0
-                and self.draft_remote_pending_count
-                < self._draft_remote_pending_limit
-                and not self.drafts_last_ready
+                and self._draft_remote_pending(kind)
+                < self._draft_remote_pending_limit(kind)
+                and not self._drafts_last_ready(kind)
                 and not self._force_decode_last
-                and not self._force_draft_last
+                and not self._force_draft_last(kind)
             )
 
         # Scheduled draft head/tail payloads share the DECODE channel.
@@ -830,10 +1128,10 @@ class PDSeparatedScheduler(Scheduler):
         # for the opposite-direction send before posting the matching recv.
         return bool(
             self.decode_or_draft_inflight_count == 0
-            and self.draft_remote_pending_count == 0
-            and not self.drafts_last_ready
+            and self._draft_remote_pending(kind) == 0
+            and not self._drafts_last_ready(kind)
             and not self._force_decode_last
-            and not self._force_draft_last
+            and not self._force_draft_last(kind)
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -846,11 +1144,14 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
                 f"running[]: {len(self.running)}, "
                 f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
-                f"drafts_first_ready[]: {len(self.drafts_first_ready)}, "
-                f"drafts_last_ready[]: {len(self.drafts_last_ready)}, "
+                f"prefill_drafts_first_ready[]: {len(self.prefill_drafts_first_ready)}, "
+                f"prefill_drafts_last_ready[]: {len(self.prefill_drafts_last_ready)}, "
+                f"decode_drafts_first_ready[]: {len(self.decode_drafts_first_ready)}, "
+                f"decode_drafts_last_ready[]: {len(self.decode_drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
-                f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"prefill_draft_remote_pending: {self.prefill_draft_remote_pending_count}, "
+                f"decode_draft_remote_pending: {self.decode_draft_remote_pending_count}, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}, "
                 f"chunk_flights: {len(self._prefill_flight_by_token)}, "
                 f"pending_tails: {self._total_pending_tails()}, "
@@ -864,11 +1165,14 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
                 f"running[]: {len(self.running)}, "
                 f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
-                f"drafts_first_ready[]: {len(self.drafts_first_ready)}, "
-                f"drafts_last_ready[]: {len(self.drafts_last_ready)}, "
+                f"prefill_drafts_first_ready[]: {len(self.prefill_drafts_first_ready)}, "
+                f"prefill_drafts_last_ready[]: {len(self.prefill_drafts_last_ready)}, "
+                f"decode_drafts_first_ready[]: {len(self.decode_drafts_first_ready)}, "
+                f"decode_drafts_last_ready[]: {len(self.decode_drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
-                f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"prefill_draft_remote_pending: {self.prefill_draft_remote_pending_count}, "
+                f"decode_draft_remote_pending: {self.decode_draft_remote_pending_count}, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
 
@@ -909,19 +1213,48 @@ class PDSeparatedScheduler(Scheduler):
                         _key, raw[_key], yaml_path,
                         self._decode_last_delay_schedule_ms,
                     )
-            _draft_key = "draft_last_delay_schedule_ms"
-            if _draft_key in raw:
+            # Per-domain draft tail delays (design §6.2).  The legacy
+            # `draft_last_delay_schedule_ms` key remains a compat alias that
+            # sets both domains when the new keys are absent.
+            _draft_keys = (
+                "prefill_draft_last_delay_schedule_ms",
+                "decode_draft_last_delay_schedule_ms",
+            )
+            if all(_k not in raw for _k in _draft_keys) and (
+                "draft_last_delay_schedule_ms" in raw
+            ):
                 try:
-                    self._draft_last_delay_schedule_ms = int(raw[_draft_key])
+                    value = int(raw["draft_last_delay_schedule_ms"])
+                    self._prefill_draft_last_delay_schedule_ms = value
+                    self._decode_draft_last_delay_schedule_ms = value
                     logger.info(
-                        "[PDSeparatedScheduler] %s set to %d from %s",
-                        _draft_key, self._draft_last_delay_schedule_ms, yaml_path,
+                        "[PDSeparatedScheduler] draft_last_delay_schedule_ms "
+                        "alias set both domains to %d from %s",
+                        value, yaml_path,
                     )
                 except (ValueError, TypeError):
                     logger.warning(
-                        "Invalid %s value %r in %s; keeping %d",
-                        _draft_key, raw[_draft_key], yaml_path,
-                        self._draft_last_delay_schedule_ms,
+                        "Invalid draft_last_delay_schedule_ms value %r in %s; "
+                        "keeping defaults",
+                        raw["draft_last_delay_schedule_ms"], yaml_path,
+                    )
+            for _k in _draft_keys:
+                if _k not in raw:
+                    continue
+                try:
+                    value = int(raw[_k])
+                    if _k.startswith("prefill_"):
+                        self._prefill_draft_last_delay_schedule_ms = value
+                    else:
+                        self._decode_draft_last_delay_schedule_ms = value
+                    logger.info(
+                        "[PDSeparatedScheduler] %s set to %d from %s",
+                        _k, value, yaml_path,
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid %s value %r in %s; keeping default",
+                        _k, raw[_k], yaml_path,
                     )
             self._layer_slice_config_path = yaml_path
             self._layer_slice_config_mtime = os.path.getmtime(yaml_path)
@@ -971,21 +1304,11 @@ class PDSeparatedScheduler(Scheduler):
         return False
 
     # ------------------------------------------------------------------ #
-    # DRAFT_LAST delay scheduling                                         #
+    # Draft-tail delay scheduling                                         #
     # ------------------------------------------------------------------ #
-    def _start_draft_last_delay(self) -> None:
-        """Draft首 pick 后启动，Draft尾 在延迟到期前不可被调度。"""
-        self._draft_last_delay_start_ts = time.monotonic()
-
-    def _can_schedule_draft_last(self) -> bool:
-        """Return True if the delay since DRAFT_FIRST has elapsed."""
-        if self._draft_last_delay_start_ts is None:
-            return True
-        elapsed_ms = (time.monotonic() - self._draft_last_delay_start_ts) * 1000
-        if elapsed_ms >= self._draft_last_delay_schedule_ms:
-            self._draft_last_delay_start_ts = None
-            return True
-        return False
+    # Per-domain draft-tail delay timers live in the kind-parameterized
+    # accessors (_start_draft_last_delay(kind) / _can_schedule_draft_last(kind))
+    # defined in the draft-domain state accessors section above.
 
     def _pick_prefill_first_batch(self) -> SchedulerOutput:
         saved_running = self.running
@@ -1070,6 +1393,16 @@ class PDSeparatedScheduler(Scheduler):
                         )
                     )
                     self.prefill_inflight_count += 1
+                    # Phase B (§5.2): the slot now spans PF → PL → the whole
+                    # prefill_draft chain.  Count the PL ticket; it is
+                    # consumed at PL completion, and the channel release is
+                    # deferred until the chain finishes.
+                    self._prefill_slot_pending[
+                        scheduler_output.head_token
+                    ] = 1
+                    self._prefill_slot_pl_done[
+                        scheduler_output.head_token
+                    ] = False
 
                     scheduled_req_ids = set(
                         scheduler_output.num_scheduled_tokens.keys()
@@ -1342,23 +1675,66 @@ class PDSeparatedScheduler(Scheduler):
             )
 
     def _validate_draft_tail_channel(
-        self, scheduler_output: SchedulerOutput
+        self, kind: str, scheduler_output: SchedulerOutput
     ) -> None:
         if not scheduler_output.head_token:
-            raise RuntimeError("DRAFT_LAST missing head_token")
+            raise RuntimeError("draft tail missing head_token")
         if not scheduler_output.draft_task_id:
-            raise RuntimeError("DRAFT_LAST missing draft_task_id")
+            raise RuntimeError("draft tail missing draft_task_id")
         if scheduler_output.draft_step_idx is None:
-            raise RuntimeError("DRAFT_LAST missing draft_step_idx")
+            raise RuntimeError("draft tail missing draft_step_idx")
+        if kind == _DRAFT_KIND_PREFILL:
+            self._validate_prefill_draft_tail_channel(scheduler_output)
+        else:
+            self._validate_decode_draft_tail_channel(scheduler_output)
+
+    def _validate_prefill_draft_tail_channel(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        # Phase B (§4.3): prefill_draft rides the parent chunk's prefill
+        # channel, so the tail must be a prefill channel AND the parent's
+        # allocated one (draft_task_id == parent head_token).  A None
+        # expected channel means the slot was released while the chain was
+        # still in flight (the §5.2 deferral broke).
+        channel = scheduler_output.hidden_channel
+        pool = self.hidden_channel_manager.prefill_pool
+        if channel not in pool:
+            raise RuntimeError(
+                f"PREFILL_DRAFT_LAST expects a prefill hidden channel from "
+                f"{pool}, got {channel}"
+            )
+        expected = self.hidden_channel_manager.get_channel(
+            scheduler_output.draft_task_id
+        )
+        if expected != channel:
+            raise RuntimeError(
+                "PREFILL_DRAFT_LAST hidden channel mismatch: expected "
+                f"{expected}, got {channel}, task_id="
+                f"{scheduler_output.draft_task_id}"
+            )
+
+    def _validate_decode_draft_tail_channel(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
         if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
             raise RuntimeError(
-                "DRAFT_LAST expects decode hidden channel, got "
+                "DECODE_DRAFT_LAST expects decode hidden channel, got "
                 f"{scheduler_output.hidden_channel}"
             )
 
-    def _pick_draft_first_batch(self) -> SchedulerOutput:
-        while self.drafts_first_ready:
-            scheduler_output = self.drafts_first_ready.popleft()
+    def _pick_prefill_draft_first_batch(self) -> SchedulerOutput:
+        return self._pick_draft_first_batch(_DRAFT_KIND_PREFILL)
+
+    def _pick_decode_draft_first_batch(self) -> SchedulerOutput:
+        return self._pick_draft_first_batch(_DRAFT_KIND_DECODE)
+
+    def _pick_draft_first_batch(self, kind: str) -> SchedulerOutput:
+        first_ready = self._drafts_first_ready(kind)
+        last_ready = self._drafts_last_ready(kind)
+        first_type = self._draft_first_type(kind)
+        last_type = self._draft_last_type(kind)
+        while first_ready:
+            scheduler_output = first_ready.popleft()
             if self._is_stale_draft_output(scheduler_output):
                 if scheduler_output.draft_task_id:
                     self._pregenerated_draft_task_ids.discard(
@@ -1374,12 +1750,27 @@ class PDSeparatedScheduler(Scheduler):
                     self._dropped_draft_task_ids_to_report.append(
                         scheduler_output.draft_task_id
                     )
+                    if kind == _DRAFT_KIND_PREFILL:
+                        # Phase B (§5.2): the dropped head was committed to
+                        # the slot refcount at chain creation; consume it and
+                        # close the slot if the chain is now fully gone.
+                        head = scheduler_output.draft_task_id
+                        if head in self._prefill_slot_pending:
+                            self._prefill_slot_pending[head] -= 1
+                            if (
+                                self._prefill_slot_pending[head] == 0
+                                and self._prefill_slot_pl_done.get(
+                                    head, False
+                                )
+                            ):
+                                self._finalize_prefill_slot(head)
                 if scheduler_output is self._draft_first_cloud_publish_pending:
                     self._draft_first_cloud_publish_pending = None
                     self._draft_first_scalars_patched = False
                     self._draft_first_dispatched = False
                 logger.info(
-                    "[PD] drop stale DRAFT_FIRST task_id=%s step=%s",
+                    "[PD] drop stale %s task_id=%s step=%s",
+                    first_type.value,
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
@@ -1394,21 +1785,38 @@ class PDSeparatedScheduler(Scheduler):
                 self._draft_first_cloud_publish_pending = None
                 self._draft_first_scalars_patched = False
 
-        scheduler_output.batch_type = BatchType.DRAFT_FIRST
+        scheduler_output.batch_type = first_type
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
-        scheduler_output.hidden_channel = HiddenChannelType.DECODE
+        if kind == _DRAFT_KIND_PREFILL:
+            # Phase B (§4.1 / §9 risk 1): prefill_draft inherits the parent
+            # chunk's prefill channel, set at chain creation.  The parent
+            # slot must still be occupied (release is deferred to chain
+            # completion, §5.2); a missing channel here means the deferral
+            # broke.
+            inherited = self.hidden_channel_manager.get_channel(
+                scheduler_output.draft_task_id
+            )
+            if inherited is None:
+                raise RuntimeError(
+                    "PREFILL_DRAFT_FIRST parent slot released before the "
+                    f"draft chain completed: task_id="
+                    f"{scheduler_output.draft_task_id}"
+                )
+            scheduler_output.hidden_channel = inherited
+        else:
+            scheduler_output.hidden_channel = HiddenChannelType.DECODE
         # Draft-first self-posting mirrors the decode path below. Every
-        # field needed by DRAFT_LAST is already known on the edge; the cloud
+        # field needed by the tail is already known on the edge; the cloud
         # used to echo the same SchedulerOutput back through POST_OUT only
-        # after its worker acked DRAFT_FIRST. Pre-generating the tail here
+        # after its worker acked the draft head. Pre-generating the tail here
         # removes that per-draft-step control-plane round trip and lets the
-        # edge post the matching receive as soon as DRAFT_FIRST has completed
-        # locally. Worker FIFO ordering plus the per-channel send-work wait
-        # preserves DRAFT_FIRST -> DRAFT_LAST data-plane ordering.
+        # edge post the matching receive as soon as the draft head has
+        # completed locally. Worker FIFO ordering plus the per-channel
+        # send-work wait preserves FIRST -> LAST data-plane ordering.
         draft_last = replace(
             scheduler_output,
-            batch_type=BatchType.DRAFT_LAST,
+            batch_type=last_type,
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
@@ -1422,24 +1830,31 @@ class PDSeparatedScheduler(Scheduler):
             "draft_output_req_ids",
             tuple(scheduler_output.num_scheduled_tokens),
         )
-        self._validate_draft_tail_channel(draft_last)
-        self.drafts_last_ready.append(draft_last)
-        self.decode_or_draft_inflight_count += 1
-        self.draft_remote_pending_count += 1
-        self._force_draft_last = True
-        self._start_draft_last_delay()
+        self._validate_draft_tail_channel(kind, draft_last)
+        last_ready.append(draft_last)
+        # Phase B (§5.4): only the decode domain shares the DECODE channel
+        # credit.  prefill_draft rides the inherited prefill channel and is
+        # bounded by the slot refcount + its own remote-pending credit.
+        if kind == _DRAFT_KIND_DECODE:
+            self.decode_or_draft_inflight_count += 1
+        self._incr_draft_remote_pending(kind)
+        self._set_force_draft_last(kind, True)
+        self._start_draft_last_delay(kind)
 
         logger.info(
-            "[MTP-DEBUG] scheduler picked DRAFT_FIRST: task_id=%s, "
+            "[MTP-DEBUG] scheduler picked %s: task_id=%s, "
             "parent_req_id=%s, draft_step_idx=%s, head_token=%s, "
-            "remaining_ready=%d, decode_or_draft_inflight=%d, draft_remote_pending=%d",
+            "remaining_ready=%d, decode_or_draft_inflight=%d, "
+            "%s_remote_pending=%d",
+            first_type.value,
             scheduler_output.draft_task_id,
             scheduler_output.parent_req_id,
             scheduler_output.draft_step_idx,
             scheduler_output.head_token,
-            len(self.drafts_first_ready),
+            len(first_ready),
             self.decode_or_draft_inflight_count,
-            self.draft_remote_pending_count,
+            kind,
+            self._draft_remote_pending(kind),
         )
         return scheduler_output
 
@@ -1469,12 +1884,20 @@ class PDSeparatedScheduler(Scheduler):
         every DRF executes after the DRL that produces its local inputs.  Only
         the step-0 accepted-token scalars are finalized later for the cloud;
         they are not consumed by the edge worker.
+
+        The chain's scheduling domain is derived from the parent tail batch
+        type (design §3.3): PREFILL_LAST -> prefill_draft, DECODE_LAST ->
+        decode_draft.  Phase B (§4.1, 要点3): a prefill chain inherits the
+        parent chunk's prefill channel so PF -> PL -> prefill_draft* share
+        one channel; the decode chain stays on DECODE.
         """
         if not self._uses_async_scheduled_mtp_placeholders():
             return
         if (
-            self.drafts_first_ready
-            or self.drafts_last_ready
+            self.prefill_drafts_first_ready
+            or self.prefill_drafts_last_ready
+            or self.decode_drafts_first_ready
+            or self.decode_drafts_last_ready
             or self._draft_first_cloud_publish_pending is not None
         ):
             return
@@ -1487,12 +1910,41 @@ class PDSeparatedScheduler(Scheduler):
         if not task_id:
             return
 
+        kind = self._draft_kind_for_batch_type(target_tail.batch_type)
+        first_type = self._draft_first_type(kind)
+        first_ready = self._drafts_first_ready(kind)
+
+        # Phase B (§4.1): inherit the parent tail's channel.  prefill_draft
+        # rides the parent chunk's prefill channel; decode_draft stays on the
+        # DECODE channel carried by a DECODE_LAST parent.
+        inherited_channel = (
+            target_tail.hidden_channel
+            if kind == _DRAFT_KIND_PREFILL
+            else HiddenChannelType.DECODE
+        )
+        if (
+            kind == _DRAFT_KIND_PREFILL
+            and inherited_channel not in self.hidden_channel_manager.prefill_pool
+        ):
+            raise RuntimeError(
+                f"prefill draft chain parent tail on non-prefill channel: "
+                f"{inherited_channel}"
+            )
+        if kind == _DRAFT_KIND_PREFILL:
+            # Phase B (§5.2): commit all chain steps at generation, so the
+            # slot refcount is positive by the time PL completes and the
+            # channel stays held for the chain.
+            self._prefill_slot_pending[task_id] = (
+                self._prefill_slot_pending.get(task_id, 0)
+                + self.num_spec_tokens
+            )
+
         for step_idx in range(self.num_spec_tokens):
             draft_first = replace(
                 target_tail,
-                batch_type=BatchType.DRAFT_FIRST,
+                batch_type=first_type,
                 head_token=None,
-                hidden_channel=HiddenChannelType.DECODE,
+                hidden_channel=inherited_channel,
                 parent_req_id=req_ids[0],
                 draft_task_id=task_id,
                 draft_step_idx=step_idx,
@@ -1510,7 +1962,7 @@ class PDSeparatedScheduler(Scheduler):
                 "draft_output_req_ids",
                 tuple(target_tail.num_scheduled_tokens),
             )
-            self.drafts_first_ready.append(draft_first)
+            first_ready.append(draft_first)
             if step_idx == 0:
                 self._draft_first_cloud_publish_pending = draft_first
                 self._draft_first_scalars_patched = False
@@ -1519,7 +1971,8 @@ class PDSeparatedScheduler(Scheduler):
         self._pregenerated_draft_task_ids.add(task_id)
         self._pregenerated_draft_req_ids[task_id] = set(req_ids)
         logger.info(
-            "[PD] pre-generated async MTP placeholders task_id=%s steps=%d",
+            "[PD] pre-generated async MTP placeholders kind=%s task_id=%s steps=%d",
+            kind,
             task_id,
             self.num_spec_tokens,
         )
@@ -1578,27 +2031,63 @@ class PDSeparatedScheduler(Scheduler):
         The worker owns the mutable draft tensors, but the scheduler owns all
         draft control-plane SchedulerOutputs. The initial step receives only
         the rejection-corrected scalar state from the worker; follow-up steps
-        are derived directly from the completed DRAFT_LAST.
+        are derived directly from the completed draft tail.
+
+        The chain's scheduling domain is inherited from ``source``'s batch type
+        (design §3.3): a PREFILL_LAST parent spawns prefill_draft, a
+        DECODE_LAST / DECODE_DRAFT_LAST spawns decode_draft.
         """
         req_ids = list(source.num_scheduled_tokens)
+        kind = self._draft_kind_for_batch_type(source.batch_type)
         # With KV retention, finished requests stay in self.requests until
         # their draft chain releases them, so this refusal only fires when
         # a request is genuinely gone (e.g. aborted before the parent
         # output was processed).  The chain then can never (fully) run:
         # report the task so EngineCore releases the retained KV blocks
-        # and invalidates the cloud-side cached metadata.
+        # and invalidates the cloud-side cached metadata.  A refused
+        # prefill chain also never materializes, so the prefill slot held
+        # for it (deferred release, §5.2) must be closed right here.
         if not req_ids or any(
             req_id not in self.requests for req_id in req_ids
         ):
             if draft_task_id:
                 self._dropped_draft_task_ids_to_report.append(draft_task_id)
+                if (
+                    kind == _DRAFT_KIND_PREFILL
+                    and draft_task_id in self._prefill_slot_pending
+                ):
+                    self._finalize_prefill_slot(draft_task_id)
             return False
 
+        first_type = self._draft_first_type(kind)
+        # Phase B (§4.1): the draft head inherits the parent tail's channel.
+        # prefill_draft rides the parent chunk's prefill channel (a PREFILL_LAST
+        # / PREFILL_DRAFT_LAST source carries it); decode_draft stays on DECODE.
+        inherited_channel = (
+            source.hidden_channel
+            if kind == _DRAFT_KIND_PREFILL
+            else HiddenChannelType.DECODE
+        )
+        if (
+            kind == _DRAFT_KIND_PREFILL
+            and inherited_channel
+            not in self.hidden_channel_manager.prefill_pool
+        ):
+            raise RuntimeError(
+                f"prefill draft parent on non-prefill channel: "
+                f"{inherited_channel}"
+            )
+        if kind == _DRAFT_KIND_PREFILL:
+            # Phase B (§5.2): one chain step committed.  Each committed step
+            # is consumed by the matching PREFILL_DRAFT_LAST completion.
+            self._prefill_slot_pending[draft_task_id] = (
+                self._prefill_slot_pending.get(draft_task_id, 0) + 1
+            )
         draft_first = replace(
             source,
-            batch_type=BatchType.DRAFT_FIRST,
+            batch_type=first_type,
             head_token=None,
-            hidden_channel=HiddenChannelType.DECODE,
+            hidden_channel=inherited_channel,
             parent_req_id=req_ids[0],
             draft_task_id=draft_task_id,
             draft_step_idx=draft_step_idx,
@@ -1613,7 +2102,7 @@ class PDSeparatedScheduler(Scheduler):
             "draft_output_req_ids",
             tuple(source.num_scheduled_tokens),
         )
-        self.drafts_first_ready.append(draft_first)
+        self._drafts_first_ready(kind).append(draft_first)
         return True
 
     def _enqueue_next_draft_first(
@@ -1630,34 +2119,50 @@ class PDSeparatedScheduler(Scheduler):
         if next_step_idx >= self.num_spec_tokens:
             return False
         if task_id is None:
-            raise RuntimeError("DRAFT_LAST missing draft_task_id")
+            raise RuntimeError("draft tail missing draft_task_id")
         return self.enqueue_draft_first(
             draft_last,
             draft_task_id=task_id,
             draft_step_idx=next_step_idx,
         )
 
-    def _pick_draft_last_batch(self) -> SchedulerOutput:
-        while self.drafts_last_ready:
-            scheduler_output = self.drafts_last_ready.popleft()
-            if scheduler_output.batch_type != BatchType.DRAFT_LAST:
+    def _pick_prefill_draft_last_batch(self) -> SchedulerOutput:
+        return self._pick_draft_last_batch(_DRAFT_KIND_PREFILL)
+
+    def _pick_decode_draft_last_batch(self) -> SchedulerOutput:
+        return self._pick_draft_last_batch(_DRAFT_KIND_DECODE)
+
+    def _pick_draft_last_batch(self, kind: str) -> SchedulerOutput:
+        last_ready = self._drafts_last_ready(kind)
+        last_type = self._draft_last_type(kind)
+        while last_ready:
+            scheduler_output = last_ready.popleft()
+            if scheduler_output.batch_type != last_type:
                 raise RuntimeError(
-                    "drafts_last_ready expects DRAFT_LAST, got "
+                    f"drafts_last_ready expects {last_type.value}, got "
                     f"{scheduler_output.batch_type}"
                 )
-            self._validate_draft_tail_channel(scheduler_output)
-            # A DRAFT_LAST here always has its DRAFT_FIRST already dispatched
+            self._validate_draft_tail_channel(kind, scheduler_output)
+            # A tail here always has its matching first already dispatched
             # to the cloud (it was self-posted in _pick_draft_first_batch when
             # the head was picked).  The cloud does not track request
             # lifecycle, so it will isend a response even if the owning
             # request has since finished/aborted.  The edge MUST still execute
-            # this tail (recv) to keep the DECODE hidden channel paired --
-            # never drop it.  When the request is gone the worker drains the
-            # recv and skips the tail-segment compute (see
+            # this tail (recv) to keep its hidden channel (prefill or DECODE,
+            # Phase B) paired -- never drop it.  When the request is gone the
+            # worker drains the recv and skips the tail-segment compute (see
             # _run_edge_cloud_draft_last_segment); we also must not spawn a
             # verify placeholder for a dead request.
-            self._force_draft_last = False
-            self._start_decode_or_draft_first_only_window()
+            self._set_force_draft_last(kind, False)
+            if kind == _DRAFT_KIND_DECODE:
+                # Phase B (§6.3): the first-only window is decode-domain
+                # only.  After a decode_draft tail the next slot is reserved
+                # for a decode-domain head; after a prefill_draft tail the
+                # next slot belongs to the prefill domain (next prefill_draft
+                # head, or P首 when the chain finished).
+                self._start_decode_or_draft_first_only_window()
+            else:
+                self._clear_decode_or_draft_first_only_window()
             output_req_ids = getattr(
                 scheduler_output,
                 "draft_output_req_ids",
@@ -1672,15 +2177,17 @@ class PDSeparatedScheduler(Scheduler):
                 self._prepare_next_decode_first_placeholder(scheduler_output)
             elif not output_req_ids:
                 logger.info(
-                    "[PD] finish DRAFT_LAST task_id=%s step=%s "
+                    "[PD] finish %s task_id=%s step=%s "
                     "(mid-prefill KV warmup; no verify placeholder)",
+                    last_type.value,
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
             else:
                 logger.info(
-                    "[PD] drain DRAFT_LAST task_id=%s step=%s "
+                    "[PD] drain %s task_id=%s step=%s "
                     "(request gone; worker will drain cloud response)",
+                    last_type.value,
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
@@ -1859,24 +2366,77 @@ class PDSeparatedScheduler(Scheduler):
         # attention metadata is whole-batch and cannot be re-sliced.
         # Dropped task ids are reported to the runner (which may still
         # hold the enqueued context) via take_dropped_draft_task_ids().
-        kept_first: deque[SchedulerOutput] = deque()
-        for output in self.drafts_first_ready:
-            if (
-                self._scheduler_output_intersects_req_ids(output, req_ids)
-                and self._scheduler_output_all_requests_finished(output)
-            ):
-                task_id = output.draft_task_id
-                if task_id is not None:
-                    self._pregenerated_draft_task_ids.discard(task_id)
-                    self._pregenerated_draft_req_ids.pop(task_id, None)
-                    self._dropped_draft_task_ids_to_report.append(task_id)
-                if output is self._draft_first_cloud_publish_pending:
-                    self._draft_first_cloud_publish_pending = None
-                    self._draft_first_scalars_patched = False
-                    self._draft_first_dispatched = False
+        # Stale-first drop applies independently to each draft domain.
+        for kind in (_DRAFT_KIND_PREFILL, _DRAFT_KIND_DECODE):
+            first_ready = self._drafts_first_ready(kind)
+            kept_first: deque[SchedulerOutput] = deque()
+            # Phase B (§5.2): per-parent count of committed chain steps
+            # dropped here, so the slot refcount stays consistent.
+            dropped_steps: dict[str, int] = {}
+            for output in first_ready:
+                if (
+                    self._scheduler_output_intersects_req_ids(output, req_ids)
+                    and self._scheduler_output_all_requests_finished(output)
+                ):
+                    task_id = output.draft_task_id
+                    if task_id is not None:
+                        self._pregenerated_draft_task_ids.discard(task_id)
+                        self._pregenerated_draft_req_ids.pop(task_id, None)
+                        self._dropped_draft_task_ids_to_report.append(task_id)
+                        if kind == _DRAFT_KIND_PREFILL:
+                            dropped_steps[task_id] = (
+                                dropped_steps.get(task_id, 0) + 1
+                            )
+                    if output is self._draft_first_cloud_publish_pending:
+                        self._draft_first_cloud_publish_pending = None
+                        self._draft_first_scalars_patched = False
+                        self._draft_first_dispatched = False
+                else:
+                    kept_first.append(output)
+            if kind == _DRAFT_KIND_PREFILL:
+                self.prefill_drafts_first_ready = kept_first
+                for task_id, num_dropped in dropped_steps.items():
+                    if task_id in self._prefill_slot_pending:
+                        self._prefill_slot_pending[task_id] -= num_dropped
+                        if (
+                            self._prefill_slot_pending[task_id] == 0
+                            and self._prefill_slot_pl_done.get(task_id, False)
+                        ):
+                            self._finalize_prefill_slot(task_id)
             else:
-                kept_first.append(output)
-        self.drafts_first_ready = kept_first
+                self.decode_drafts_first_ready = kept_first
+
+            # Never drop a queued draft tail.  Tails are self-posted
+            # in _pick_draft_first_batch at the moment their head is picked,
+            # and a picked first is always dispatched to the cloud.  The
+            # cloud does not track request lifecycle, so it will still isend
+            # the response; the edge MUST execute (drain) the tail to keep
+            # the DECODE hidden channel paired (see _pick_draft_last_batch
+            # and the drain path in the worker's
+            # _run_edge_cloud_draft_last_segment).  Dropping the tail also
+            # strands _force_draft_last(kind)=True -- the flag is only
+            # cleared when a tail is picked -- which then blocks every
+            # future head of that domain and deadlocks the scheduler.
+            last_ready = self._drafts_last_ready(kind)
+            last_type = self._draft_last_type(kind)
+            for output in last_ready:
+                if self._scheduler_output_intersects_req_ids(output, req_ids):
+                    gone = {
+                        rid
+                        for rid in output.num_scheduled_tokens
+                        if rid in req_ids
+                    }
+                    if output.parent_req_id in req_ids:
+                        gone.add(output.parent_req_id)
+                    logger.info(
+                        "[PD] keep %s task_id=%s step=%s for drain "
+                        "(%d member request(s) gone; its head was "
+                        "already dispatched to the cloud)",
+                        last_type.value,
+                        output.draft_task_id,
+                        output.draft_step_idx,
+                        len(gone),
+                    )
 
         self.decodes_first_ready = deque(
             output
@@ -1893,34 +2453,6 @@ class PDSeparatedScheduler(Scheduler):
             )
         ):
             self._decode_first_placeholder_parent = None
-        # Never drop a queued DRAFT_LAST.  Tails are self-posted in
-        # _pick_draft_first_batch at the moment their head is picked, and
-        # a picked DRAFT_FIRST is always dispatched to the cloud.  The
-        # cloud does not track request lifecycle, so it will still isend
-        # the response; the edge MUST execute (drain) the tail to keep
-        # the DECODE hidden channel paired (see _pick_draft_last_batch
-        # and the drain path in the worker's
-        # _run_edge_cloud_draft_last_segment).  Dropping the tail also
-        # strands _force_draft_last=True -- the flag is only cleared when
-        # a DRAFT_LAST is picked -- which then blocks every future
-        # DRAFT_FIRST/DECODE_FIRST and deadlocks the scheduler.
-        for output in self.drafts_last_ready:
-            if self._scheduler_output_intersects_req_ids(output, req_ids):
-                gone = {
-                    rid
-                    for rid in output.num_scheduled_tokens
-                    if rid in req_ids
-                }
-                if output.parent_req_id in req_ids:
-                    gone.add(output.parent_req_id)
-                logger.info(
-                    "[PD] keep DRAFT_LAST task_id=%s step=%s for drain "
-                    "(%d member request(s) gone; its DRAFT_FIRST was "
-                    "already dispatched to the cloud)",
-                    output.draft_task_id,
-                    output.draft_step_idx,
-                    len(gone),
-                )
 
     def take_dropped_draft_task_ids(self) -> list[str]:
         """Drain draft task ids dropped from the ready queues since the
@@ -1933,7 +2465,7 @@ class PDSeparatedScheduler(Scheduler):
         self, scheduler_output: SchedulerOutput
     ) -> bool:
         # A draft output is stale when EVERY backing request has finished.
-        # This drives the DRAFT_FIRST skip in _pick_draft_first_batch:
+        # This drives the draft-head skip in _pick_draft_first_batch:
         # once all owning requests are gone, future (not-yet-dispatched)
         # draft heads must not be picked -- the edge can no longer produce
         # their payload (the draft context was cleared on finish/abort) and
@@ -1943,7 +2475,7 @@ class PDSeparatedScheduler(Scheduler):
         # chain runs to completion and the dead rows' draft tokens are
         # discarded by the worker (_run_edge_cloud_draft_last_segment).
         # Already-dispatched heads are handled separately: their matching
-        # DRAFT_LAST is always executed (drained) in _pick_draft_last_batch
+        # draft tail is always executed (drained) in _pick_draft_last_batch
         # to pair the cloud's response, so this check intentionally does NOT
         # exempt pre-generated dispatched chains the way it used to.
         # NOTE: finished requests may still be present in self.requests
@@ -1957,8 +2489,8 @@ class PDSeparatedScheduler(Scheduler):
     ) -> bool:
         """True if any request backing this draft output is still active.
 
-        Used both to decide whether a DRAFT_LAST may spawn a verify
-        placeholder and (inverted) whether a DRAFT_FIRST is stale.
+        Used both to decide whether a draft tail may spawn a verify
+        placeholder and (inverted) whether a draft head is stale.
         """
         return not self._scheduler_output_all_requests_finished(
             scheduler_output
@@ -2284,13 +2816,6 @@ class PDSeparatedScheduler(Scheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, Any]:
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
-            if self.prefill_inflight_count > 0:
-                self.prefill_inflight_count -= 1
-            if scheduler_output.head_token:
-                self.hidden_channel_manager.release_prefill(
-                    scheduler_output.head_token
-                )
-
             if self.chunk_prefill_prior_enable:
                 self._update_from_output_prefill_last_chunk_prior(
                     scheduler_output
@@ -2299,6 +2824,29 @@ class PDSeparatedScheduler(Scheduler):
                 self._update_from_output_prefill_last_legacy(
                     scheduler_output
                 )
+
+            # Phase B (§5.2): the slot now spans PF → PL → the whole
+            # prefill_draft chain, so the PL completion consumes only its
+            # own ticket.  The channel release / inflight decrement is
+            # deferred until the chain finishes (or, when the chunk produced
+            # no chain, closed right here).
+            head = scheduler_output.head_token
+            if head in self._prefill_slot_pending:
+                self._prefill_slot_pl_done[head] = True
+                self._prefill_slot_pending[head] -= 1
+                # Chain steps are committed at chain creation (async
+                # pregeneration commits all steps at once, so a positive
+                # count here means a chain is already accounted).  The
+                # non-async fallback chain is enqueued by the engine AFTER
+                # update_from_output, driven by the worker's edge-cloud
+                # draft state — its pending arrival is signaled by the
+                # draft-task registration, which the EngineCore performs
+                # before update_from_output.
+                if self._prefill_slot_pending[head] == 0 and not (
+                    self._edge_cloud_draft_retention_enabled
+                    and head in self._edge_cloud_draft_task_reqs
+                ):
+                    self._finalize_prefill_slot(head)
 
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             # D首完成后立即释放 inflight 计数，使下一个 D首可以
@@ -2311,23 +2859,49 @@ class PDSeparatedScheduler(Scheduler):
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
-        if scheduler_output.batch_type == BatchType.DRAFT_FIRST:
-            self.decode_or_draft_inflight_count = max(
-                0, self.decode_or_draft_inflight_count - 1
+        if scheduler_output.batch_type in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        ):
+            kind = self._draft_kind_for_batch_type(
+                scheduler_output.batch_type
             )
+            # Phase B (§5.4): only the decode domain rides the DECODE
+            # channel — a completed decode draft head frees the
+            # shared-channel inflight credit.  prefill_draft rides the
+            # inherited prefill channel and only returns its domain's
+            # remote-pending credit.
+            if kind == _DRAFT_KIND_DECODE:
+                self.decode_or_draft_inflight_count = max(
+                    0, self.decode_or_draft_inflight_count - 1
+                )
+            self._decr_draft_remote_pending(kind)
             logger.info(
-                "[PD] update_from_output DRAFT_FIRST done, "
-                "decode_or_draft_inflight: %d/%d",
+                "[PD] update_from_output %s done, "
+                "decode_or_draft_inflight: %d/%d, %s_remote_pending: %d",
+                scheduler_output.batch_type.value,
                 self.decode_or_draft_inflight_count,
                 self.decode_or_draft_inflight_limit,
+                kind,
+                self._draft_remote_pending(kind),
             )
-        enqueue_next_draft = (
-            scheduler_output.batch_type == BatchType.DRAFT_LAST
+        enqueue_next_draft = scheduler_output.batch_type in (
+            BatchType.PREFILL_DRAFT_LAST,
+            BatchType.DECODE_DRAFT_LAST,
         )
         if enqueue_next_draft:
-            self.draft_remote_pending_count = max(
-                0, self.draft_remote_pending_count - 1
+            kind = self._draft_kind_for_batch_type(
+                scheduler_output.batch_type
             )
+            self._decr_draft_remote_pending(kind)
+            if kind == _DRAFT_KIND_PREFILL:
+                # Phase B (§5.2): one draft-chain step completed.  The
+                # finalize check runs after _enqueue_next_draft_first below,
+                # so the next step's committed unit (the non-async fallback
+                # enqueues one per step) has already been added back.
+                head = scheduler_output.draft_task_id
+                if head in self._prefill_slot_pending:
+                    self._prefill_slot_pending[head] -= 1
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_or_draft_inflight_count 已在 DECODE_FIRST 的 update_from_output
             # 中释放，此处不再重复减 1。
@@ -2342,13 +2916,29 @@ class PDSeparatedScheduler(Scheduler):
             # not-yet-enqueued placeholder tasks for those requests.
             self._drop_stale_drafts_for_req_ids(self.finished_req_ids)
         if enqueue_next_draft:
+            kind = self._draft_kind_for_batch_type(
+                scheduler_output.batch_type
+            )
             next_draft_ready = self._enqueue_next_draft_first(
                 scheduler_output
             )
+            if kind == _DRAFT_KIND_PREFILL:
+                # Phase B (§5.2): if no further step was committed (chain
+                # done) the slot's last unit was consumed above — close the
+                # slot and release the channel.
+                head = scheduler_output.draft_task_id
+                if (
+                    head in self._prefill_slot_pending
+                    and self._prefill_slot_pending[head] == 0
+                    and self._prefill_slot_pl_done.get(head, False)
+                ):
+                    self._finalize_prefill_slot(head)
             logger.info(
-                "[PD] update_from_output DRAFT_LAST done, "
-                "draft_remote_pending: %d, next_draft_ready: %s",
-                self.draft_remote_pending_count,
+                "[PD] update_from_output %s done, "
+                "%s_remote_pending: %d, next_draft_ready: %s",
+                scheduler_output.batch_type.value,
+                kind,
+                self._draft_remote_pending(kind),
                 next_draft_ready,
             )
         self.chunk_prefill_first = [
@@ -2413,10 +3003,13 @@ class PDSeparatedScheduler(Scheduler):
     def _has_draft_work(self) -> bool:
         return bool(
             self.decodes_first_ready
-            or self.drafts_first_ready
-            or self.drafts_last_ready
+            or self.prefill_drafts_first_ready
+            or self.prefill_drafts_last_ready
+            or self.decode_drafts_first_ready
+            or self.decode_drafts_last_ready
             or self.decode_or_draft_inflight_count > 0
-            or self.draft_remote_pending_count > 0
+            or self.prefill_draft_remote_pending_count > 0
+            or self.decode_draft_remote_pending_count > 0
         )
 
     def has_requests(self) -> bool:
