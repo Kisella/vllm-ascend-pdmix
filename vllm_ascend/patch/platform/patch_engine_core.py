@@ -183,7 +183,8 @@ def _drain_pd_channel_inbox(self) -> None:
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
         and hasattr(self.scheduler, "decodes_last_ready")
-        and hasattr(self.scheduler, "drafts_last_ready")
+        and hasattr(self.scheduler, "prefill_drafts_last_ready")
+        and hasattr(self.scheduler, "decode_drafts_last_ready")
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
@@ -194,20 +195,26 @@ def _drain_pd_channel_inbox(self) -> None:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
-        elif bt == BatchType.DRAFT_LAST:
-            # DRAFT_LAST is self-posted by _pick_draft_first_batch (like
-            # DECODE_LAST). If it arrives via POST_OUT (e.g. from an older
-            # cloud that still publishes it), drop it -- the edge already has
-            # its own copy in drafts_last_ready.
+        elif bt == BatchType.PREFILL_DRAFT_LAST:
+            # Phase C (design §7.5 #28'): PREFILL_DRAFT_LAST is published by
+            # the CLOUD after its worker finishes the PDFF middle segment
+            # (the cloud round-trip is the pacing). Append directly to the
+            # per-domain ready queue — it is schedulable immediately.
+            self.scheduler.prefill_drafts_last_ready.append(so)
+        elif bt == BatchType.DECODE_DRAFT_LAST:
+            # Decode draft LAST batches are self-posted by the edge (like
+            # DECODE_LAST). If one arrives via POST_OUT anyway, drop it --
+            # the edge already has its own copy in the ready queue.
             logger.debug(
-                "Dropping POST_OUT DRAFT_LAST head_token=%s "
-                "(edge self-posts DRAFT_LAST)",
+                "Dropping POST_OUT %s head_token=%s "
+                "(edge self-posts draft LAST)",
+                bt.value,
                 getattr(so, "head_token", None),
             )
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "
-                "expected PREFILL_LAST, DECODE_LAST, or DRAFT_LAST. "
+                "expected PREFILL_LAST, DECODE_LAST, or a draft LAST. "
                 "Dropping.",
                 bt.value if bt is not None else "<none>",
             )
@@ -266,7 +273,10 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt == BatchType.DRAFT_FIRST:
+    if bt in (
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
+    ):
         is_pregenerated = getattr(
             self.scheduler, "is_pre_generated_draft", lambda _so: False
         )(scheduler_output)
@@ -302,8 +312,12 @@ def _maybe_publish_pre_out(
         BatchType.EMPTY,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
-        BatchType.DRAFT_LAST,
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
     ):
+        # Draft LAST batches are self-posted by the edge scheduler, never
+        # published to the cloud (Phase C moved PREFILL_DRAFT_LAST to
+        # cloud-publishing — it is listed here only defensively).
         return
     else:
         logger.debug(
@@ -354,7 +368,8 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
     if scheduler_output.batch_type not in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
-        BatchType.DRAFT_FIRST,
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
     ):
         return
     if not scheduler_output.head_token:
@@ -540,16 +555,30 @@ def _advance_edge_cloud_draft(
                 # never wait for accepted-token propagation.
                 self._release_deferred_draft_pre_out(task_id)
                 return
-        enqueue_draft_first(
+        if not enqueue_draft_first(
             completed_scheduler_output,
             draft_task_id=task_id,
             draft_step_idx=int(state["draft_step_idx"]),
             num_accepted_tokens=num_accepted_tokens,
             valid_sampled_token_count=valid_sampled_token_count,
-        )
+        ):
+            # 对抗 review C1：fallback 链 step0 入队被拒（成员已死/槽已
+            # finalize 防御分支）时，被 has_fallback_chain 门控的存活请求
+            # per-req 计数已配平为 0 但链永不建立、无自身迁移触发点——
+            # 立即触发迁移扫描放行（链未建立则无 verify 越界风险；死请求
+            # no-op）。否则该请求只能等系统内其他 prefill 链的 final
+            # PDFL 触发扫描，若无其他链则永久卡死。
+            migrate = getattr(
+                self.scheduler, "_migrate_ready_prefill_pending", None
+            )
+            if migrate is not None:
+                migrate()
         return
 
-    if batch_type != BatchType.DRAFT_LAST:
+    if batch_type not in (
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
+    ):
         return
     draft_step_idx = int(completed_scheduler_output.draft_step_idx or 0)
     if draft_step_idx + 1 >= getattr(
@@ -813,7 +842,10 @@ def _patched_step_with_batch_queue(self):
         # [ascend insert] Publish head-segment batches immediately at
         # schedule time to keep the pipeline full.
         if scheduler_output.batch_type in (
-            BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
+            BatchType.PREFILL_FIRST,
+            BatchType.DECODE_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
         ):
             self._maybe_publish_pre_out(scheduler_output)
 

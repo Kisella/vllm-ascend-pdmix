@@ -444,7 +444,11 @@ def _updates_worker_persistent_batch(
 ) -> bool:
     """Return whether this dispatch updates the cloud worker batch state."""
     return (
-        scheduler_output.batch_type != BatchType.DRAFT_FIRST
+        scheduler_output.batch_type
+        not in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        )
         and scheduler_output.total_num_scheduled_tokens > 0
         and (slice_info is None or slice_info.is_first_slice)
     )
@@ -538,6 +542,12 @@ class PassiveEngineCoreProc:
         self._prev_dispatch_req_ids: set[str] = set()
         self._pending_post_out_by_head_token: dict[str, SchedulerOutput] = {}
         self._published_post_out_tokens: set[str] = set()
+        # Phase C: PDFL publish idempotency, in a separate set — draft_task_id
+        # collides with the parent head_token (head-token set is append-only,
+        # see _maybe_publish_post_out).  Entries are (draft_task_id,
+        # draft_step_idx) tuples: one draft_task_id is shared by every step
+        # of a chain, and PDFL publish is per-step.
+        self._published_draft_post_out_tokens: set[tuple] = set()
 
     def _drain_worker_completion_acks(self) -> None:
         """Publish POST_OUT only after cloud workers complete the middle segment."""
@@ -557,22 +567,39 @@ class PassiveEngineCoreProc:
                 ):
                     continue
 
-                # Decode and draft tails are self-posted on the edge. Their
-                # worker acks are still drained from the response MQ, but do
-                # not drive a cloud -> edge POST_OUT control message.
-                if result.get("batch_type") != BatchType.PREFILL_FIRST:
+                # Decode and decode-draft tails are self-posted on the edge.
+                # Their worker acks are still drained from the response MQ,
+                # but do not drive a cloud -> edge POST_OUT control message.
+                # Phase C: PREFILL_DRAFT_FIRST now also drives a POST_OUT
+                # (the cloud publishes PREFILL_DRAFT_LAST).
+                bt = result.get("batch_type")
+                if bt not in (BatchType.PREFILL_FIRST,
+                              BatchType.PREFILL_DRAFT_FIRST):
                     continue
-                head_token = result.get("head_token")
-                if not head_token or head_token in self._published_post_out_tokens:
+                if bt == BatchType.PREFILL_DRAFT_FIRST:
+                    # draft_task_id is shared by every step of one prefill
+                    # chain, so the idempotency key MUST include the step:
+                    # a task-level guard would suppress steps >= 1 and the
+                    # chain would stall waiting for a tail that is never
+                    # published (edge watchdog raises ~30s later).
+                    task_id = result.get("draft_task_id")
+                    step_idx = result.get("draft_step_idx")
+                    key = (task_id, step_idx) if task_id is not None else None
+                    published_set = self._published_draft_post_out_tokens
+                else:
+                    key = result.get("head_token")
+                    published_set = self._published_post_out_tokens
+                if not key or key in published_set:
                     continue
                 scheduler_output = self._pending_post_out_by_head_token.pop(
-                    head_token, None
+                    key, None
                 )
                 if scheduler_output is None:
                     continue
-                # NOTE: do NOT add head_token to _published_post_out_tokens
-                # here — _maybe_publish_post_out records it after actually
-                # publishing (single idempotency point for both PL and DL).
+                # NOTE: do NOT add key to the published set here —
+                # _maybe_publish_post_out records it after actually
+                # publishing (single idempotency point for both PL and
+                # PDFL).
                 # logger.info(
                 #     "[CLOUD-POST-OUT] Publishing PREFILL_LAST after worker done, "
                 #     "head_token=%s",
@@ -752,8 +779,9 @@ class PassiveEngineCoreProc:
             # For prefill, POST_OUT must mean the cloud middle
             # segment has completed. Store the original SchedulerOutput here
             # and publish it from _drain_worker_completion_acks() after the
-            # worker reports done. Decode-last and Draft-last are prepared on
-            # the edge (self-posting), so they are not pending here.
+            # worker reports done. Decode-last and decode-draft-last are
+            # prepared on the edge (self-posting), so they are not pending
+            # here.
             if (
                 batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
                 and (slice_info is None or slice_info.is_last_slice)
@@ -763,6 +791,28 @@ class PassiveEngineCoreProc:
                     self._pending_post_out_by_head_token[head_token] = (
                         batch.scheduler_output
                     )
+            elif (
+                batch.scheduler_output.batch_type
+                == BatchType.PREFILL_DRAFT_FIRST
+            ):
+                # Phase C: PDFF registers by (draft_task_id, draft_step_idx)
+                # so the worker ack (which carries both, after the
+                # multiproc_executor ack change) can locate the original SO.
+                # draft_task_id alone would collide across the steps of one
+                # chain (it equals the parent head_token); the parent PF
+                # entry is keyed by head_token and popped at PF ack,
+                # strictly before a PDFF of that chain is dispatched, so a
+                # single dict is safe.
+                draft_task_id = getattr(
+                    batch.scheduler_output, "draft_task_id", None
+                )
+                draft_step_idx = getattr(
+                    batch.scheduler_output, "draft_step_idx", None
+                )
+                if draft_task_id is not None:
+                    self._pending_post_out_by_head_token[
+                        (draft_task_id, draft_step_idx)
+                    ] = batch.scheduler_output
         return True
 
     def _maybe_publish_post_out(
@@ -772,14 +822,21 @@ class PassiveEngineCoreProc:
         on the POST_OUT (cloud → edge) channel.
 
         Mapping (cloud-side):
-            PREFILL_FIRST → PREFILL_LAST
-            DECODE_FIRST  → skipped (edge self-posts DECODE_LAST)
-            DRAFT_FIRST   → skipped (edge self-posts DRAFT_LAST)
-            anything else → dropped (legacy PP batches don't trigger return)
+            PREFILL_FIRST       → PREFILL_LAST
+            PREFILL_DRAFT_FIRST → PREFILL_DRAFT_LAST (Phase C: cloud-published;
+                                  the cloud round-trip is the pacing, the edge
+                                  no longer self-posts PDFL)
+            DECODE_FIRST        → skipped (edge self-posts DECODE_LAST)
+            DECODE_DRAFT_FIRST  → skipped (edge self-posts the matching
+                                  decode draft LAST)
+            anything else       → dropped (legacy PP batches don't trigger return)
 
         Uses a shallow copy via :py:func:`dataclasses.replace` so the original
         SchedulerOutput (still about to be enqueued for the local executor)
-        keeps its head-segment ``batch_type``.
+        keeps its head-segment ``batch_type``.  ``replace()`` drops dynamic
+        attributes (``is_last_prefill_chunk`` / ``draft_output_req_ids``) —
+        the edge's PDFL processing needs both, so they are re-attached
+        explicitly.
         """
         if self._pp_pd_channel is None:
             return
@@ -788,6 +845,28 @@ class PassiveEngineCoreProc:
         if bt == BatchType.PREFILL_FIRST:
             tail = replace(
                 scheduler_output, batch_type=BatchType.PREFILL_LAST
+            )
+        elif bt == BatchType.PREFILL_DRAFT_FIRST:
+            # Phase C (design §7.5 #28): publish the prefill draft tail
+            # after the cloud worker finishes the PDFF middle segment.
+            tail = replace(
+                scheduler_output,
+                batch_type=BatchType.PREFILL_DRAFT_LAST,
+                num_accepted_tokens=None,
+                valid_sampled_token_count=None,
+            )
+            tail.is_last_prefill_chunk = getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            )
+            # Default must match the edge's former self-posting exactly: the
+            # edge's PDFL pick falls back to num_scheduled_tokens when the
+            # attribute is missing, and getattr's default only applies when
+            # the attribute is ABSENT — a None here would survive into the
+            # edge's output_req_ids iteration and blow up.
+            tail.draft_output_req_ids = getattr(
+                scheduler_output,
+                "draft_output_req_ids",
+                tuple(scheduler_output.num_scheduled_tokens),
             )
         elif bt == BatchType.DECODE_FIRST:
             # The edge pre-generates DECODE_LAST, so the cloud does not
@@ -798,13 +877,16 @@ class PassiveEngineCoreProc:
                 scheduler_output.head_token,
             )
             return
-        elif bt == BatchType.DRAFT_FIRST:
-            # The edge pre-generates DRAFT_LAST (self-posting, same as
-            # DECODE_FIRST -> DECODE_LAST), so the cloud does not publish
-            # POST_OUT for DRAFT_FIRST.
+        elif bt in (
+            BatchType.DECODE_DRAFT_FIRST,
+        ):
+            # The edge pre-generates the matching decode draft LAST
+            # (self-posting, same as DECODE_FIRST -> DECODE_LAST), so the
+            # cloud does not publish POST_OUT for decode draft FIRSTs.
             logger.debug(
-                "[Cloud] Skipping POST_OUT for DRAFT_FIRST "
-                "head_token=%s (edge pre-generates DRAFT_LAST)",
+                "[Cloud] Skipping POST_OUT for %s "
+                "head_token=%s (edge pre-generates draft LAST)",
+                bt.value,
                 scheduler_output.head_token,
             )
             return
@@ -816,17 +898,31 @@ class PassiveEngineCoreProc:
         # it negative (fatal assert in AsyncScheduler._update_request_with_output).
         # PREFILL_LAST is additionally gated by the worker-ack path; the
         # guard is harmless there and essential for DL.
-        head_token = getattr(tail, "head_token", None)
-        if head_token:
-            if head_token in self._published_post_out_tokens:
+        # PREFILL_DRAFT_LAST lives in a SEPARATE set so the parent PL publish
+        # (keyed by the same head_token string) cannot suppress it.  Guard
+        # keys are per-step (draft_task_id, draft_step_idx): draft_task_id
+        # equals the parent head_token and is shared by every step of one
+        # chain, so a task-level guard would suppress steps >= 1 — the chain
+        # stalls waiting for a tail the cloud never publishes (edge watchdog
+        # raises ~30s later).
+        if tail.batch_type == BatchType.PREFILL_DRAFT_LAST:
+            task_id = getattr(tail, "draft_task_id", None)
+            step_idx = getattr(tail, "draft_step_idx", None)
+            guard_key = (task_id, step_idx) if task_id is not None else None
+            published_set = self._published_draft_post_out_tokens
+        else:
+            guard_key = getattr(tail, "head_token", None)
+            published_set = self._published_post_out_tokens
+        if guard_key:
+            if guard_key in published_set:
                 logger.warning(
                     "[CLOUD-POST-OUT] Suppressing duplicate %s publish for "
-                    "head_token=%s",
+                    "guard_key=%s",
                     tail.batch_type,
-                    head_token,
+                    guard_key,
                 )
                 return
-            self._published_post_out_tokens.add(head_token)
+            published_set.add(guard_key)
         # Echo the head_token back so the edge can correlate the tail
         # segment with its suspended head state.
         self._pp_pd_channel.publish(tail)

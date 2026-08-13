@@ -46,7 +46,8 @@ class PDSeparationConfig:
 
     # Dispatch policy for PassiveScheduler on the cloud side.
     # Valid options: "expect_alternation", "prefill_first", "decode_first", "pdmix_first"
-    # Default: "expect_alternation" - implements EEP/EED PD-covering state machine
+    # Default: "expect_alternation" - Phase C: CloudUndesiredState three-state
+    # machine (design §6.5), the EEP/EED machine's replacement
     dispatch_policy: str = "expect_alternation"
 
     @classmethod

@@ -901,6 +901,9 @@ class PDSeparationConfig:
                     "next_prefill_prior_enable": true,
                     "chunk_prefill_prior_enable": true,
                     "max_chunk_prefill_ahead": 1,
+                    "prefill_draft_remote_pending_limit": 2,
+                    "decode_draft_remote_pending_limit": 2,
+                    "prefill_draft_last_watchdog_seconds": 30.0,
                 }
             }
         }
@@ -919,6 +922,23 @@ class PDSeparationConfig:
         self.max_chunk_prefill_ahead: int = int(
             user_config.get("max_chunk_prefill_ahead", 1)
         )
+        # Phase C (design §7.7 #37): per-domain remote-pending caps — the
+        # number of in-flight draft steps per domain allowed before the
+        # edge stalls dispatching further heads of that domain.
+        self.prefill_draft_remote_pending_limit: int = int(
+            user_config.get("prefill_draft_remote_pending_limit", 2)
+        )
+        self.decode_draft_remote_pending_limit: int = int(
+            user_config.get("decode_draft_remote_pending_limit", 2)
+        )
+        # Phase C review: seconds the edge waits for a cloud-published
+        # PREFILL_DRAFT_LAST before treating its absence as an edge-cloud
+        # link failure and raising (the cloud tail travels over a ZMQ
+        # PUSH control channel that drops under backpressure; a lost
+        # tail is unrecoverable in-place, restart is required).
+        self.prefill_draft_last_watchdog_seconds: float = float(
+            user_config.get("prefill_draft_last_watchdog_seconds", 30.0)
+        )
 
     @property
     def prefill_inflight_limit(self) -> int:
@@ -934,7 +954,13 @@ class PDSeparationConfig:
             f"PDSeparationConfig(enabled={self.enabled}, "
             f"next_prefill_prior_enable={self.next_prefill_prior_enable}, "
             f"chunk_prefill_prior_enable={self.chunk_prefill_prior_enable}, "
-            f"max_chunk_prefill_ahead={self.max_chunk_prefill_ahead})"
+            f"max_chunk_prefill_ahead={self.max_chunk_prefill_ahead}, "
+            f"prefill_draft_remote_pending_limit="
+            f"{self.prefill_draft_remote_pending_limit}, "
+            f"decode_draft_remote_pending_limit="
+            f"{self.decode_draft_remote_pending_limit}, "
+            f"prefill_draft_last_watchdog_seconds="
+            f"{self.prefill_draft_last_watchdog_seconds})"
         )
 
 

@@ -126,10 +126,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # isend/irecv on a channel rendezvous the two sides (gloo metadata
     # exchange + HCCL link setup) and blocks the host until the peer
     # posts the matching op.  If that rendezvous happens mid-pipeline
-    # while a DRAFT_FIRST batch overtakes a PREFILL_FIRST batch on the
-    # cloud side (draft is published at schedule time, prefill only when
-    # about to execute), the two sides rendezvous on *different* channels
-    # and deadlock.  Warming the channels at init moves the rendezvous to
+    # while a decode draft FIRST batch overtakes a PREFILL_FIRST batch on
+    # the cloud side (draft is published at schedule time, prefill only
+    # when about to execute), the two sides rendezvous on *different*
+    # channels and deadlock.  Warming the channels at init moves the rendezvous to
     # a point where both sides are guaranteed to arrive in the same
     # order.  Default 1 (enabled). Set to 0 to disable.
     "VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP": lambda: bool(

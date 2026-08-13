@@ -382,6 +382,19 @@ class NPUPlatform(Platform):
             pd.max_chunk_prefill_ahead
         )
 
+        # Phase C (design §7.7 #37): per-domain draft remote-pending caps.
+        scheduler_config.pd_prefill_draft_remote_pending_limit = (
+            pd.prefill_draft_remote_pending_limit
+        )
+        scheduler_config.pd_decode_draft_remote_pending_limit = (
+            pd.decode_draft_remote_pending_limit
+        )
+        # Phase C review: watchdog interval for cloud-published PDFL;
+        # exceeding it raises (edge-cloud link failure, restart needed).
+        scheduler_config.pd_prefill_draft_last_watchdog_seconds = (
+            pd.prefill_draft_last_watchdog_seconds
+        )
+
         if getattr(scheduler_config, "async_scheduling", False):
             scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.pd_separated_scheduler.AsyncPDSeparatedScheduler"

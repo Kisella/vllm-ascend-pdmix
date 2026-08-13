@@ -111,6 +111,10 @@ class TestConfigWiring:
             prefill_inflight_limit=2,
             chunk_prefill_prior_enable=True,
             max_chunk_prefill_ahead=1,
+            # Phase C (§7.7 #37): per-domain draft pending caps + watchdog.
+            prefill_draft_remote_pending_limit=2,
+            decode_draft_remote_pending_limit=2,
+            prefill_draft_last_watchdog_seconds=30.0,
         )
         edge_cloud = SimpleNamespace(enabled=True, pd_separation=pd)
         ascend_config = SimpleNamespace(edge_cloud_config=edge_cloud)
@@ -120,6 +124,9 @@ class TestConfigWiring:
         assert vllm_config.scheduler_config.pd_next_prefill_prior_enable is True
         assert vllm_config.scheduler_config.pd_chunk_prefill_prior_enable is True
         assert vllm_config.scheduler_config.pd_max_chunk_prefill_ahead == 1
+        assert vllm_config.scheduler_config.pd_prefill_draft_remote_pending_limit == 2
+        assert vllm_config.scheduler_config.pd_decode_draft_remote_pending_limit == 2
+        assert vllm_config.scheduler_config.pd_prefill_draft_last_watchdog_seconds == 30.0
 
     def test_chunk_prefill_prior_disabled_by_default(self):
         """When not configured, chunk_prefill_prior_enable defaults to False."""
@@ -138,6 +145,10 @@ class TestConfigWiring:
             prefill_inflight_limit=2,
             chunk_prefill_prior_enable=False,
             max_chunk_prefill_ahead=1,
+            # Phase C keys (direct attribute access in platform).
+            prefill_draft_remote_pending_limit=2,
+            decode_draft_remote_pending_limit=2,
+            prefill_draft_last_watchdog_seconds=30.0,
         )
         edge_cloud = SimpleNamespace(enabled=True, pd_separation=pd)
         ascend_config = SimpleNamespace(edge_cloud_config=edge_cloud)
@@ -952,11 +963,14 @@ class TestBackwardCompatibility:
         scheduler.running = []
         scheduler.prefills_last_ready = []
         scheduler.decodes_last_ready = []
-        scheduler.drafts_first_ready = []
-        scheduler.drafts_last_ready = []
+        scheduler.prefill_drafts_first_ready = []
+        scheduler.prefill_drafts_last_ready = []
+        scheduler.decode_drafts_first_ready = []
+        scheduler.decode_drafts_last_ready = []
         scheduler.prefill_inflight_count = 0
         scheduler.prefill_inflight_limit = 1
-        scheduler.draft_remote_pending_count = 0
+        scheduler.prefill_draft_remote_pending_count = 0
+        scheduler.decode_draft_remote_pending_count = 0
         scheduler.decode_or_draft_inflight_count = 0
         scheduler.decode_or_draft_inflight_limit = 1
 
@@ -981,11 +995,14 @@ class TestBackwardCompatibility:
         scheduler.running = []
         scheduler.prefills_last_ready = []
         scheduler.decodes_last_ready = []
-        scheduler.drafts_first_ready = []
-        scheduler.drafts_last_ready = []
+        scheduler.prefill_drafts_first_ready = []
+        scheduler.prefill_drafts_last_ready = []
+        scheduler.decode_drafts_first_ready = []
+        scheduler.decode_drafts_last_ready = []
         scheduler.prefill_inflight_count = 0
         scheduler.prefill_inflight_limit = 1
-        scheduler.draft_remote_pending_count = 0
+        scheduler.prefill_draft_remote_pending_count = 0
+        scheduler.decode_draft_remote_pending_count = 0
         scheduler.decode_or_draft_inflight_count = 0
         scheduler.decode_or_draft_inflight_limit = 1
         scheduler._prefill_flight_by_token = {}
@@ -1123,7 +1140,7 @@ class TestPDPreemptionProtection:
         for step in (0, 1):
             scheduler._register_pd_flight(
                 self._make_output(
-                    BatchType.DRAFT_FIRST,
+                    BatchType.DECODE_DRAFT_FIRST,
                     draft_task_id="draft-0",
                     draft_step_idx=step,
                 )
@@ -1132,7 +1149,7 @@ class TestPDPreemptionProtection:
         assert scheduler._pd_active_flight_count == {"req-0": 2}
         scheduler._complete_pd_flight(
             self._make_output(
-                BatchType.DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
                 draft_task_id="draft-0",
                 draft_step_idx=0,
             )
@@ -1140,7 +1157,7 @@ class TestPDPreemptionProtection:
         assert scheduler._pd_active_flight_count == {"req-0": 1}
         scheduler._complete_pd_flight(
             self._make_output(
-                BatchType.DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
                 draft_task_id="draft-0",
                 draft_step_idx=1,
             )

@@ -396,6 +396,12 @@ class CloudPendingRequestCorrection:
     task_id: str
     generation: int
     num_draft_tokens: int
+    # The parent target's scheduler-side num_computed_tokens at dispatch time.
+    # The consume side uses it as the lower bound of the plausible
+    # num_computed_tokens_cpu range: async scheduling may leave the CPU value
+    # un-advanced or partially advanced between `start` and `optimistic`, and
+    # that is not a state-mismatch anomaly (2026-08-13, see consume).
+    start_num_computed_tokens: int
     optimistic_num_computed_tokens: int
     actual_num_computed_tokens: int
     num_accepted_tokens: int
@@ -1258,8 +1264,8 @@ class NPUModelRunner(GPUModelRunner):
         # Bound sized for long-sequence (e.g. 64k) multi-request runs where the
         # draft chain can legitimately lag several verify steps behind.  Too
         # small a bound evicts an in-flight task's metadata; the matching
-        # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
-        # cloud never sends the DRAFT_LAST response, deadlocking the edge's
+        # draft FIRST then raises in _reconstruct_cloud_draft_positions and the
+        # cloud never sends the draft LAST response, deadlocking the edge's
         # matching recv on the shared DECODE channel.
         self._cloud_spec_decode_metadata_cache_max: int = 32
         # Same per-task treatment for the verify step's scheduler_output. The
@@ -2137,15 +2143,29 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         previous_num_draft_tokens: dict[str, int],
-    ) -> bool:
+    ) -> str:
         """Apply complete request-keyed cloud corrections without device sync.
 
-        Returns ``True`` only when every request that participated in the
-        previous speculative step has a matching, current-generation result.
-        In that case the CPU batch state is authoritative and input
-        preparation can use its normal single CPU-to-device copy.  Incomplete
-        or stale results are left pending instead of being applied by batch
-        position.
+        Returns one of:
+          * ``"applied"`` -- every request that participated in the previous
+            speculative step resolved to a matching, current-generation
+            correction.  The CPU batch state is then authoritative and input
+            preparation can use its normal single CPU-to-device copy.
+          * ``"deferred"`` -- the verify chain that would produce a
+            request-keyed correction has not executed yet.  This is the
+            NORMAL async flow: the edge deliberately defers each chain's
+            step-0 past the next target (see the ``defer=True`` MTP decision
+            in ``_maybe_defer_draft``), and placeholder spec tokens filled by
+            the recompute scheduler make requests participate before a chain
+            has refilled their real drafts.  The upstream per-request
+            rejection correction (``deferred_spec_decode_corrections``,
+            keyed by request identity against the cloud's own GPU-observed
+            valid counts) is the correct authority in this case.
+          * ``"anomaly"`` -- a correction exists but the current CPU
+            num_computed_tokens is outside the plausible scheduling range
+            ``[start, max(optimistic, actual)]`` (async scheduling skew
+            inside that range is normal and applies); fall back and surface
+            it.
         """
         if not (
             self._edge_cloud_enabled
@@ -2154,7 +2174,7 @@ class NPUModelRunner(GPUModelRunner):
             and scheduler_output.batch_type
             in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST)
         ):
-            return False
+            return "deferred"
 
         participating = {
             req_id: num_draft
@@ -2163,7 +2183,7 @@ class NPUModelRunner(GPUModelRunner):
             and req_id in self.input_batch.req_id_to_index
         }
         if not participating:
-            return False
+            return "deferred"
 
         resolved: list[
             tuple[str, int, CloudPendingRequestCorrection]
@@ -2173,32 +2193,101 @@ class NPUModelRunner(GPUModelRunner):
             latest_generation = (
                 self._cloud_latest_target_generation_by_req.get(req_id)
             )
-            if (
-                correction is None
-                or correction.generation != latest_generation
-                or correction.num_draft_tokens != num_draft
-            ):
-                return False
+            if correction is None:
+                # The chain that would verify this req's drafts runs one
+                # target late (deferred chain execution), so no correction
+                # exists yet; the per-request rejection path corrects it.
+                logger.debug(
+                    "Cloud target has no pending request-keyed correction "
+                    "(deferred chain): req=%s num_draft=%d "
+                    "latest_generation=%s",
+                    req_id,
+                    num_draft,
+                    latest_generation,
+                )
+                return "deferred"
+            if correction.generation != latest_generation:
+                # A stale correction from an earlier chain: the req has
+                # already advanced past the generation this correction was
+                # recorded for.  The per-request rejection path is the
+                # authority for the current step.
+                logger.debug(
+                    "Cloud request correction generation mismatch (stale "
+                    "chain): req=%s task=%s correction_generation=%d "
+                    "latest_generation=%d num_draft=%d "
+                    "correction_num_draft=%d",
+                    req_id,
+                    correction.task_id,
+                    correction.generation,
+                    latest_generation,
+                    num_draft,
+                    correction.num_draft_tokens,
+                )
+                return "deferred"
+            if num_draft > correction.num_draft_tokens:
+                # The next target scheduled more drafts than the chain
+                # actually produced -- a real protocol violation (the chain's
+                # draft rows cannot exceed the parent step's count). This is
+                # unreachable by construction but kept as a hard failure.
+                logger.warning(
+                    "Cloud request correction under-provisions drafts: "
+                    "req=%s task=%s num_draft=%d correction_num_draft=%d",
+                    req_id,
+                    correction.task_id,
+                    num_draft,
+                    correction.num_draft_tokens,
+                )
+                return "anomaly"
+            if num_draft < correction.num_draft_tokens:
+                # The scheduler truncated this step's spec tokens to its
+                # draft budget (num_output_placeholders accounting in deep
+                # multi-chain pipelines). The correction is self-consistent
+                # per request -- optimistic/actual only depend on the frozen
+                # parent step -- so it remains applicable.
+                logger.debug(
+                    "Cloud request correction count truncated by draft "
+                    "budget: req=%s task=%s num_draft=%d "
+                    "correction_num_draft=%d",
+                    req_id,
+                    correction.task_id,
+                    num_draft,
+                    correction.num_draft_tokens,
+                )
 
             req_index = self.input_batch.req_id_to_index[req_id]
             cpu_value = int(
                 self.input_batch.num_computed_tokens_cpu[req_index]
             )
-            if cpu_value not in (
+            # The CPU value is the *current* batch's scheduler-side
+            # num_computed_tokens (overwritten by base _update_states).  In
+            # async scheduling the edge scheduler may leave it un-advanced
+            # (== start) or partially advanced between start and optimistic
+            # while the chain's verify is still in flight -- that is a normal
+            # timing skew, not a state mismatch.  Only a CPU value outside
+            # [start, max(optimistic, actual)] is a genuine anomaly (e.g.
+            # state polluted by an unrelated correction).  Within the range
+            # the correction applies normally (CPU := actual), matching what
+            # the upstream per-request callback would do post-launch
+            # (fix 2026-08-13).
+            start_value = correction.start_num_computed_tokens
+            upper_value = max(
                 correction.optimistic_num_computed_tokens,
                 correction.actual_num_computed_tokens,
-            ):
+            )
+            if cpu_value < start_value or cpu_value > upper_value:
                 logger.warning(
-                    "Cloud request correction does not match scheduler "
-                    "state; leaving the request-keyed correction pending: "
-                    "req=%s task=%s cpu=%d optimistic=%d actual=%d",
+                    "Cloud request correction is outside the plausible "
+                    "scheduling range; leaving the request-keyed correction "
+                    "pending: req=%s task=%s cpu=%d start=%d optimistic=%d "
+                    "actual=%d",
                     req_id,
                     correction.task_id,
                     cpu_value,
+                    start_value,
                     correction.optimistic_num_computed_tokens,
                     correction.actual_num_computed_tokens,
                 )
-                return False
+                return "anomaly"
             resolved.append((req_id, req_index, correction))
 
         # Apply only after the complete batch has been validated so a partial
@@ -2214,7 +2303,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._cloud_pending_request_corrections.pop(req_id, None)
 
-        return True
+        return "applied"
     def _strip_tail_new_block_ids(
         self, scheduler_output: "SchedulerOutput"
     ) -> "SchedulerOutput":
@@ -2318,21 +2407,53 @@ class NPUModelRunner(GPUModelRunner):
             for req_id, num_draft in previous_num_draft_tokens.items()
         )
         if has_previous_cloud_spec:
-            if not self._consume_cloud_request_corrections(
+            consume_result = self._consume_cloud_request_corrections(
                 scheduler_output, previous_num_draft_tokens
-            ):
-                # Scheduled cloud draft results must arrive before the next
-                # target. There is no safe positional fallback once batches
-                # can be independently reordered on the edge and cloud.
-                raise RuntimeError(
-                    "Cloud target is missing request-keyed speculative "
-                    "corrections for one or more active requests"
+            )
+            if consume_result == "deferred":
+                # The verify chain for this step runs one target late
+                # (deferred edge chain execution), so no request-keyed
+                # correction is available yet. Fall back to the upstream
+                # per-request rejection correction
+                # (deferred_spec_decode_corrections): it is keyed by request
+                # identity against the cloud's own GPU-observed valid counts,
+                # so no batch-positional edge/cloud assumption is made. This
+                # is the normal async flow, not an error.
+                logger.debug(
+                    "Cloud target deferred request-keyed correction for "
+                    "%d participating request(s); upstream per-request "
+                    "rejection correction will apply",
+                    sum(
+                        1
+                        for num_draft in previous_num_draft_tokens.values()
+                        if num_draft > 0
+                    ),
                 )
-            # The upstream callback would apply the same rejection correction
-            # later using the positional prev_req_id_to_index map.  The CPU
-            # state is already corrected by request identity, so suppress it.
-            result = None
-            self._cloud_current_cpu_state_authoritative = True
+            elif consume_result == "anomaly":
+                # A request-keyed correction exists but disagrees with the
+                # scheduler state; the request-keyed path cannot be used for
+                # this batch. Fall back to the upstream per-request rejection
+                # correction; the specific disagreement was already logged by
+                # the consume. The next recorded correction re-anchors the
+                # CPU state (see the confirmed check in
+                # _cache_cloud_spec_decode_metadata).
+                logger.warning(
+                    "Cloud target failed request-keyed correction "
+                    "resolution for %d participating request(s); falling "
+                    "back to the upstream per-request rejection correction",
+                    sum(
+                        1
+                        for num_draft in previous_num_draft_tokens.values()
+                        if num_draft > 0
+                    ),
+                )
+            else:  # consume_result == "applied"
+                # The upstream callback would apply the same rejection
+                # correction later using the positional
+                # prev_req_id_to_index map.  The CPU state is already
+                # corrected by request identity, so suppress it.
+                result = None
+                self._cloud_current_cpu_state_authoritative = True
 
         if shelved_prev_map:
             prev_map = self.input_batch.prev_req_id_to_index
@@ -4066,10 +4187,10 @@ class NPUModelRunner(GPUModelRunner):
 
         ``force_drop_task_ids`` carries chains the scheduler cut from its
         ready queues (all requests finished): their contexts are dropped
-        unconditionally.  Dropping a context whose DRAFT_FIRST already
-        executed is safe — the matching DRAFT_LAST drains through the
+        unconditionally.  Dropping a context whose draft FIRST already
+        executed is safe — the matching draft LAST drains through the
         context-is-None path in _run_edge_cloud_draft_last_segment, and
-        worker FIFO ordering guarantees an already-dispatched DRAFT_FIRST
+        worker FIFO ordering guarantees an already-dispatched draft FIRST
         ran before this RPC arrives.
         """
         req_id_set = set(req_ids)
@@ -4306,16 +4427,16 @@ class NPUModelRunner(GPUModelRunner):
         )
         if context is None:
             # Drain: the owning request finished/aborted after its
-            # DRAFT_FIRST was already dispatched to the cloud.  The cloud
+            # draft FIRST was already dispatched to the cloud.  The cloud
             # does not track request lifecycle, so it still ran the draft
-            # middle segment and isend the DRAFT_LAST response; the recv in
+            # middle segment and isend the draft LAST response; the recv in
             # _execute_model_edge_draft_tail already consumed it to keep the
             # DECODE hidden channel paired.  With no draft context there is
             # no tail-segment compute to run (the result would be discarded
             # anyway), so return a token-less placeholder and let
             # update_from_output skip the gone request.
             logger.info(
-                "[PD] drain stale DRAFT_LAST task_id=%s step=%s "
+                "[PD] drain stale draft LAST task_id=%s step=%s "
                 "(request gone, draft context cleared)",
                 task_id,
                 scheduler_output.draft_step_idx,
@@ -4330,7 +4451,7 @@ class NPUModelRunner(GPUModelRunner):
         if positions is None:
             positions = intermediate_tensors.tensors.get("positions")
         if positions is None:
-            raise RuntimeError("DRAFT_LAST missing positions")
+            raise RuntimeError("draft LAST missing positions")
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         intermediate_tensors = (
             self._sync_edge_cloud_draft_intermediate_tensors(
@@ -4338,8 +4459,8 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
         segment = self._edge_cloud_draft_segments["e"]
-        # DRAFT_LAST is dispatched independently as well, so it needs the
-        # same explicit eager context as DRAFT_FIRST.
+        # draft LAST is dispatched independently as well, so it needs the
+        # same explicit eager context as draft FIRST.
         with set_ascend_forward_context(
             attn_metadata=None,
             vllm_config=self.vllm_config,
@@ -4409,8 +4530,8 @@ class NPUModelRunner(GPUModelRunner):
         completed_draft_token_ids = None
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
-            # DRAFT_LAST completion is the readiness signal for the next
-            # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
+            # draft LAST completion is the readiness signal for the next
+            # step. PDSeparatedScheduler derives the next draft FIRST locally
             # from this completed SchedulerOutput, so no worker-side pending
             # task or follow-up control RPC is needed.
         elif context.get("draft_output_req_ids"):
@@ -5942,7 +6063,7 @@ class NPUModelRunner(GPUModelRunner):
                     # host. EngineCore derives both accepted-count fields from
                     # that existing result. Do not add another synchronous
                     # D2H here: the edge does not consume these cloud-only
-                    # scalars, and the next local DRAFT_FIRST is already queued.
+                    # scalars, and the next local draft FIRST is already queued.
                     task_id = scheduler_output.head_token
                     context = (
                         self._pending_edge_cloud_draft_contexts.get(task_id)
@@ -6543,6 +6664,15 @@ class NPUModelRunner(GPUModelRunner):
             or position_state is None
             or generation is None
         ):
+            logger.warning(
+                "Cloud draft corrections have no cached target metadata: "
+                "task=%s target_present=%s position_present=%s "
+                "generation_present=%s",
+                task_id,
+                target_output is not None,
+                position_state is not None,
+                generation is not None,
+            )
             return 0
 
         req_ids = position_state.req_ids
@@ -6576,6 +6706,21 @@ class NPUModelRunner(GPUModelRunner):
         for req_id, valid_value in valid_by_req.items():
             num_draft = len(spec_tokens.get(req_id, ()))
             if num_draft <= 0 or req_id not in start_by_req:
+                # The step-0 chain batch is padded with every parent-batch
+                # request; a request whose parent step scheduled zero spec
+                # tokens (e.g. short-prompt prefill outside the draft budget)
+                # has no drafts to correct, so skipping is expected. Requests
+                # that DO draft are recorded below and consumed by the next
+                # target.
+                logger.debug(
+                    "Skipping cloud correction for non-participating req "
+                    "(no scheduled drafts): task=%s req=%s num_draft=%d "
+                    "in_start_by_req=%s",
+                    task_id,
+                    req_id,
+                    num_draft,
+                    req_id in start_by_req,
+                )
                 continue
             valid_count = int(valid_value)
             if not 1 <= valid_count <= num_draft + 1:
@@ -6592,7 +6737,12 @@ class NPUModelRunner(GPUModelRunner):
                 self._cloud_latest_target_generation_by_req.get(req_id)
                 != generation
             ):
-                logger.warning(
+                # The chain's step-0 executes one target late (deferred edge
+                # chain), so by the time it records, the request has already
+                # advanced past this generation and its consume fell back to
+                # the per-request rejection path. Discarding the superseded
+                # count is correct -- it was never applied by batch position.
+                logger.debug(
                     "Ignoring late cloud accepted state: task=%s req=%s "
                     "generation=%d latest=%s",
                     task_id,
@@ -6613,6 +6763,7 @@ class NPUModelRunner(GPUModelRunner):
                 task_id=task_id,
                 generation=generation,
                 num_draft_tokens=num_draft,
+                start_num_computed_tokens=start_by_req[req_id],
                 optimistic_num_computed_tokens=optimistic,
                 actual_num_computed_tokens=actual,
                 num_accepted_tokens=int(
@@ -6644,10 +6795,10 @@ class NPUModelRunner(GPUModelRunner):
         communication stays in the worker layer, consistent with the
         non-draft ``_execute_model_cloud`` path.
 
-        The edge self-posts DRAFT_LAST together with DRAFT_FIRST, so the
-        matching receive does not depend on a cloud worker ack or POST_OUT.
-        The worker records (rather than waits for) the cloud->edge send,
-        exactly like ``_execute_model_cloud``.
+        The edge self-posts the matching draft LAST together with the draft
+        FIRST (decode domain), so the matching receive does not depend on a
+        cloud worker ack or POST_OUT. The worker records (rather than waits
+        for) the cloud->edge send, exactly like ``_execute_model_cloud``.
         """
         # DRAFT batches bypass execute_model/_update_states on the cloud, so
         # the purge hook there never runs for them.  Consume any piggybacked
@@ -6674,6 +6825,18 @@ class NPUModelRunner(GPUModelRunner):
                     "expected step 0",
                     spec_step_idx,
                 )
+        elif spec_step_idx == 0:
+            # Step-0 of a chain should usually carry the rejection-corrected
+            # sampling state (the edge patches it at finalize / creation), but
+            # a chain whose parent scheduled no drafts (or whose finalize was
+            # bypassed) legitimately has none. Either way the next target
+            # finds no pending request-keyed result and falls back to the
+            # upstream per-request rejection correction -- the normal flow.
+            logger.debug(
+                "Cloud draft step 0 carried no request-keyed corrections: "
+                "task=%s",
+                scheduler_output.draft_task_id,
+            )
 
         token_tensor_key = (
             "input_embeds"
@@ -7344,7 +7507,7 @@ class NPUModelRunner(GPUModelRunner):
             # slice of a new request that just entered the cloud worker's
             # batch.  _update_states must see the request at least once to
             # populate req_data.all_token_ids; otherwise a later
-            # DECODE_FIRST / DRAFT_FIRST will KeyError.
+            # DECODE_FIRST / draft FIRST will KeyError.
             self._update_states(scheduler_output)
             return
 

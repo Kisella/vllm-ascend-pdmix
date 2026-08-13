@@ -602,9 +602,9 @@ def init_ascend_model_parallel(
                 HiddenChannelType.init(dp_size=1)
             # Pre-establish the HCCL/gloo links of every hidden channel so
             # the first-use rendezvous never happens mid-pipeline, where a
-            # DRAFT_FIRST batch overtaking a PREFILL_FIRST batch on the
-            # cloud side would make the two sides rendezvous on different
-            # channels and deadlock.
+            # decode draft FIRST batch overtaking a PREFILL_FIRST batch on
+            # the cloud side would make the two sides rendezvous on
+            # different channels and deadlock.
             if envs.VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP:
                 warmup_edge_cloud_hidden_channels(parallel_config)
 
@@ -1013,11 +1013,11 @@ def warmup_edge_cloud_hidden_channels(
 
     The first isend/irecv on a hidden channel rendezvous the two sides
     (gloo metadata exchange + HCCL link setup) and blocks the host until
-    the peer posts the matching op.  DRAFT_FIRST is published to the cloud
-    at schedule time while PREFILL_FIRST is published only when it is
-    about to execute, so a draft batch can overtake a prefill batch on the
-    cloud side.  If both batches happen to be the first use of their
-    channels, the two sides rendezvous on *different* channels and
+    the peer posts the matching op.  A draft FIRST batch is published to
+    the cloud at schedule time while PREFILL_FIRST is published only when
+    it is about to execute, so a draft batch can overtake a prefill batch
+    on the cloud side.  If both batches happen to be the first use of
+    their channels, the two sides rendezvous on *different* channels and
     deadlock: edge TP0 blocks in the PREFILL_2 send rendezvous while the
     cloud workers block in the DECODE draft recv.  Exchanging a tiny
     tensor-dict on every channel in both directions here -- in a fixed
