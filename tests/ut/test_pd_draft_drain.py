@@ -12,12 +12,12 @@ _pregenerate_draft_chain in TestMidPrefillDraftChain.
 Regression coverage for the edge-side MTP draft deadlock fixes:
 
   * ``_can_schedule_decode_draft_first`` (pre-generated branch) now respects
-    ``_force_decode_draft_last`` -- a second DECODE_DRAFT_FIRST may not be
-    picked until the preceding DECODE_DRAFT_LAST is picked (which clears the
-    flag).  Previously the pre-generated branch omitted this guard, so a
-    draft LAST dropped without clearing the flag let a second draft FIRST
-    through (two heads with no tail on the shared DECODE channel -> cloud
-    ``irecv`` deadlock).
+    the FORCE state machine's ``decode_draft_last_pending`` (design §6.3.2)
+    -- a second DECODE_DRAFT_FIRST may not be picked until the preceding
+    DECODE_DRAFT_LAST is picked (which clears it).  Previously the
+    pre-generated branch omitted this guard, so a draft LAST dropped without
+    clearing the flag let a second draft FIRST through (two heads with no
+    tail on the shared DECODE channel -> cloud ``irecv`` deadlock).
   * ``_is_stale_draft_output`` no longer exempts pre-generated dispatched
     chains: once the owning request is gone, future (not-yet-dispatched)
     draft FIRST heads are stale and must be skipped -- the edge can no longer
@@ -53,7 +53,10 @@ from vllm.v1.core.sched.output import (
 
 
 def _make_bare_scheduler():
-    from vllm_ascend.core.pd_separated_scheduler import PDSeparatedScheduler
+    from vllm_ascend.core.pd_separated_scheduler import (
+        EdgeForceStateMachine,
+        PDSeparatedScheduler,
+    )
 
     s = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
     s.decode_drafts_first_ready = deque()
@@ -71,9 +74,8 @@ def _make_bare_scheduler():
     s.decode_or_draft_inflight_count = 0
     s.decode_or_draft_inflight_limit = 1
     s.decode_head_inflight_count = 0
-    s._force_decode_draft_last = False
-    s._force_prefill_draft_last = False
-    s._force_decode_last = False
+    # [FORCE] 状态机（设计 §6.3.2）：交替与窗口状态在此驱动/断言。
+    s._force = EdgeForceStateMachine()
     s.num_spec_tokens = 3
     return s
 
@@ -127,9 +129,10 @@ def _make_real_output(
 
 
 class TestCanScheduleDecodeDraftFirstForceGuard:
-    """The pre-generated branch must gate on _force_decode_draft_last just
-    like the non-pre-generated branch, so DECODE_DRAFT_FIRST ->
-    DECODE_DRAFT_LAST alternation is guaranteed."""
+    """The pre-generated branch must gate on the FORCE state machine's
+    ``decode_draft_last_pending`` just like the non-pre-generated branch,
+    so DECODE_DRAFT_FIRST -> DECODE_DRAFT_LAST alternation is
+    guaranteed."""
 
     def _setup(self, pregenerated=True):
         s = _make_bare_scheduler()
@@ -139,25 +142,25 @@ class TestCanScheduleDecodeDraftFirstForceGuard:
             s._pregenerated_draft_task_ids.add(drf.draft_task_id)
         # Conditions that would otherwise allow scheduling.
         s.decode_drafts_last_ready = deque()
-        s._force_decode_last = False
-        s._force_decode_draft_last = False
+        s._force.decode_last_pending = False
+        s._force.decode_draft_last_pending = False
         s.decode_draft_remote_pending_count = 0
         s.decode_or_draft_inflight_count = 0
         return s
 
     def test_preGen_blocked_when_force_draft_last_true(self):
         s = self._setup(pregenerated=True)
-        s._force_decode_draft_last = True
+        s._force.decode_draft_last_pending = True
         assert s._can_schedule_decode_draft_first() is False
 
     def test_preGen_allowed_when_force_draft_last_false(self):
         s = self._setup(pregenerated=True)
-        s._force_decode_draft_last = False
+        s._force.decode_draft_last_pending = False
         assert s._can_schedule_decode_draft_first() is True
 
     def test_preGen_blocked_by_drafts_last_ready(self):
         s = self._setup(pregenerated=True)
-        s._force_decode_draft_last = False
+        s._force.decode_draft_last_pending = False
         s.decode_drafts_last_ready.append(_make_draft_last())
         assert s._can_schedule_decode_draft_first() is False
 
@@ -168,7 +171,7 @@ class TestCanScheduleDecodeDraftFirstForceGuard:
         head is in flight (the cloud's recv order could mismatch the edge's
         send order).  Gate on decode heads, not total heads."""
         s = self._setup(pregenerated=True)
-        s._force_decode_draft_last = False
+        s._force.decode_draft_last_pending = False
         s.decode_head_inflight_count = 1  # a DECODE_FIRST in flight
         assert s._can_schedule_decode_draft_first() is False
         s.decode_head_inflight_count = 0
@@ -181,7 +184,7 @@ class TestCanScheduleDecodeDraftFirstForceGuard:
         stream directions), and draft+draft uses the same recv primitive
         (FIFO).  Only a DECODE_FIRST head blocks it, not another draft head."""
         s = self._setup(pregenerated=True)
-        s._force_decode_draft_last = False  # prev draft LAST already picked
+        s._force.decode_draft_last_pending = False  # prev draft LAST already picked
         s.decode_drafts_last_ready = deque()  # prev draft LAST popped (in flight)
         s.decode_head_inflight_count = 0  # no DECODE_FIRST in flight
         s.decode_or_draft_inflight_count = 1  # a draft FIRST in flight
@@ -191,7 +194,7 @@ class TestCanScheduleDecodeDraftFirstForceGuard:
     def test_non_pregenerated_branch_also_blocked_by_force_draft_last(self):
         """Non-pre-generated branch already had the guard (unchanged)."""
         s = self._setup(pregenerated=False)
-        s._force_decode_draft_last = True
+        s._force.decode_draft_last_pending = True
         assert s._can_schedule_decode_draft_first() is False
 
 
@@ -204,16 +207,16 @@ class TestDraftFirstLastAlternation:
         s._pregenerated_draft_task_ids.add("task-0")
         # step-0 head already picked; step-1 is next in decode_drafts_first_ready.
         s.decode_drafts_first_ready.append(_make_draft_first(step=1))
-        s._force_decode_last = False
+        s._force.decode_last_pending = False
         s.decode_draft_remote_pending_count = 0
 
         # draft FIRST step-0 in force + its draft LAST pending -> step-1 blocked.
-        s._force_decode_draft_last = True
+        s._force.decode_draft_last_pending = True
         s.decode_drafts_last_ready.append(_make_draft_last(step=0))
         assert s._can_schedule_decode_draft_first() is False
 
         # draft LAST step-0 picked -> flag cleared, no tail pending -> allowed.
-        s._force_decode_draft_last = False
+        s._force.decode_draft_last_pending = False
         s.decode_drafts_last_ready.clear()
         assert s._can_schedule_decode_draft_first() is True
 
@@ -276,9 +279,8 @@ class TestMidPrefillDraftChain:
         tail.is_last_prefill_chunk = False
         tail.draft_output_req_ids = ()
         s.decode_drafts_last_ready.append(tail)
-        s._force_decode_draft_last = True
+        s._force.decode_draft_last_pending = True
         s._validate_decode_draft_tail_channel = MagicMock()
-        s._start_decode_or_draft_first_only_window = MagicMock()
         s._prepare_next_decode_first_placeholder = MagicMock()
 
         assert s._pick_decode_draft_last_batch() is tail
@@ -410,11 +412,10 @@ class TestPickDecodeDraftLastBatchDrain:
         if req_present:
             s.requests["req-0"] = MagicMock()
         s.decode_drafts_last_ready.append(_make_draft_last())
-        s._force_decode_draft_last = True
+        s._force.decode_draft_last_pending = True
         s.decode_draft_remote_pending_count = 1
         # Stub side-effecting helpers to isolate the drain decision.
         s._validate_decode_draft_tail_channel = MagicMock()
-        s._start_decode_or_draft_first_only_window = MagicMock()
         s._prepare_next_decode_first_placeholder = MagicMock()
         s._make_empty_batch = MagicMock(return_value="EMPTY")
         return s
@@ -428,8 +429,8 @@ class TestPickDecodeDraftLastBatchDrain:
         # dropped -- the cloud's response must be paired on the DECODE channel.
         assert result.batch_type == BatchType.DECODE_DRAFT_LAST
         assert len(s.decode_drafts_last_ready) == 0
-        # _force_decode_draft_last is always reset now (old stale-drop skipped).
-        assert s._force_decode_draft_last is False
+        # decode_draft_last_pending is always reset now (old stale-drop skipped).
+        assert s._force.decode_draft_last_pending is False
         # The decrement moved to update_from_output; the pick no longer
         # decrements (the old stale-drop did).
         assert s.decode_draft_remote_pending_count == before
@@ -441,7 +442,7 @@ class TestPickDecodeDraftLastBatchDrain:
         s = self._setup(req_present=True)
         result = s._pick_decode_draft_last_batch()
         assert result.batch_type == BatchType.DECODE_DRAFT_LAST
-        assert s._force_decode_draft_last is False
+        assert s._force.decode_draft_last_pending is False
         s._prepare_next_decode_first_placeholder.assert_called_once()
 
     def test_empty_returns_empty_batch(self):

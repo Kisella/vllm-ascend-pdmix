@@ -190,6 +190,172 @@ class HiddenChannelManager:
         return dp_size * _DECODE_CHANNELS_PER_DP
 
 
+class EdgeForceStateMachine:
+    """FORCE 状态机（设计 §6.3.2）：边侧强制调度逻辑的唯一宿主。
+
+    收编两类强制机制（原散落为 3 个交替 bool + 2 个 first-only 窗口 +
+    4 处门控查询 + 2 个消费函数）：
+
+    * 交替标记：F pick 置 L-pending，L pick 解除——保证 DF->DL、
+      DDF->DDL、PDFF->PDFL 严格交替时序；
+    * first-only 窗口：DL/DDL/PL(仅 MTP)/非末跳 PDFL pick 后，下一拍
+      只允许对应域的 first（选中即解除；超时自动解除并打 warning）。
+
+    范围（用户确认，仅"交替+窗口"）：延迟 pacing 计时器（decode_last
+    30ms、decode_draft_last 5ms）与 PDFL watchdog 不在此状态机内，
+    保留原位（pacing / 故障检测非强制语义）。
+
+    两域独立（正确性要求）：prefill 域强制 PDFL 与 decode 域强制
+    first-only 可叠加存在，故按域建字段而非单枚举；每域内"F->L 交替"
+    与"L->F 窗口"天然时序互斥，同一时刻至多一个激活（与窗口互斥注释
+    一致）。
+    """
+
+    def __init__(
+        self,
+        *,
+        decode_first_only_window_ms: int = 30,
+        prefill_draft_first_only_window_ms: int = 15,
+        prefill_first_only_enabled: bool = True,
+    ) -> None:
+        # decode 域交替：DF/DDF pick 置位，DL/DDL pick 解除。
+        self.decode_last_pending: bool = False
+        self.decode_draft_last_pending: bool = False
+        # decode 域 first-only 窗口（绝对截止时刻；None = 未激活）。
+        self.decode_first_only_deadline: float | None = None
+        # prefill 域交替：PDFF pick 置位，PDFL pick 解除。
+        self.prefill_draft_last_pending: bool = False
+        # prefill 域 first-only 窗口（绝对截止时刻；None = 未激活）。
+        self.prefill_first_only_deadline: float | None = None
+
+        self._decode_first_only_window_ms: int = decode_first_only_window_ms
+        self._prefill_draft_first_only_window_ms: int = (
+            prefill_draft_first_only_window_ms
+        )
+        # 非 MTP 无链可等：PL 后启动 prefill 窗口只会白白锁住 15ms。
+        self._prefill_first_only_enabled: bool = prefill_first_only_enabled
+
+    # ------------------------------------------------------------------ #
+    # 事件转移：pick 后通知（batch_type 为实际派发类型）                  #
+    # ------------------------------------------------------------------ #
+    def on_pick(
+        self,
+        batch_type: BatchType,
+        *,
+        prefill_chain_has_more: bool = False,
+    ) -> None:
+        if batch_type == BatchType.DECODE_FIRST:
+            self.decode_last_pending = True
+        elif batch_type == BatchType.DECODE_DRAFT_FIRST:
+            self.decode_draft_last_pending = True
+        elif batch_type == BatchType.DECODE_LAST:
+            self._start_decode_first_only()
+            self.decode_last_pending = False
+        elif batch_type == BatchType.DECODE_DRAFT_LAST:
+            self._start_decode_first_only()
+            self.decode_draft_last_pending = False
+        elif batch_type == BatchType.PREFILL_DRAFT_FIRST:
+            self.prefill_draft_last_pending = True
+        elif batch_type == BatchType.PREFILL_DRAFT_LAST:
+            # 非末跳（同 task 仍有未派发 PDFF 在队）才启动窗口强制跟随；
+            # 末跳后无首可等，清窗口（防御性，防残留误锁）。
+            if prefill_chain_has_more:
+                self._start_prefill_draft_first_only()
+            else:
+                self.prefill_first_only_deadline = None
+            self.prefill_draft_last_pending = False
+        elif batch_type == BatchType.PREFILL_LAST:
+            # 第 3 点强制等待（仅 MTP 场景生效——构造时判定，等价现状
+            # _uses_async_scheduled_mtp_placeholders 运行时门控）。
+            if self._prefill_first_only_enabled:
+                self._start_prefill_draft_first_only()
+        # PREFILL_FIRST / EMPTY：无转移。
+
+    # ------------------------------------------------------------------ #
+    # 门控查询（替代 _can_schedule_* 中的 not self._force_* 检查）       #
+    # ------------------------------------------------------------------ #
+    def can_pick_decode_first(self) -> bool:
+        return (
+            not self.decode_last_pending
+            and not self.decode_draft_last_pending
+        )
+
+    def can_pick_decode_draft_first(self) -> bool:
+        return self.can_pick_decode_first()
+
+    def can_pick_prefill_draft_first(self) -> bool:
+        return not self.prefill_draft_last_pending
+
+    def can_pick_decode_last(self) -> bool:
+        # 现状仅受延迟 pacing 计时器约束（不在 FORCE 范围），无强制门控。
+        return True
+
+    def can_pick_decode_draft_last(self) -> bool:
+        return True
+
+    # ------------------------------------------------------------------ #
+    # first-only 窗口活性：未激活/未超时返回 True 语义相反（active），    #
+    # 超时自动解除并打 warning（文案与现状逐字一致）                     #
+    # ------------------------------------------------------------------ #
+    def decode_first_only_active(self) -> bool:
+        deadline = self.decode_first_only_deadline
+        if deadline is None:
+            return False
+        if time.monotonic() < deadline:
+            return True
+        self.decode_first_only_deadline = None
+        logger.warning(
+            "[PD] decode-first-only window expired after %dms "
+            "without a DECODE_FIRST / DECODE_DRAFT_FIRST pick "
+            "(scheduling anomaly: decode domain stalled or first "
+            "gated too long)",
+            self._decode_first_only_window_ms,
+        )
+        return False
+
+    def prefill_draft_first_only_active(self) -> bool:
+        deadline = self.prefill_first_only_deadline
+        if deadline is None:
+            return False
+        if time.monotonic() < deadline:
+            return True
+        self.prefill_first_only_deadline = None
+        logger.warning(
+            "[PD] prefill-draft-first-only window expired after %dms "
+            "without a PREFILL_DRAFT_FIRST pick (scheduling anomaly: "
+            "prefill draft chain stalled or first gated too long)",
+            self._prefill_draft_first_only_window_ms,
+        )
+        return False
+
+    # ------------------------------------------------------------------ #
+    # 消费：选中 first 即解除对应窗口                                    #
+    # ------------------------------------------------------------------ #
+    def clear_decode_first_only(self) -> None:
+        self.decode_first_only_deadline = None
+
+    def clear_prefill_draft_first_only(self) -> None:
+        self.prefill_first_only_deadline = None
+
+    def release_for_draft_work(self) -> None:
+        """_has_draft_work 接管：链 FIFO 即节奏（§6.3 域间互不阻塞），
+        且链排空后无残留窗口可误报超时。"""
+        self.clear_decode_first_only()
+        self.clear_prefill_draft_first_only()
+
+    def _start_decode_first_only(self) -> None:
+        self.decode_first_only_deadline = (
+            time.monotonic()
+            + self._decode_first_only_window_ms / 1000.0
+        )
+
+    def _start_prefill_draft_first_only(self) -> None:
+        self.prefill_first_only_deadline = (
+            time.monotonic()
+            + self._prefill_draft_first_only_window_ms / 1000.0
+        )
+
+
 class PDSeparatedScheduler(Scheduler):
     """Scheduler that separates prefill and decode into distinct steps.
 
@@ -365,23 +531,22 @@ class PDSeparatedScheduler(Scheduler):
         self._decode_last_delay_start_ts: float | None = None
         self._decode_last_delay_schedule_ms: int = 30
 
-        # [新增] 强制调度 D尾 标记。
-        # D首 调度后置 True，D尾 调度后置 False。
-        # True 时禁止调度 D首，严格保证 DF -> DL 交替时序。
-        self._force_decode_last: bool = False
-        # 4 域拆分（设计 §6.1）：prefill_draft / decode_draft 各自的交替
-        # 标记，严格保证 PDFF -> PDFL、DDF -> DDL 交替时序。
-        self._force_prefill_draft_last: bool = False
-        self._force_decode_draft_last: bool = False
+        # [FORCE] 强制调度状态机（设计 §6.3.2）：交替标记与 first-only
+        # 窗口全部收敛于此（替代 3 个 _force_* bool + 2 个窗口组）。
+        # prefill_first_only_enabled = MTP 使能——非 MTP 无链可等，PL 后
+        # 启动 prefill 窗口只会白白锁 15ms（等价现状的运行时门控，
+        # 依赖的配置在构造后不变，故可构造时计算）。
+        self._force: EdgeForceStateMachine = EdgeForceStateMachine(
+            decode_first_only_window_ms=30,
+            prefill_draft_first_only_window_ms=15,
+            prefill_first_only_enabled=(
+                self._uses_async_scheduled_mtp_placeholders()
+            ),
+        )
 
         self._layer_slice_config_path: str | None = None
         self._layer_slice_config_mtime: float = 0.0
         self._load_layer_slice_config()
-        # After scheduling a DECODE_LAST or DECODE_DRAFT_LAST, briefly
-        # reserve the next scheduling opportunity for DECODE_FIRST or
-        # DECODE_DRAFT_FIRST only (decode 域专用窗口，设计 §6.3)。
-        self._decode_or_draft_first_only_start_ts: float | None = None
-        self._decode_or_draft_first_only_window_ms: int = 30
 
         # [MTP] DECODE_DRAFT_LAST delay scheduling (mirrors
         # decode_last_delay)。边侧自生成 decode_draft_last 后延迟 5ms
@@ -1109,42 +1274,6 @@ class PDSeparatedScheduler(Scheduler):
         )
         return scheduler_output
 
-    def _decode_or_draft_first_only_active(self) -> bool:
-        started_at = self._decode_or_draft_first_only_start_ts
-        if started_at is None:
-            return False
-        elapsed_ms = (time.monotonic() - started_at) * 1000
-        if elapsed_ms >= self._decode_or_draft_first_only_window_ms:
-            self._decode_or_draft_first_only_start_ts = None
-            return False
-        return True
-
-    def _start_decode_or_draft_first_only_window(self) -> None:
-        self._decode_or_draft_first_only_start_ts = time.monotonic()
-
-    def _clear_decode_or_draft_first_only_window(self) -> None:
-        self._decode_or_draft_first_only_start_ts = None
-
-    def _pick_decode_or_draft_first_only_or_empty(self) -> SchedulerOutput | None:
-        if self._has_draft_work():
-            # A pending draft chain must not be held back by the
-            # decode-first-only window: returning EMPTY here breaks the
-            # batch_queue fill loop right after a DECODE_LAST pick, so the
-            # pre-generated draft placeholder chain never reaches the
-            # worker MQ in the same EngineCore turn.
-            return None
-        if not self._decode_or_draft_first_only_active():
-            return None
-        # Window: allow decode_draft首 (priority) or Decode首 —— 4 域拆分后
-        # 该窗口只对 decode 域有意义（设计 §6.3），prefill 域不受其限。
-        if self._can_schedule_decode_draft_first():
-            self._clear_decode_or_draft_first_only_window()
-            return self._pick_decode_draft_first_batch()
-        if self._can_schedule_decode_first():
-            self._clear_decode_or_draft_first_only_window()
-            return self._pick_decode_first_batch()
-        return self._make_empty_batch()
-
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
         if self._decode_first_placeholder_parent is not None:
             self._prepare_next_decode_first_placeholder(
@@ -1183,9 +1312,32 @@ class PDSeparatedScheduler(Scheduler):
         ):
             return self.decodes_first_ready.popleft()
 
-        first_only = self._pick_decode_or_draft_first_only_or_empty()
-        if first_only is not None:
-            return first_only
+        # [FORCE] decode 域 first-only 窗口（设计 §6.3.2）：DL/DDL pick
+        # 后 30ms 内只允许 DF/DDF。draft 链排队时释放窗口（链 FIFO 即
+        # 节奏，且防链排空后残留超时误报——原消费函数内联于此）；选中
+        # first 即解除；超时自动解除并打 warning（状态机内）。
+        if self._has_draft_work():
+            self._force.release_for_draft_work()
+        elif self._force.decode_first_only_active():
+            if self._can_schedule_decode_draft_first():
+                self._force.clear_decode_first_only()
+                return self._pick_decode_draft_first_batch()
+            if self._can_schedule_decode_first():
+                self._force.clear_decode_first_only()
+                return self._pick_decode_first_batch()
+            return self._make_empty_batch()
+
+        # [FORCE] prefill 域 first-only 窗口（第 3/4 点强制等待）：PL(MTP)/
+        # 非末跳 PDFL pick 后 15ms 内只允许 PREFILL_DRAFT_FIRST。与
+        # decode 窗口互斥（窗口均在选中 first 或超时时解除，同一时刻
+        # 至多一个激活）。
+        if self._has_draft_work():
+            self._force.release_for_draft_work()
+        elif self._force.prefill_draft_first_only_active():
+            if self._can_schedule_prefill_draft_first():
+                self._force.clear_prefill_draft_first_only()
+                return self._pick_prefill_draft_first_batch()
+            return self._make_empty_batch()
 
         if state == PrefillState.IDLE:
             # IDLE: prefill_draft首 > prefill_draft尾 > P首 > decode_draft首
@@ -1385,14 +1537,14 @@ class PDSeparatedScheduler(Scheduler):
         # 4 域拆分（设计 §6.1）：decode 只受 decode 域标记/队列约束；
         # Phase B 后 prefill_draft 已迁出 DECODE 通道，prefill 域队列
         # 与 remote pending 不再 gate decode 域。
+        # [FORCE] 交替门控收敛到状态机（设计 §6.3.2）。
         return bool(
             self.running
             and self.decode_or_draft_inflight_count == 0
             and self.decode_draft_remote_pending_count == 0
             and not self.decode_drafts_first_ready
             and not self.decode_drafts_last_ready
-            and not self._force_decode_last
-            and not self._force_decode_draft_last
+            and self._force.can_pick_decode_first()
         )
 
     def _can_schedule_prefill_draft_first(self) -> bool:
@@ -1404,7 +1556,8 @@ class PDSeparatedScheduler(Scheduler):
         )
         if is_pregenerated:
             # 语义与旧 _can_schedule_draft_first pregenerated 分支一致：
-            # `not _force_prefill_draft_last` 保证 PDFF -> PDFL 交替；
+            # PDFF -> PDFL 交替由 FORCE 状态机保证
+            # （[FORCE] can_pick_prefill_draft_first，设计 §6.3.2）；
             # 草稿链可流水：下一个 PDFF 在前一个 PDFL 在飞时即可派发。
             # Phase B（设计 §6.1）：prefill 域已迁出 DECODE 通道，decode
             # 头/标记不再 gate prefill 域。
@@ -1412,7 +1565,7 @@ class PDSeparatedScheduler(Scheduler):
                 self.prefill_draft_remote_pending_count
                 < self._prefill_draft_remote_pending_limit
                 and not self.prefill_drafts_last_ready
-                and not self._force_prefill_draft_last
+                and self._force.can_pick_prefill_draft_first()
             )
 
         # Phase B（设计 §4.1）：scheduled draft head/tail 负载走继承的
@@ -1421,7 +1574,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.prefill_draft_remote_pending_count == 0
             and not self.prefill_drafts_last_ready
-            and not self._force_prefill_draft_last
+            and self._force.can_pick_prefill_draft_first()
         )
 
     def _can_schedule_decode_draft_first(self) -> bool:
@@ -1434,25 +1587,25 @@ class PDSeparatedScheduler(Scheduler):
         if is_pregenerated:
             # 与 _can_schedule_prefill_draft_first 的 pregenerated 分支
             # 同构，仅作用于 decode 域计数/标记（设计 §6.1）。
+            # [FORCE] 交替门控收敛到状态机（设计 §6.3.2）。
             return bool(
                 self.decode_head_inflight_count == 0
                 and self.decode_draft_remote_pending_count
                 < self._decode_draft_remote_pending_limit
                 and not self.decode_drafts_last_ready
-                and not self._force_decode_last
-                and not self._force_decode_draft_last
+                and self._force.can_pick_decode_draft_first()
             )
 
         # Scheduled draft head/tail payloads share the DECODE channel.
         # Do not start another head while an earlier head is still remote or
         # its tail is ready locally: otherwise edge and cloud can each wait
         # for the opposite-direction send before posting the matching recv.
+        # [FORCE] 交替门控收敛到状态机（设计 §6.3.2）。
         return bool(
             self.decode_or_draft_inflight_count == 0
             and self.decode_draft_remote_pending_count == 0
             and not self.decode_drafts_last_ready
-            and not self._force_decode_last
-            and not self._force_decode_draft_last
+            and self._force.can_pick_decode_draft_first()
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -1988,6 +2141,11 @@ class PDSeparatedScheduler(Scheduler):
         # tokens are published to the following target verify batch; the
         # worker uses draft_output_req_ids to discard mid-chunk outputs.
         self._pregenerate_draft_chain(so)
+        # 第 3 点强制等待（[FORCE] 设计 §6.3.2）：PL 后下一拍必须紧跟
+        # PREFILL_DRAFT_FIRST（链由 _pregenerate_draft_chain 生成）。状态机
+        # 按构造时的 MTP 使能决定是否启动 prefill 窗口——非 MTP 无链可等，
+        # 启动只会白白锁 15ms（等价现状运行时门控，配置构造后不变）。
+        self._force.on_pick(BatchType.PREFILL_LAST)
         return so
 
     def _validate_prefill_tail_channel(self, scheduler_output: SchedulerOutput) -> None:
@@ -2152,7 +2310,8 @@ class PDSeparatedScheduler(Scheduler):
             # 时 -1（flight 键 draft_task_id:draft_step_idx 配对）。
             # 通道校验在 PDFL 到达 `_pick_draft_last_batch_by_kind` 时进行。
             self.prefill_draft_remote_pending_count += 1
-            self._force_prefill_draft_last = True
+            # [FORCE] PDFF pick → prefill_draft_last_pending（交替门控）
+            self._force.on_pick(BatchType.PREFILL_DRAFT_FIRST)
             # Phase C review: 登记 watchdog 截止时间——云发 PDFL 超过
             # 阈值未到即判定链路故障（丢包/云侧故障），报错退出。
             self._prefill_draft_last_watchdog[
@@ -2184,7 +2343,8 @@ class PDSeparatedScheduler(Scheduler):
             self._validate_decode_draft_tail_channel(draft_last)
             self.decode_drafts_last_ready.append(draft_last)
             self.decode_draft_remote_pending_count += 1
-            self._force_decode_draft_last = True
+            # [FORCE] DDF pick → decode_draft_last_pending（交替门控）
+            self._force.on_pick(BatchType.DECODE_DRAFT_FIRST)
             self._start_decode_draft_last_delay()
             self.decode_or_draft_inflight_count += 1
 
@@ -2578,16 +2738,25 @@ class PDSeparatedScheduler(Scheduler):
             # _run_edge_cloud_draft_last_segment); we also must not spawn a
             # verify placeholder for a dead request.
             if kind == "prefill":
-                self._force_prefill_draft_last = False
                 # 尾已到手（云发或 watchdog 自贴），清 watchdog 条目。
                 self._prefill_draft_last_watchdog.pop(
                     scheduler_output.draft_task_id, None
                 )
-                # prefill 域尾不启动 decode-first-only 窗口（设计 §6.3：
-                # 窗口只对 decode 域有意义）。
+                # 第 4 点强制等待（[FORCE] 设计 §6.3.2）：非最后一个 PDFL
+                # （同 task 仍有未派发的剩余 step PDFF 在队）才启动 15ms
+                # prefill-first-only 窗口强制跟随；最后一跳后无首可等，
+                # 状态机按 prefill_chain_has_more 判定（末跳全清）。
+                self._force.on_pick(
+                    BatchType.PREFILL_DRAFT_LAST,
+                    prefill_chain_has_more=any(
+                        t.draft_task_id == scheduler_output.draft_task_id
+                        for t in self.prefill_drafts_first_ready
+                    ),
+                )
             else:
-                self._force_decode_draft_last = False
-                self._start_decode_or_draft_first_only_window()
+                # [FORCE] DDL pick → 30ms decode first-only 窗口 + 解除
+                # decode_draft_last_pending 交替（设计 §6.3.2）。
+                self._force.on_pick(BatchType.DECODE_DRAFT_LAST)
             output_req_ids = getattr(
                 scheduler_output,
                 "draft_output_req_ids",
@@ -2972,8 +3141,9 @@ class PDSeparatedScheduler(Scheduler):
             f"decodes_last_ready expects DECODE_LAST, got {so.batch_type}"
         )
         self._validate_decode_tail_channel(so)
-        self._start_decode_or_draft_first_only_window()
-        self._force_decode_last = False
+        # [FORCE] DL pick → 30ms decode first-only 窗口 + 解除
+        # decode_last_pending 交替（设计 §6.3.2）。
+        self._force.on_pick(BatchType.DECODE_LAST)
         self._pregenerate_draft_chain(so)
         return so
 
@@ -3049,7 +3219,8 @@ class PDSeparatedScheduler(Scheduler):
                     self.decode_or_draft_inflight_count += 1
                     self.decode_head_inflight_count += 1
                     self._register_pd_flight(scheduler_output)
-                    self._force_decode_last = True
+                    # [FORCE] DF pick → decode_last_pending（交替门控）
+                    self._force.on_pick(BatchType.DECODE_FIRST)
                     self._start_decode_last_delay()
 
                     # === Decode-first self-posting optimization ===
