@@ -2162,8 +2162,17 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                         async_op=True,
                     )
                 )
+            # TP fan-out of the received draft tensors; wait must be
+            # brief (the irecv above already completed).  Logged so a
+            # hang here is distinguishable from a hang in the irecv.
+            logger.info(
+                "[EC2S] waiting %d TP broadcasts of the received draft "
+                "tensors",
+                len(handles),
+            )
             for handle in handles:
                 handle.wait()
+            logger.info("[EC2S] TP broadcasts of the draft tensors complete")
 
         return recv_tensor_dict, comm_handles, [broadcast_postprocess]
 

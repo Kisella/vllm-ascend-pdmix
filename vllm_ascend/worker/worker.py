@@ -24,6 +24,7 @@ import gc
 import logging
 import threading
 import time
+from datetime import timedelta
 from types import NoneType
 
 import torch
@@ -1426,8 +1427,36 @@ class NPUWorker(WorkerBase):
                 channel=channel,
             )
         )
+        # The edge schedules the draft FIRST and self-posts the matching
+        # send, so this irecv must normally complete in milliseconds.
+        # A long wait means the edge never scheduled/sent it (e.g. its
+        # EngineCore is blocked behind a sync D2H in the stash path);
+        # fail with a clear error instead of hanging this worker until
+        # HCCL raises its own SUSPECT REMOTE ERROR minutes later.
+        recv_started = time.monotonic()
         for handle in comm_handles:
-            handle.wait()
+            try:
+                handle.wait(timeout=timedelta(seconds=120))
+            except TypeError:
+                # Backend without timeout support: keep the blocking wait.
+                logger.warning(
+                    "[EC2S] irecv wait() has no timeout support; "
+                    "falling back to the blocking wait"
+                )
+                handle.wait()
+            except Exception as exc:
+                logger.error(
+                    "[EC2S] edge->cloud scheduled draft irecv wait failed "
+                    "after %.1fs: %s",
+                    time.monotonic() - recv_started,
+                    exc,
+                )
+                raise
+            logger.info(
+                "[EC2S] edge->cloud scheduled draft irecv complete "
+                "(%.1fs)",
+                time.monotonic() - recv_started,
+            )
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None

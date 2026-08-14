@@ -4028,6 +4028,17 @@ class NPUModelRunner(GPUModelRunner):
         # crashes in aclnnCat (error EZ1001) once the running batch drops below
         # a capture boundary (e.g. 16 -> 15 requests).
         scheduled_token_count = sum(num_scheduled)
+        # Heartbeat: any further blocking D2H point below is logged
+        # individually, so a stall on the device (e.g. a poisoned DSA
+        # scatter) is pinpointed to the exact sync instead of appearing
+        # as a silent gap between 6012 and the stash-complete log.
+        logger.info(
+            "[MTP-DEBUG] stash: begin task_id=%s reqs=%d "
+            "scheduled_tokens=%d",
+            task_id,
+            num_reqs,
+            scheduled_token_count,
+        )
         draft_positions = positions[:scheduled_token_count].clone()
         # The draft needs the target hidden states of every scheduled token
         # (sample_hidden_states only covers the logits rows).
@@ -4047,6 +4058,13 @@ class NPUModelRunner(GPUModelRunner):
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
             num_rejected = [0] * num_reqs
         elif torch.is_tensor(sampled_token_ids):
+            # Blocking D2H: forces the current stream to drain.  If the
+            # device stalled (e.g. a poisoned DSA scatter on a garbage
+            # slot), this never returns and the edge EngineCore blocks
+            # behind us -- the cloud then times out on the draft irecv.
+            logger.info(
+                "[MTP-DEBUG] stash: D2H sync sampled token ids (blocking)"
+            )
             valid_counts = (
                 (sampled_token_ids[:num_reqs] != -1).sum(dim=1).tolist()
             )
@@ -4066,6 +4084,10 @@ class NPUModelRunner(GPUModelRunner):
             start_offsets[req_idx] = running
             running += n
         total_tokens = running
+        # Second blocking D2H (see the sampled-token-ids sync above).
+        logger.info(
+            "[MTP-DEBUG] stash: D2H sync start offsets (blocking)"
+        )
         start_pos = pos_flat[start_offsets.to(pos_flat.device)].cpu()
         scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
         sample_row_indices = torch.empty(num_reqs, dtype=torch.long)
@@ -6249,6 +6271,33 @@ class NPUModelRunner(GPUModelRunner):
             for req_id in self.input_batch.req_ids
         )
         num_tokens = sum(num_scheduled_tokens)
+
+        # The MTP draft layers read/write the KV cache of the group
+        # their attention layers belong to (draft_attn_groups[0]), not
+        # the target's gid 0.  The frozen gid-0 metadata carries the
+        # compressed C4 block table (256-wide rows): rebuilding draft
+        # slots against it gathers OOB for any position >= 32768 and
+        # poisons the DSA scatter with garbage addresses (MTE / hang
+        # under async launch).  Swap in the draft group's own
+        # uncompressed block table / slot mapping so both the step-0
+        # verbatim metadata and the step>0 rebuild (see
+        # _build_edge_cloud_draft_attn_metadata) stay in range.  PCP is
+        # a single-device feature and never combined with the
+        # scheduled edge-cloud draft path, so pcp_size == 1 here.
+        draft_gid = getattr(self.drafter, "kv_cache_gid", None)
+        if (
+            self.pcp_size == 1
+            and draft_gid is not None
+            and 0 < draft_gid < len(self.input_batch.block_table)
+        ):
+            blk_table = self.input_batch.block_table[draft_gid]
+            frozen_metadata.block_table_tensor = (
+                blk_table.get_device_tensor()[:num_reqs]
+            )
+            frozen_metadata.slot_mapping = (
+                blk_table.slot_mapping.gpu[:num_tokens]
+            )
+
         if positions.shape[-1] < num_tokens:
             raise RuntimeError(
                 "Cloud target positions are shorter than the scheduled "
@@ -6594,19 +6643,41 @@ class NPUModelRunner(GPUModelRunner):
                 and self.drafter is not None
                 and hasattr(self.drafter, "kernel_block_size")
             ):
-                block_size = self.drafter.kernel_block_size
+                # Mirror the proposer's own slot-mapping math
+                # (llm_base_proposer.py): the GDN path divides by the
+                # kernel block size, everything else by the KV group's
+                # real block size.  The previous hardcoded
+                # kernel_block_size (=2) mapped e.g. pos 65519 to
+                # block 32759, which exceeds the compressed C4 block
+                # table's 256-wide rows and gathers OOB garbage.
+                block_size = (
+                    self.drafter.kernel_block_size
+                    if getattr(self.drafter, "has_gdn", False)
+                    else getattr(self.drafter, "block_size", self.drafter.kernel_block_size)
+                )
                 pos_flat = positions if positions.dim() == 1 else positions[0]
                 pos_flat = pos_flat[:batch_size]
                 exceeds = pos_flat >= self.model_config.max_model_len
                 clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
                 block_numbers = clamped // block_size
+                # Row-width clamp: a block_number past the table's last
+                # column must not gather (returns garbage slots that the
+                # DSA scatter kernel dereferences as real addresses).
+                # Such positions map to PADDING_SLOT_ID instead.
+                row_width = block_table_tensor.shape[1]
+                exceeds_row = block_numbers >= row_width
+                safe_block_numbers = torch.where(
+                    exceeds_row, torch.zeros_like(block_numbers), block_numbers
+                )
                 block_ids = block_table_tensor[:batch_size].gather(
-                    dim=1, index=block_numbers.view(-1, 1).long()
+                    dim=1, index=safe_block_numbers.view(-1, 1).long()
                 ).view(-1)
                 new_slot_mapping = (
                     block_ids * block_size + clamped % block_size
                 ).to(torch.int32)
-                new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+                new_slot_mapping.masked_fill_(
+                    exceeds | exceeds_row, PADDING_SLOT_ID
+                )
                 common_attn_metadata.slot_mapping = new_slot_mapping
         else:
             # For the first speculative step, preserve the original attn_state
