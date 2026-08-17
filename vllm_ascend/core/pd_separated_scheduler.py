@@ -113,6 +113,11 @@ class HiddenChannelManager:
             for i in range(prefill_start, prefill_start + prefill_per_dp)
         )
         self._decode_channel = HiddenChannelType.decode(dp_rank + 1)
+        # MTP draft data plane: DECODE_DRAFT_* batches travel on their own
+        # channel so the draft chain never contends with the shared DECODE
+        # channel.  One draft channel per dp_rank, fixed like decode (no
+        # free-list).
+        self._draft_channel = HiddenChannelType.draft(dp_rank + 1)
         self._head_token_to_channel: dict[str, HiddenChannelType] = {}
 
     # ------------------------------------------------------------------ #
@@ -154,6 +159,10 @@ class HiddenChannelManager:
     # ------------------------------------------------------------------ #
     def decode_channel(self) -> HiddenChannelType:
         return self._decode_channel
+
+    def draft_channel(self) -> HiddenChannelType:
+        """Dedicated MTP draft channel for this dp_rank."""
+        return self._draft_channel
 
     # ------------------------------------------------------------------ #
     # Introspection                                                      #
@@ -553,6 +562,19 @@ class PDSeparatedScheduler(Scheduler):
         # （默认）再调度，保留解码域 pacing（设计 §6.2）。
         self._decode_draft_last_delay_start_ts: float | None = None
         self._decode_draft_last_delay_schedule_ms: int = 15
+
+        # [EHER-draft] DDL recv-readiness ack gate: when enabled, a queued
+        # DECODE_DRAFT_LAST is schedulable the moment the edge TP0 worker
+        # reports its return irecv complete (worker report thread ->
+        # edge_recv_ready_mq -> EngineCore._drain_draft_recv_acks ->
+        # notify_draft_recv_ready), replacing fixed-delay pacing with
+        # data-plane readiness.  A timeout fallback (10x the delay, min
+        # 100ms) keeps the gate safe when no ack ever arrives (TP1-only
+        # worker mix, SP compat path, or sideband MQ not attached).
+        # Default off: legacy delay pacing unless the deployment yaml sets
+        # decode_draft_recv_ack_enable.
+        self._decode_draft_recv_ack_enable: bool = False
+        self._draft_recv_ready_acks: set[str] = set()
 
         # [MTP] PREFILL_DRAFT_LAST delay scheduling。
         # Phase A：prefill_draft 保持旧行为（边侧自贴尾 + 延迟，默认 10ms
@@ -1596,11 +1618,27 @@ class PDSeparatedScheduler(Scheduler):
                 and self._force.can_pick_decode_draft_first()
             )
 
-        # Scheduled draft head/tail payloads share the DECODE channel.
-        # Do not start another head while an earlier head is still remote or
-        # its tail is ready locally: otherwise edge and cloud can each wait
-        # for the opposite-direction send before posting the matching recv.
-        # [FORCE] 交替门控收敛到状态机（设计 §6.3.2）。
+        # Scheduled draft head/tail payloads used to share the DECODE
+        # channel, forcing full serialization (==0 gate): with a second
+        # chain in flight, edge and cloud could each wait for the
+        # opposite-direction send before posting the matching recv.  With
+        # the dedicated DRAFT channel (P0) per-direction FIFO matching
+        # makes concurrent chains safe, so when pipelining is enabled the
+        # gate relaxes to the pregenerated form: inflight < limit and
+        # remote_pending < limit (default 2).  Off (legacy ==0) by default.
+        self._decode_draft_pipeline_enable: bool = False
+        if self._decode_draft_pipeline_enable:
+            # inflight_limit is hardcoded 1 (legacy); under pipelining the
+            # effective cap is the same remote-pending limit (default 2)
+            # that governs the pregenerated branch.
+            return bool(
+                self.decode_or_draft_inflight_count
+                < self._decode_draft_remote_pending_limit
+                and self.decode_draft_remote_pending_count
+                < self._decode_draft_remote_pending_limit
+                and not self.decode_drafts_last_ready
+                and self._force.can_pick_decode_draft_first()
+            )
         return bool(
             self.decode_or_draft_inflight_count == 0
             and self.decode_draft_remote_pending_count == 0
@@ -1728,6 +1766,29 @@ class PDSeparatedScheduler(Scheduler):
                             _key, raw[_key], yaml_path,
                             getattr(self, _attr),
                         )
+            # [EHER-draft] Readiness-ack gate switch: replace the fixed
+            # DDL delay pacing with worker-reported recv readiness (see
+            # _can_schedule_decode_draft_last).  Off by default.
+            _ack_raw = raw.get("decode_draft_recv_ack_enable")
+            if _ack_raw is not None:
+                self._decode_draft_recv_ack_enable = bool(_ack_raw)
+                logger.info(
+                    "[PDSeparatedScheduler] decode_draft_recv_ack_enable "
+                    "set to %s from %s",
+                    self._decode_draft_recv_ack_enable, yaml_path,
+                )
+            # [P2] Decode-draft pipelining switch: relax the serial ==0
+            # draft-first gate to < limit now that drafts own the DRAFT
+            # channel (see _can_schedule_decode_draft_first).  Off by
+            # default.
+            _pipe_raw = raw.get("decode_draft_pipeline_enable")
+            if _pipe_raw is not None:
+                self._decode_draft_pipeline_enable = bool(_pipe_raw)
+                logger.info(
+                    "[PDSeparatedScheduler] decode_draft_pipeline_enable "
+                    "set to %s from %s",
+                    self._decode_draft_pipeline_enable, yaml_path,
+                )
             self._layer_slice_config_path = yaml_path
             self._layer_slice_config_mtime = os.path.getmtime(yaml_path)
         except Exception:
@@ -1785,8 +1846,41 @@ class PDSeparatedScheduler(Scheduler):
         """
         self._decode_draft_last_delay_start_ts = time.monotonic()
 
+    def notify_draft_recv_ready(self, head_token: str) -> None:
+        """[EHER-draft] Worker reported a DDL return irecv complete."""
+        self._draft_recv_ready_acks.add(head_token)
+
     def _can_schedule_decode_draft_last(self) -> bool:
         """Return True if the delay since DECODE_DRAFT_FIRST has elapsed."""
+        if self._decode_draft_recv_ack_enable:
+            # Readiness gate: the oldest queued DDL is schedulable once its
+            # return transfer has landed (worker ack).  Fallback to the
+            # delay timer after a safety timeout so a missing ack path
+            # (no early post / sideband not attached) can never stall the
+            # pipeline -- tails must always eventually execute to keep the
+            # hidden channel paired.
+            if not self.decode_drafts_last_ready:
+                return True
+            front = self.decode_drafts_last_ready[0]
+            head_token = getattr(front, "head_token", None)
+            if head_token is None or head_token in self._draft_recv_ready_acks:
+                return True
+            if self._decode_draft_last_delay_start_ts is not None:
+                elapsed_ms = (
+                    time.monotonic()
+                    - self._decode_draft_last_delay_start_ts
+                ) * 1000
+                timeout_ms = max(
+                    10 * self._decode_draft_last_delay_schedule_ms, 100
+                )
+                if elapsed_ms >= timeout_ms:
+                    logger.warning(
+                        "[EHER-draft] DDL head_token=%s ack timeout after "
+                        "%.0fms; dispatching on the delay fallback",
+                        head_token, elapsed_ms,
+                    )
+                    return True
+            return False
         if self._decode_draft_last_delay_start_ts is None:
             return True
         elapsed_ms = (
@@ -2215,10 +2309,13 @@ class PDSeparatedScheduler(Scheduler):
             raise RuntimeError("DECODE_DRAFT_LAST missing draft_task_id")
         if scheduler_output.draft_step_idx is None:
             raise RuntimeError("DECODE_DRAFT_LAST missing draft_step_idx")
-        if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
+        if scheduler_output.hidden_channel != (
+            self.hidden_channel_manager.draft_channel()
+        ):
             raise RuntimeError(
-                "DECODE_DRAFT_LAST expects decode hidden channel, got "
-                f"{scheduler_output.hidden_channel}"
+                "DECODE_DRAFT_LAST expects the dedicated draft hidden "
+                f"channel {self.hidden_channel_manager.draft_channel()}, "
+                f"got {scheduler_output.hidden_channel}"
             )
 
     def _pick_prefill_draft_first_batch(self) -> SchedulerOutput:
@@ -2293,8 +2390,12 @@ class PDSeparatedScheduler(Scheduler):
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
         if kind == "decode":
-            # decode 域固定 DECODE 通道（设计 §4.2）。
-            scheduler_output.hidden_channel = HiddenChannelType.DECODE
+            # decode_draft 域走独立 DRAFT 通道（不再与 DECODE 共享，这是
+            # 放宽 draft 串行门控的前提：共享通道时边云可能互相等对方
+            # 方向的 send 才 post 匹配 recv，会死锁）。
+            scheduler_output.hidden_channel = (
+                self.hidden_channel_manager.draft_channel()
+            )
         elif scheduler_output.hidden_channel is None:
             # Phase B（设计 §4.1）：prefill 域链在 enqueue 时已继承父 chunk
             # 的 Prefill 通道；缺失说明链创建路径漏了继承。
@@ -2434,7 +2535,11 @@ class PDSeparatedScheduler(Scheduler):
         else:
             first_type = BatchType.DECODE_DRAFT_FIRST
             ready_queue = self.decode_drafts_first_ready
-            inherited_channel = HiddenChannelType.DECODE
+            # decode_draft 占位链继承 DRAFT 通道（与 _pick_draft_first_
+            # batch_by_kind 的 decode 分支一致）。
+            inherited_channel = (
+                self.hidden_channel_manager.draft_channel()
+            )
         req_ids = list(target_tail.num_scheduled_tokens)
         if not req_ids or any(
             req_id not in self.requests for req_id in req_ids
@@ -2587,7 +2692,11 @@ class PDSeparatedScheduler(Scheduler):
         else:
             first_type = BatchType.DECODE_DRAFT_FIRST
             ready_queue = self.decode_drafts_first_ready
-            inherited_channel = HiddenChannelType.DECODE
+            # decode_draft 链固定 DRAFT 通道（独立数据面，见
+            # HiddenChannelManager.draft_channel）。
+            inherited_channel = (
+                self.hidden_channel_manager.draft_channel()
+            )
         req_ids = list(source.num_scheduled_tokens)
         # With KV retention, finished requests stay in self.requests until
         # their draft chain releases them, so this refusal only fires when
@@ -2756,6 +2865,12 @@ class PDSeparatedScheduler(Scheduler):
             else:
                 # [FORCE] DDL pick → 30ms decode first-only 窗口 + 解除
                 # decode_draft_last_pending 交替（设计 §6.3.2）。
+                # [EHER-draft] Consume the readiness ack for this flight
+                # (bounds _draft_recv_ready_acks growth; a re-posted DDF
+                # under the same head_token starts with a clean marker).
+                self._draft_recv_ready_acks.discard(
+                    scheduler_output.head_token
+                )
                 self._force.on_pick(BatchType.DECODE_DRAFT_LAST)
             output_req_ids = getattr(
                 scheduler_output,

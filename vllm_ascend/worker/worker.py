@@ -249,6 +249,18 @@ class NPUWorker(WorkerBase):
         # used.
         self._cloud_hidden_early_recv_enabled: bool = False
 
+        # [EHER-draft] Edge-side early irecv of the DECODE_DRAFT_LAST (DDL)
+        # return tensors.  Keyed by head_token; posted by TP0 at the end of
+        # the matching DECODE_DRAFT_FIRST (DDF) send block, consumed by
+        # _execute_model_edge_draft_tail.  The AsyncIntermediateTensors
+        # carries the ``__comm_event__`` NPU event so busy_loop can poll
+        # readiness and ack the scheduler without touching HCCL.
+        self._draft_recv_cache: dict[str, AsyncIntermediateTensors] = {}
+        self._draft_recv_lock = threading.Lock()
+        # head_tokens whose readiness has already been reported through
+        # edge_recv_ready_mq (poll-phase dedup).
+        self._draft_recv_reported: set[str] = set()
+
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
             # Prevent duplicate triggers, execute the exit logic only once
@@ -952,6 +964,86 @@ class NPUWorker(WorkerBase):
             self._early_recv_handles.pop(head_token, None)
             self._early_recv_consumed.discard(head_token)
 
+    def _post_draft_return_irecv(
+        self, scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """[EHER-draft] Post the DDL return irecv while the DDF send drains.
+
+        Called at the end of the DECODE_DRAFT_FIRST (DDF) send block, on the
+        PP rank with world_size==2 only (edge TP0; TP1 receives the DDL via
+        the TP broadcast postprocess, so no early post there).  The decode-
+        domain DDL is self-posted by the edge scheduler at DDF pick time via
+        ``replace()`` -- which preserves draft_step_idx / token counts /
+        head_token -- so the c2e meta derived here is byte-identical to the
+        one the DDL execute would derive, and the posted irecv shapes always
+        match the cloud's isend.  The recv now overlaps the remaining DDF
+        work plus the scheduler round trip instead of serializing behind
+        the DDL dispatch.
+
+        Fails soft: any error keeps the sync fallback path in
+        ``_execute_model_edge_draft_tail`` (a second irecv would only be
+        posted if the cached entry is absent, which the exception path
+        guarantees by not caching).
+        """
+        if get_pp_group().world_size != 2:
+            return
+        if scheduler_output.batch_type != BatchType.DECODE_DRAFT_FIRST:
+            return
+        head_token = scheduler_output.head_token
+        if not head_token:
+            return
+        with self._draft_recv_lock:
+            if head_token in self._draft_recv_cache:
+                return
+        # SP-on / drafter-less configs stay on the sync compat path (the
+        # scheduled-draft wire schema is not derivable there).
+        tensor_meta = self._scheduled_draft_tensor_meta(scheduler_output, "c2e")
+        if tensor_meta is None:
+            return
+        channel = self._hidden_channel_for(scheduler_output)
+        try:
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv_scheduled_draft(
+                    tensor_meta=tensor_meta, channel=channel,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "[EHER-draft] early DDL irecv post failed head_token=%s",
+                head_token,
+            )
+            return
+        comm_event = tensor_dict.pop("__comm_event__", None)
+        entry = AsyncIntermediateTensors(
+            tensor_dict,
+            comm_handles=comm_handles,
+            comm_postprocess=comm_postprocess,
+            comm_event=comm_event,
+        )
+        with self._draft_recv_lock:
+            # Re-check: a same-token post cannot have raced (single-threaded
+            # execute path), but stay explicit for future callers.
+            self._draft_recv_cache[head_token] = entry
+
+    def _consume_draft_recv(
+        self, scheduler_output: "SchedulerOutput",
+    ) -> AsyncIntermediateTensors | None:
+        """Pop the cached early DDL recv for this batch, if any.
+
+        On hit, the returned entry is fully lazy: the NPU transfer may still
+        be in flight and ``wait_for_comm()`` (waits handles, then runs the
+        TP broadcast postprocess) fires on first ``.tensors`` access inside
+        the draft LAST segment.  On miss (TP1, SP compat path, or a failed
+        early post) the caller falls back to the sync recv.
+        """
+        head_token = scheduler_output.head_token
+        if not head_token:
+            return None
+        with self._draft_recv_lock:
+            entry = self._draft_recv_cache.pop(head_token, None)
+            self._draft_recv_reported.discard(head_token)
+        return entry
+
     def _all_gather_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor],
@@ -1065,7 +1157,11 @@ class NPUWorker(WorkerBase):
             BatchType.DECODE_DRAFT_FIRST,
             BatchType.DECODE_DRAFT_LAST,
         ):
-            return HiddenChannelType.DECODE
+            # MTP draft data plane travels on its dedicated DRAFT channel
+            # (scheduler writes it at pick time; this is the fallback when
+            # the SchedulerOutput carries no channel).  Sharing the DECODE
+            # channel would force the scheduler's draft serialization gate.
+            return HiddenChannelType.DRAFT
         if bt in (
             BatchType.PREFILL_DRAFT_FIRST,
             BatchType.PREFILL_DRAFT_LAST,
@@ -1527,6 +1623,12 @@ class NPUWorker(WorkerBase):
                 ),
                 channel=channel,
             )
+            # [EHER-draft] DDF send recorded; the matching decode-domain DDL
+            # is already self-posted on the edge scheduler, so the cloud's
+            # return isend can land any moment -- post our side of the DDL
+            # recv now (TP0 only) so the transfer overlaps the remaining
+            # work instead of starting at DDL dispatch.
+            self._post_draft_return_irecv(scheduler_output)
             logger.info(
                 "Send intermediate tensors to cloud, "
                 f"hidden_channel: {channel.value}"
@@ -1542,11 +1644,20 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput:
         """Receive and finish one edge-side scheduled draft step."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        channel = self._hidden_channel_for(scheduler_output)
+        # [EHER-draft] Prefer the entry TP0 posted at DDF time: the NPU
+        # transfer has been overlapping since then, and wait_for_comm()
+        # (inside the lazy .tensors access) degenerates to a no-op wait
+        # when the event already fired.  Miss => sync fallback below.
+        entry = self._consume_draft_recv(scheduler_output)
+        if entry is not None:
+            return self.model_runner._run_edge_cloud_draft_last_segment(
+                scheduler_output, entry
+            )
         recv_tensor_meta = self._scheduled_draft_tensor_meta(
             scheduler_output,
             "c2e",
         )
-        channel = self._hidden_channel_for(scheduler_output)
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_scheduled_draft(
                 tensor_meta=recv_tensor_meta,

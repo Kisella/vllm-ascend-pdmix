@@ -172,6 +172,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             self._prefill_cpu_groups: list[torch.distributed.ProcessGroup] = []
             self._decode_device_groups: list[torch.distributed.ProcessGroup] = []
             self._decode_cpu_groups: list[torch.distributed.ProcessGroup] = []
+            # DRAFT channels (MTP draft data plane): _draft_device_groups[idx]
+            # idx 0 -> DRAFT_1 (pg_options="pp_draft1")
+            self._draft_device_groups: list[torch.distributed.ProcessGroup] = []
+            self._draft_cpu_groups: list[torch.distributed.ProcessGroup] = []
 
             # Seed index-0 with the primary PP group (PREFILL_1) so that
             # len(_prefill_device_groups) is 1 and the range in
@@ -277,7 +281,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         # Destroy hidden channel groups (array-based).
         for groups in (self._prefill_device_groups, self._prefill_cpu_groups,
-                       self._decode_device_groups, self._decode_cpu_groups):
+                       self._decode_device_groups, self._decode_cpu_groups,
+                       self._draft_device_groups, self._draft_cpu_groups):
             for pg in groups:
                 if pg is not None:
                     torch.distributed.destroy_process_group(pg)
@@ -285,6 +290,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self._prefill_cpu_groups.clear()
         self._decode_device_groups.clear()
         self._decode_cpu_groups.clear()
+        self._draft_device_groups.clear()
+        self._draft_cpu_groups.clear()
 
     def destroy_hccl(self) -> bool:
         """Release the HCCL process group."""
@@ -350,6 +357,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         torch_distributed_backend: str | Backend,
         num_prefill: int = 2,
         num_decode: int = 1,
+        num_draft: int = 0,
     ) -> None:
         """Create extra hidden-channel groups for DP-scalable PD separation.
 
@@ -360,6 +368,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         This method adds:
           - PREFILL_2..num_prefill  (append to ``_prefill_device_groups``)
           - DECODE_2..num_decode    (append to ``_decode_device_groups``)
+          - DRAFT_1..num_draft      (append to ``_draft_device_groups``)
 
         Each group uses a unique ``pg_options`` name for HCCL stream isolation.
         """
@@ -376,6 +385,15 @@ class GroupCoordinatorPatch(GroupCoordinator):
             self._create_one_hidden_channel(
                 f"pp_decode{i}", torch_distributed_backend,
                 self._decode_device_groups, self._decode_cpu_groups,
+            )
+
+        # --- DRAFT groups (1..K, MTP draft data plane) ---
+        # Unlike prefill/decode there is no index-0 seed: DRAFT_1 is always a
+        # dedicated pg ("pp_draft1"), never the shared primary group.
+        for i in range(len(self._draft_device_groups) + 1, num_draft + 1):
+            self._create_one_hidden_channel(
+                f"pp_draft{i}", torch_distributed_backend,
+                self._draft_device_groups, self._draft_cpu_groups,
             )
 
     def _create_one_hidden_channel(
@@ -487,6 +505,9 @@ class GroupCoordinatorPatch(GroupCoordinator):
         if value.startswith("decode_"):
             idx = int(value.split("_")[1]) - 1
             return self._decode_device_groups[idx], self._decode_cpu_groups[idx]
+        if value.startswith("draft_"):
+            idx = int(value.split("_")[1]) - 1
+            return self._draft_device_groups[idx], self._draft_cpu_groups[idx]
         raise ValueError(f"Unknown hidden channel: {channel}")
 
     def send_object_on_hidden_channel(

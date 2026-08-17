@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import pickle
+import time
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -151,6 +152,21 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         else:
             # Clean any stale handle so a non-cloud worker does not pick it up.
             os.environ.pop(_CLOUD_RECV_HINT_MQ_ENV, None)
+
+        # [EHER-draft] Edge-side draft-recv readiness sideband.  Direction is
+        # worker -> EngineCore (opposite of cloud_recv_hint_mq), and a
+        # MessageQueue writer must be the creating instance, so the edge TP0
+        # worker creates the MQ inside _init_message_queues and exports its
+        # handle through a node-local file; the reader side is attached after
+        # the workers are ready (see _eher_attach_edge_recv_ready_mq below).
+        # The worker's report thread probes the DDL return irecv's NPU event
+        # (posted at DDF time) and publishes ready head_tokens here; the
+        # EngineCore drains them next to _drain_pd_channel_inbox and the
+        # PDSeparatedScheduler gates DDL dispatch on the ack.  Dedicated MQ
+        # (not rpc_broadcast_mq / response_mq) for the same reason as
+        # cloud_recv_hint_mq: busy_loop and the batch_queue future collect
+        # must not be on this path.
+        self.edge_recv_ready_mq: MessageQueue | None = None
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -194,6 +210,11 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
             # Wait for all local workers to be ready.
             self.workers = AscendWorkerProc.wait_for_ready(unready_workers)
+
+            # [EHER-draft] Attach the EngineCore-side reader of the DDL
+            # recv-readiness sideband (written by the TP0 worker during
+            # _init_message_queues, i.e. before it signalled READY above).
+            self._eher_attach_edge_recv_ready_mq()
 
             # Start background thread to monitor worker health if not in headless mode.
             if self.monitor_workers:
@@ -260,6 +281,55 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
+
+    def _eher_attach_edge_recv_ready_mq(self) -> None:
+        """[EHER-draft] Create the reader side of edge_recv_ready_mq.
+
+        The edge TP0 worker created the MQ (writer) during
+        _init_message_queues and exported its handle to a node-local file;
+        by the time workers are READY that file exists.  Read it once
+        (short retry for robustness), build the reader instance, and
+        remove the file.  Failure is soft: the scheduler falls back to the
+        fixed DDL dispatch delay.
+        """
+        if not (
+            self.parallel_config.enable_edge_cloud
+            and self.parallel_config.is_edge_node
+            and _cloud_pd_enabled(self.vllm_config)
+        ):
+            return
+        _path = _eher_ready_handle_path(self.vllm_config)
+        _raw = None
+        _deadline = time.monotonic() + 30.0
+        while _raw is None and time.monotonic() < _deadline:
+            try:
+                with open(_path, "r", encoding="utf-8") as _f:
+                    _raw = _f.read().strip()
+            except FileNotFoundError:
+                time.sleep(0.05)
+        if not _raw:
+            logger.warning(
+                "[EHER-draft] no ready-handle file at %s; readiness acks "
+                "disabled (scheduler falls back to the delay gate)",
+                _path,
+            )
+            return
+        try:
+            _handle = pickle.loads(base64.b64decode(_raw))
+            self.edge_recv_ready_mq = MessageQueue.create_from_handle(
+                _handle, 0
+            )
+            os.remove(_path)
+            logger.info(
+                "[EHER-draft] edge_recv_ready_mq reader attached on edge "
+                "executor"
+            )
+        except Exception:
+            logger.exception(
+                "[EHER-draft] failed to attach edge_recv_ready_mq; "
+                "readiness acks disabled"
+            )
+            self.edge_recv_ready_mq = None
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
@@ -359,6 +429,7 @@ class AscendWorkerProc(WorkerProc):
         # WorkerProc instances that worker_main actually creates.  Initialize
         # the attribute here for the AscendWorkerProc path (if ever taken).
         self.cloud_recv_hint_mq: MessageQueue | None = None
+        self.edge_recv_ready_mq: MessageQueue | None = None
 
     @staticmethod
     def make_worker_process(
@@ -430,6 +501,9 @@ _orig_init_message_queues = _OrigWorkerProc._init_message_queues
 
 def _cher_init_message_queues(self, input_shm_handle, vllm_config):
     _orig_init_message_queues(self, input_shm_handle, vllm_config)
+    # [EHER-draft] Chain the edge readiness-MQ rebuild (no-op on cloud /
+    # non-rank0 workers, so the CHER early-return below is unaffected).
+    _eher_init_edge_recv_ready_mq(self, vllm_config)
     # Only rebuild if not already done by AscendWorkerProc._init_message_queues.
     if getattr(self, "cloud_recv_hint_mq", None) is not None:
         return
@@ -460,6 +534,65 @@ def _cher_init_message_queues(self, input_shm_handle, vllm_config):
             self.local_rank,
         )
         self.cloud_recv_hint_mq = None
+
+
+def _eher_ready_handle_path(vllm_config) -> str:
+    """Node-local file the edge TP0 worker exports its MQ handle through.
+
+    Keyed on master_port + dp_rank so concurrent deployments on one host do
+    not collide; the parent (EngineCore's executor) reads it after the
+    workers are ready and then removes it.
+    """
+    import tempfile
+    pc = vllm_config.parallel_config
+    dp_rank = getattr(pc, "data_parallel_rank", 0)
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"vllm_eher_ready_{pc.master_port}_{dp_rank}.handle",
+    )
+
+
+def _eher_init_edge_recv_ready_mq(self, vllm_config):
+    """[EHER-draft] Create edge_recv_ready_mq on the edge TP0 worker.
+
+    Direction is worker -> EngineCore, and only the creating MessageQueue
+    instance can enqueue, so the worker (local_rank==0, the rank that posts
+    the DDL return irecv) creates the MQ here and exports its handle via a
+    node-local file that the executor reads once the workers are ready.
+    Non-qualifying workers just get the None attribute so busy_loop's
+    report-thread start check stays a no-op.
+    """
+    self.edge_recv_ready_mq: MessageQueue | None = None
+    if not (
+        self.local_rank == 0
+        and vllm_config.parallel_config.is_edge_node
+    ):
+        return
+    try:
+        # 64 slots x 1KB: at most a handful of DDL recvs are ever in
+        # flight; the ring absorbs EngineCore scheduling latency.  No
+        # wait_until_ready() here -- enqueue does not require the reader
+        # to be connected, and the reader attaches during executor init
+        # (before the first DDF can execute).
+        self.edge_recv_ready_mq = MessageQueue(
+            1, 1, max_chunk_bytes=1024, max_chunks=64,
+        )
+        _handle = self.edge_recv_ready_mq.export_handle()
+        _path = _eher_ready_handle_path(vllm_config)
+        with open(_path, "w", encoding="utf-8") as _f:
+            _f.write(base64.b64encode(pickle.dumps(_handle)).decode())
+        logger.info(
+            "[EHER-draft] edge_recv_ready_mq created on worker "
+            "local_rank=%d, handle exported to %s",
+            self.local_rank, _path,
+        )
+    except Exception:
+        logger.exception(
+            "[EHER-draft] failed to create edge_recv_ready_mq on worker "
+            "local_rank=%d; readiness acks disabled (scheduler falls "
+            "back to the delay gate)", self.local_rank,
+        )
+        self.edge_recv_ready_mq = None
 
 
 _OrigWorkerProc._init_message_queues = _cher_init_message_queues

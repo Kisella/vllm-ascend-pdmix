@@ -582,21 +582,23 @@ def init_ascend_model_parallel(
                 if parallel_config.is_shared_model_edge:
                     num_prefill = dp_size * 2
                     num_decode = dp_size
+                    num_draft = dp_size
                 else:
                     num_prefill = 2
                     num_decode = 1
+                    num_draft = 1
                 logger.info(
                     "[PD] create_hidden_channel_groups: "
-                    "dp_size=%s dp_rank=%s num_prefill=%s num_decode=%s, "
-                    "edge_npu_count=%s",
+                    "dp_size=%s dp_rank=%s num_prefill=%s num_decode=%s "
+                    "num_draft=%s, edge_npu_count=%s",
                     dp_size,
                     getattr(parallel_config, "data_parallel_rank", 0),
-                    num_prefill, num_decode,
+                    num_prefill, num_decode, num_draft,
                     edge_npu_count,
                 )
                 HiddenChannelType.init(dp_size=num_decode)
                 pp_group.create_hidden_channel_groups(
-                    backend, num_prefill, num_decode,
+                    backend, num_prefill, num_decode, num_draft,
                 )
             else:
                 HiddenChannelType.init(dp_size=1)
@@ -1036,6 +1038,7 @@ def warmup_edge_cloud_hidden_channels(
 
     prefill_groups = getattr(pp_group, "_prefill_device_groups", None)
     decode_groups = getattr(pp_group, "_decode_device_groups", None)
+    draft_groups = getattr(pp_group, "_draft_device_groups", None)
     channel_peers: list[tuple[HiddenChannelType, int]] = []
     if prefill_groups is not None and decode_groups is not None:
         num_prefill = len(prefill_groups)
@@ -1083,6 +1086,13 @@ def warmup_edge_cloud_hidden_channels(
                         decode_start + decode_per_dp,
                     )
                 )
+            # DRAFT channels (MTP draft data plane): one per dp_rank, peer =
+            # that dp_rank's cloud first-worker (same mapping as decode).
+            if draft_groups:
+                for dp_rank in range(min(len(draft_groups), dp_size)):
+                    channel_peers.append(
+                        (HiddenChannelType.draft(dp_rank + 1), dp_rank + 1)
+                    )
         else:
             if pp_group.world_size != 2:
                 logger.warning(
@@ -1099,6 +1109,11 @@ def warmup_edge_cloud_hidden_channels(
                 (HiddenChannelType.decode(channel_idx), 1)
                 for channel_idx in range(1, num_decode + 1)
             )
+            if draft_groups:
+                channel_peers.extend(
+                    (HiddenChannelType.draft(channel_idx), 1)
+                    for channel_idx in range(1, len(draft_groups) + 1)
+                )
     else:
         # Backward compatibility with the original three-channel layout.
         channel_peers.append((HiddenChannelType.PREFILL_1, 1))
@@ -1568,6 +1583,21 @@ def edge_cloud_irecv_tensor_dict(
             if full_tensor.numel() > 0:
                 full_tensor.zero_()
         tensor_dict[key] = full_tensor
+
+    # [MTP async tail] Record one NPU event on the channel stream covering
+    # every irecv issued above (they all share the channel stream, so a
+    # single event suffices).  ``event.query()`` then provides a
+    # non-blocking "recv done" signal the worker can poll - we use an
+    # explicit device event because HCCL ``Work.is_completed`` support is
+    # uncertain.  The event rides on the dict under a private key; the
+    # edge worker pops it when constructing AsyncIntermediateTensors.
+    if handles:
+        with _hidden_channel_stream_ctx(
+            channel, wait_for_default=False
+        ):
+            comm_event = torch.npu.Event()
+            comm_event.record()
+        tensor_dict["__comm_event__"] = comm_event
 
     return tensor_dict, handles, postprocess
 
@@ -2139,6 +2169,18 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                     device=value.device,
                 )
             recv_tensor_dict[key] = tensor
+
+        # [EHER] Record one NPU event on the channel stream covering every
+        # draft irecv issued above.  ``event.query()`` gives the edge worker
+        # a non-blocking readiness probe so the scheduler can gate the draft
+        # LAST dispatch on data-plane readiness instead of a fixed delay.
+        if comm_handles:
+            with _hidden_channel_stream_ctx(
+                channel, wait_for_default=False
+            ):
+                comm_event = torch.npu.Event()
+                comm_event.record()
+            recv_tensor_dict["__comm_event__"] = comm_event
 
         def broadcast_postprocess():
             handles = []

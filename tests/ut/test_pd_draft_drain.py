@@ -36,6 +36,7 @@ Regression coverage for the edge-side MTP draft deadlock fixes:
 """
 
 from collections import deque
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -74,6 +75,13 @@ def _make_bare_scheduler():
     s.decode_or_draft_inflight_count = 0
     s.decode_or_draft_inflight_limit = 1
     s.decode_head_inflight_count = 0
+    # [EHER-draft] P1/P2 gate state: ack set + switches + delay fallback
+    # baseline (see _can_schedule_decode_draft_first/_last).
+    s._decode_draft_pipeline_enable = False
+    s._decode_draft_recv_ack_enable = False
+    s._draft_recv_ready_acks = set()
+    s._decode_draft_last_delay_start_ts = None
+    s._decode_draft_last_delay_schedule_ms = 15
     # [FORCE] 状态机（设计 §6.3.2）：交替与窗口状态在此驱动/断言。
     s._force = EdgeForceStateMachine()
     s.num_spec_tokens = 3
@@ -86,7 +94,7 @@ def _make_draft_first(task_id="task-0", req_id="req-0", step=0):
     so.draft_task_id = task_id
     so.draft_step_idx = step
     so.head_token = f"tok-{task_id}-{step}"
-    so.hidden_channel = HiddenChannelType.DECODE
+    so.hidden_channel = HiddenChannelType.DRAFT
     so.num_scheduled_tokens = {req_id: 1}
     so.parent_req_id = req_id
     so.num_accepted_tokens = None
@@ -102,7 +110,7 @@ def _make_draft_last(task_id="task-0", req_id="req-0", step=0):
     so.draft_task_id = task_id
     so.draft_step_idx = step
     so.head_token = f"tok-{task_id}-{step}"
-    so.hidden_channel = HiddenChannelType.DECODE
+    so.hidden_channel = HiddenChannelType.DRAFT
     so.num_scheduled_tokens = {req_id: 1}
     so.parent_req_id = req_id
     so.is_last_prefill_chunk = True
@@ -196,6 +204,80 @@ class TestCanScheduleDecodeDraftFirstForceGuard:
         s = self._setup(pregenerated=False)
         s._force.decode_draft_last_pending = True
         assert s._can_schedule_decode_draft_first() is False
+
+
+class TestDecodeDraftPipelineGate:
+    """[P2-1] With decode_draft_pipeline_enable, the serial ==0 gate relaxes
+    to < limit (drafts own the dedicated DRAFT channel; per-direction FIFO
+    matching makes concurrent chains safe).  Legacy behavior is unchanged
+    while the switch is off."""
+
+    def _setup(self):
+        s = _make_bare_scheduler()
+        s.decode_drafts_first_ready.append(_make_draft_first())
+        s._force.decode_last_pending = False
+        s._force.decode_draft_last_pending = False
+        return s
+
+    def test_legacy_serial_gate_blocks_second_head(self):
+        s = self._setup()
+        s.decode_or_draft_inflight_count = 1
+        s.decode_draft_remote_pending_count = 1
+        assert s._can_schedule_decode_draft_first() is False
+
+    def test_pipeline_allows_second_head_under_limit(self):
+        s = self._setup()
+        s._decode_draft_pipeline_enable = True
+        s.decode_or_draft_inflight_count = 1
+        s.decode_draft_remote_pending_count = 1
+        assert s._can_schedule_decode_draft_first() is True
+
+    def test_pipeline_blocked_at_limit(self):
+        s = self._setup()
+        s._decode_draft_pipeline_enable = True
+        s.decode_draft_remote_pending_count = 2  # == limit (2)
+        assert s._can_schedule_decode_draft_first() is False
+
+    def test_pipeline_blocked_when_last_ready_unpicked(self):
+        s = self._setup()
+        s._decode_draft_pipeline_enable = True
+        s.decode_drafts_last_ready.append(_make_draft_last())
+        assert s._can_schedule_decode_draft_first() is False
+
+
+class TestDecodeDraftRecvAckGate:
+    """[P1-5] With decode_draft_recv_ack_enable, a queued DDL is schedulable
+    once the worker acks its return irecv, with a timeout fallback so a
+    missing ack path can never stall the pipeline."""
+
+    def _setup(self):
+        s = _make_bare_scheduler()
+        ddl = _make_draft_last()
+        s.decode_drafts_last_ready.append(ddl)
+        s._decode_draft_recv_ack_enable = True
+        s._decode_draft_last_delay_start_ts = time.monotonic()
+        return s, ddl.head_token
+
+    def test_blocked_until_acked(self):
+        s, _ = self._setup()
+        assert s._can_schedule_decode_draft_last() is False
+
+    def test_schedulable_on_ack(self):
+        s, tok = self._setup()
+        s.notify_draft_recv_ready(tok)
+        assert s._can_schedule_decode_draft_last() is True
+
+    def test_timeout_fallback_dispatches_without_ack(self):
+        s, _ = self._setup()
+        s._decode_draft_last_delay_start_ts = (
+            time.monotonic() - 1.0
+        )  # >> max(10*15ms, 100ms)
+        assert s._can_schedule_decode_draft_last() is True
+
+    def test_empty_queue_passes(self):
+        s, _ = self._setup()
+        s.decode_drafts_last_ready.clear()
+        assert s._can_schedule_decode_draft_last() is True
 
 
 class TestDraftFirstLastAlternation:

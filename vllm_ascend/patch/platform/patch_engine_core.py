@@ -174,6 +174,35 @@ def _patched_engine_core_init(self, *args, **kwargs):
 # =======================================================================#
 # Three helper methods bound on EngineCore. Mirror the dest fork.         #
 # =======================================================================#
+def _drain_draft_recv_acks(self) -> None:
+    """[EHER-draft] Drain DDL recv-readiness acks into the scheduler.
+
+    The edge TP0 worker's report thread publishes head_tokens whose DDL
+    return irecv has landed on the ``edge_recv_ready_mq`` sideband; hand
+    them to the scheduler's notify hook so its DDL pick gate can fire on
+    data-plane readiness instead of the fixed delay.  No-op (and no MQ
+    traffic) when the sideband was not attached.
+    """
+    mq = getattr(
+        getattr(self, "model_executor", None), "edge_recv_ready_mq", None
+    )
+    if mq is None:
+        return
+    notify = getattr(self.scheduler, "notify_draft_recv_ready", None)
+    if notify is None:
+        return
+    while True:
+        try:
+            method, args, _kwargs, _output_rank = mq.dequeue(timeout=0)
+        except TimeoutError:
+            break
+        except Exception:
+            logger.exception("[EHER-draft] ack dequeue error")
+            break
+        if method == b"draft_recv_ready" and args:
+            notify(args[0])
+
+
 def _drain_pd_channel_inbox(self) -> None:
     """Move cloud-returned SchedulerOutputs into the local PDSeparated
     scheduler's ``prefills_last_ready`` / ``decodes_last_ready`` queues.
@@ -749,6 +778,9 @@ def _patched_step(self):
     # [ascend insert] Drain POST_OUT (cloud → edge) into the
     # PDSeparatedScheduler's tail-segment ready queues before scheduling.
     self._drain_pd_channel_inbox()
+    # [ascend insert] Drain DDL recv-readiness acks (worker -> scheduler)
+    # so the DDL pick gate sees fresh events before scheduling.
+    self._drain_draft_recv_acks()
 
     scheduler_output = self.scheduler.schedule()
     self._ensure_pd_head_token(scheduler_output)
@@ -829,6 +861,7 @@ def _patched_step_with_batch_queue(self):
         and not self._has_unresolved_edge_cloud_draft_parent()
     ):
         self._drain_pd_channel_inbox()
+        self._drain_draft_recv_acks()
         scheduler_output = self.scheduler.schedule()
         self._ensure_pd_head_token(scheduler_output)
 
@@ -1104,6 +1137,7 @@ def install() -> None:
 
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
+    EngineCore._drain_draft_recv_acks = _drain_draft_recv_acks
     EngineCore._publish_to_cloud = _publish_to_cloud
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._release_deferred_draft_pre_out = (
