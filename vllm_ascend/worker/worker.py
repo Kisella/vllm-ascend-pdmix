@@ -643,8 +643,10 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        torch.npu.synchronize()
         self._pp_timing("model runner execute_model start", True)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        torch.npu.synchronize()
         self._pp_timing("model runner execute_model end", True)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output

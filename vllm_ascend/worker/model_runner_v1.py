@@ -2430,6 +2430,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            torch.npu.synchronize()
             self._pp_timing("propose_draft_token_ids enter", True)
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
@@ -2444,6 +2445,7 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            torch.npu.synchronize()
             self._pp_timing("propose_draft_token_ids exit", True)
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
