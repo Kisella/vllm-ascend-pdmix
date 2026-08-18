@@ -370,7 +370,8 @@ class NPUWorker(WorkerBase):
             if not pp_timing_enabled():
                 return
             if sync_npu and should_pp_timing_sync():
-                torch.npu.synchronize()
+                # torch.npu.synchronize()
+                torch.npu.current_stream().synchronize()
             print(f"[PP_TIMING][{batch_type}][{stage}] {time.perf_counter()}")
 
     def _check_weight_transfer_engine(self) -> None:
@@ -999,6 +1000,7 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         batch_type = scheduler_output.batch_type
         use_alt_group = (batch_type == SchedulerBatchType.ALL_DECODE)
+        execute_output = None
 
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
@@ -1027,22 +1029,34 @@ class NPUWorker(WorkerBase):
             bt = scheduler_output.batch_type
             if is_cloud_device():
                 if bt == BatchType.DRAFT_FIRST:
-                    return self._execute_model_cloud_draft(scheduler_output)
-                return self._execute_model_cloud(
-                    scheduler_output, layer_slice_info
-                )
+                    self._pp_timing("_execute_model_cloud_draft enter", scheduler_output.batch_type, True)
+                    execute_output = self._execute_model_cloud_draft(scheduler_output)
+                    self._pp_timing("_execute_model_cloud_draft exit", scheduler_output.batch_type, True)
+                    return execute_output
+                self._pp_timing("_execute_model_cloud enter", scheduler_output.batch_type, True)
+                execute_output = self._execute_model_cloud(scheduler_output, layer_slice_info)
+                self._pp_timing("_execute_model_cloud exit", scheduler_output.batch_type, True)
+                return execute_output
             if bt == BatchType.DRAFT_FIRST:
-                return self._execute_model_edge_draft_head(scheduler_output)
+                self._pp_timing("_execute_model_edge_draft_head enter", scheduler_output.batch_type, True)
+                execute_output = self._execute_model_edge_draft_head(scheduler_output)
+                self._pp_timing("_execute_model_edge_draft_head exit", scheduler_output.batch_type, True)
+                return execute_output
             if bt == BatchType.DRAFT_LAST:
-                return self._execute_model_edge_draft_tail(scheduler_output)
+                self._pp_timing("_execute_model_edge_draft_tail enter", scheduler_output.batch_type, True)
+                execute_output = self._execute_model_edge_draft_tail(scheduler_output)
+                self._pp_timing("_execute_model_edge_draft_tail exit", scheduler_output.batch_type, True)
+                return execute_output
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
-                return self._execute_model_edge_head(
-                    scheduler_output, layer_slice_info
-                )
+                self._pp_timing("_execute_model_edge_head enter", scheduler_output.batch_type, True)
+                execute_output = self._execute_model_edge_head(scheduler_output, layer_slice_info)
+                self._pp_timing("_execute_model_edge_head exit", scheduler_output.batch_type, True)
+                return execute_output
             if bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST):
-                return self._execute_model_edge_tail(
-                    scheduler_output, layer_slice_info
-                )
+                self._pp_timing("_execute_model_edge_tail enter", scheduler_output.batch_type, True)
+                execute_output = self._execute_model_edge_tail(scheduler_output, layer_slice_info)
+                self._pp_timing("_execute_model_edge_tail exit", scheduler_output.batch_type, True)
+                return execute_output
 
         # Fallback: original path for non-edge-cloud or unhandled batch types.
         return self._execute_model_legacy(
@@ -1068,7 +1082,7 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge head segment (PF/DF): segment_a -> isend -> suspend -> return EMPTY."""
-        self._pp_timing("_execute_model_edge_head enter", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_edge_head enter", scheduler_output.batch_type, True)
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors=None,
             layer_slice_info=layer_slice_info,
@@ -1148,7 +1162,7 @@ class NPUWorker(WorkerBase):
         # scheduler can correlate the batch, but contains no sampled tokens
         # because sampling happens in the tail segment (PL/DL).
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        self._pp_timing("_execute_model_edge_head exit", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_edge_head exit", scheduler_output.batch_type, True)
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
@@ -1159,7 +1173,7 @@ class NPUWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        self._pp_timing("_execute_model_edge_tail enter", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_edge_tail enter", scheduler_output.batch_type, True)
         edge_sp = enable_sp()
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         #logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
@@ -1190,7 +1204,7 @@ class NPUWorker(WorkerBase):
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
         )
-        self._pp_timing("_execute_model_edge_tail exit", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_edge_tail exit", scheduler_output.batch_type, True)
         if not is_last_slice:
             return None
 
@@ -1212,7 +1226,7 @@ class NPUWorker(WorkerBase):
         #         else ""
         #     )
         # )
-        self._pp_timing("_execute_model_cloud enter", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_cloud enter", scheduler_output.batch_type, True)
         intermediate_tensors = None
         is_first_slice = (
             layer_slice_info is None or layer_slice_info.is_first_slice
@@ -1346,7 +1360,7 @@ class NPUWorker(WorkerBase):
                                             dst=_send_dst),
                 channel=channel,
             )
-        self._pp_timing("_execute_model_cloud exit", scheduler_output.batch_type, True)
+        # self._pp_timing("_execute_model_cloud exit", scheduler_output.batch_type, True)
         return output
 
     def _scheduled_draft_tensor_meta(
@@ -1416,11 +1430,11 @@ class NPUWorker(WorkerBase):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
-        # self._pp_timing("_run_edge_cloud_draft_middle_segment enter", True)
+        self._pp_timing("_run_edge_cloud_draft_middle_segment enter", True)
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
-        # self._pp_timing("_run_edge_cloud_draft_middle_segment exit", True)
+        self._pp_timing("_run_edge_cloud_draft_middle_segment exit", True)
         if get_pp_group().world_size == 2:
             out_tensor_dict = {
                 key: value.contiguous()
@@ -1460,11 +1474,11 @@ class NPUWorker(WorkerBase):
         """Run and send one edge-side scheduled draft first segment."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # self._pp_timing("_execute_model_edge_draft_head enter", scheduler_output.batch_type, True)
-        # self._pp_timing("_run_edge_cloud_draft_first_segmen enter", scheduler_output.batch_type, True)
+        self._pp_timing("_run_edge_cloud_draft_first_segmen enter", scheduler_output.batch_type, True)
         output = self.model_runner._run_edge_cloud_draft_first_segment(
             scheduler_output
         )
-        # self._pp_timing("_run_edge_cloud_draft_first_segmen exit", scheduler_output.batch_type, True)
+        self._pp_timing("_run_edge_cloud_draft_first_segmen exit", scheduler_output.batch_type, True)
         
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("DRAFT_FIRST did not produce intermediates")
@@ -1522,9 +1536,13 @@ class NPUWorker(WorkerBase):
         )
         assert tensor_dict is not None
         
-        return self.model_runner._run_edge_cloud_draft_last_segment(
+        self._pp_timing("_run_edge_cloud_draft_last_segment enter", True)
+        output = self.model_runner._run_edge_cloud_draft_last_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
+        self._pp_timing("_run_edge_cloud_draft_last_segment enter", True)
+        
+        return output
 
     def _execute_model_legacy(
         self,
