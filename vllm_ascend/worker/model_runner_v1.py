@@ -1621,7 +1621,7 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
-        self._pp_timing("propose_draft_token_ids enter", True)
+        # self._pp_timing("propose_draft_token_ids enter", True)
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1841,7 +1841,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            self._pp_timing("self.drafter._propose start", True)
+            # self._pp_timing("self.drafter._propose start", True)
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -1859,10 +1859,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
-            self._pp_timing("self.drafter._propose end", True)
+            # self._pp_timing("self.drafter._propose end", True)
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
-        self._pp_timing("propose_draft_token_ids exit", True)
+        # self._pp_timing("propose_draft_token_ids exit", True)
         return draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
@@ -2266,11 +2266,11 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            self._pp_timing("_model_forward start", True)
+            # self._pp_timing("_model_forward start", True)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            self._pp_timing("_model_forward end", True)
+            # self._pp_timing("_model_forward end", True)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2782,14 +2782,14 @@ class NPUModelRunner(GPUModelRunner):
                 positions.shape[0],
             )
     
-    def _pp_timing(self, stage: str, sync_npu: bool = False) -> None:
-        from vllm_ascend.utils import pp_timing_enabled, should_pp_timing_sync
+    # def _pp_timing(self, stage: str, sync_npu: bool = False) -> None:
+    #     from vllm_ascend.utils import pp_timing_enabled, should_pp_timing_sync
 
-        if not pp_timing_enabled():
-            return
-        if sync_npu and should_pp_timing_sync():
-            torch.npu.synchronize()
-        print(f"[PP_TIMING][{stage}] {time.perf_counter()}")
+    #     if not pp_timing_enabled():
+    #         return
+    #     if sync_npu and should_pp_timing_sync():
+    #         torch.npu.synchronize()
+    #     print(f"[PP_TIMING][{stage}] {time.perf_counter()}")
 
     def _model_forward(
         self,
