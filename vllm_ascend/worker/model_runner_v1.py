@@ -1584,6 +1584,17 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs,
         )
 
+    def _pp_timing(self, stage: str, sync_npu: bool = False) -> None:
+        import time
+        from vllm_ascend.utils import pp_timing_enabled, should_pp_timing_sync
+
+        if not pp_timing_enabled():
+            return
+        if sync_npu and should_pp_timing_sync():
+            # torch.npu.synchronize()
+            torch.npu.current_stream().synchronize()
+        print(f"[PP_TIMING][{stage}] {time.perf_counter()}")
+
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
@@ -2419,6 +2430,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            self._pp_timing("propose_draft_token_ids enter", True)
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2432,6 +2444,7 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            self._pp_timing("propose_draft_token_ids exit", True)
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (

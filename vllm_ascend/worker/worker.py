@@ -245,7 +245,8 @@ class NPUWorker(WorkerBase):
         if not pp_timing_enabled():
             return
         if sync_npu and should_pp_timing_sync():
-            torch.npu.synchronize()
+            # torch.npu.synchronize()
+            torch.npu.current_stream().synchronize()
         print(f"[PP_TIMING][{stage}] {time.perf_counter()}")
 
     def wake_up(self, tags: list[str] | None = None) -> None:
