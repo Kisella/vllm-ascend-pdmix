@@ -1383,6 +1383,16 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+        
+    def _pp_timing(self, stage: str, batch_type: Any, sync_npu: bool = False) -> None:
+        from vllm_ascend.utils import pp_timing_enabled, should_pp_timing_sync
+
+        if not pp_timing_enabled():
+            return
+        if sync_npu and should_pp_timing_sync():
+            # torch.npu.synchronize()
+            torch.npu.current_stream().synchronize()
+        print(f"[PP_TIMING][{batch_type}][{stage}] {time.perf_counter()}")
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -6649,6 +6659,8 @@ class NPUModelRunner(GPUModelRunner):
         The worker records (rather than waits for) the cloud->edge send,
         exactly like ``_execute_model_cloud``.
         """
+        torch.npu.synchronize()
+        self._pp_timing("_run_edge_cloud_draft_middle_segment enter", scheduler_output.batch_type, True)
         # DRAFT batches bypass execute_model/_update_states on the cloud, so
         # the purge hook there never runs for them.  Consume any piggybacked
         # draft-metadata invalidations here instead; the call is a guarded
@@ -6739,7 +6751,11 @@ class NPUModelRunner(GPUModelRunner):
             aclgraph_runtime_mode=cudagraph_runtime_mode,
             is_draft_model=True,
         ):
+            torch.npu.synchronize()
+            self._pp_timing("draft_segments cloud enter", scheduler_output.batch_type, True)
             output = self._edge_cloud_draft_segments["c"](**model_kwargs)
+            torch.npu.synchronize()
+            self._pp_timing("draft_segments cloud exit", scheduler_output.batch_type, True)
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError(
                 "Edge-cloud draft middle segment returned no intermediates"
@@ -6764,6 +6780,8 @@ class NPUModelRunner(GPUModelRunner):
             self._eagle3_cloud_aux_hidden_states_by_task.pop(
                 scheduler_output.draft_task_id, None
             )
+        torch.npu.synchronize()
+        self._pp_timing("_run_edge_cloud_draft_middle_segment exit", scheduler_output.batch_type, True)
         return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens

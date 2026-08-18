@@ -1082,11 +1082,14 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge head segment (PF/DF): segment_a -> isend -> suspend -> return EMPTY."""
-        # self._pp_timing("_execute_model_edge_head enter", scheduler_output.batch_type, True)
+        torch.npu.synchronize()
+        self._pp_timing("self.model_runner.execute_model enter", scheduler_output.batch_type, True)
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors=None,
             layer_slice_info=layer_slice_info,
         )
+        torch.npu.synchronize()
+        self._pp_timing("self.model_runner.execute_model exit", scheduler_output.batch_type, True)
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
         )
@@ -1196,10 +1199,14 @@ class NPUWorker(WorkerBase):
             comm_handles=comm_handles,
             comm_postprocess=comm_postprocess,
         )
+        torch.npu.synchronize()
+        self._pp_timing("self.model_runner.execute_model enter", scheduler_output.batch_type, True)
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
+        torch.npu.synchronize()
+        self._pp_timing("self.model_runner.execute_model exit", scheduler_output.batch_type, True)
 
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
@@ -1321,10 +1328,14 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        torch.npu.synchronize()
+        self._pp_timing("model_runner.execute_model enter", scheduler_output.batch_type, True)
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
+        torch.npu.synchronize()
+        self._pp_timing("model_runner.execute_model exit", scheduler_output.batch_type, True)
 
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
@@ -1430,11 +1441,9 @@ class NPUWorker(WorkerBase):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
-        self._pp_timing("_run_edge_cloud_draft_middle_segment enter", True)
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
-        self._pp_timing("_run_edge_cloud_draft_middle_segment exit", True)
         if get_pp_group().world_size == 2:
             out_tensor_dict = {
                 key: value.contiguous()
@@ -1474,10 +1483,12 @@ class NPUWorker(WorkerBase):
         """Run and send one edge-side scheduled draft first segment."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # self._pp_timing("_execute_model_edge_draft_head enter", scheduler_output.batch_type, True)
+        torch.npu.synchronize()
         self._pp_timing("_run_edge_cloud_draft_first_segmen enter", scheduler_output.batch_type, True)
         output = self.model_runner._run_edge_cloud_draft_first_segment(
             scheduler_output
         )
+        torch.npu.synchronize()
         self._pp_timing("_run_edge_cloud_draft_first_segmen exit", scheduler_output.batch_type, True)
         
         if not isinstance(output, IntermediateTensors):
@@ -1535,12 +1546,13 @@ class NPUWorker(WorkerBase):
             f"hidden_channel: {HiddenChannelType.DECODE.value}"
         )
         assert tensor_dict is not None
-        
-        self._pp_timing("_run_edge_cloud_draft_last_segment enter", True)
+        torch.npu.synchronize()
+        self._pp_timing("_run_edge_cloud_draft_last_segment enter", scheduler_output.batch_type, True)
         output = self.model_runner._run_edge_cloud_draft_last_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
-        self._pp_timing("_run_edge_cloud_draft_last_segment enter", True)
+        torch.npu.synchronize()
+        self._pp_timing("_run_edge_cloud_draft_last_segment exit", scheduler_output.batch_type, True)
         
         return output
 
