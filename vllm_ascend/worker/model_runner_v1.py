@@ -5087,6 +5087,7 @@ class NPUModelRunner(GPUModelRunner):
                         deferred_state_corrections_fn = self._update_states(
                             scheduler_output
                         )
+                    self._pp_timing("_update_states exit", scheduler_output.batch_type, True)
 
                     if has_ec_transfer() and get_ec_transfer().is_producer:
                         with self.maybe_get_ec_connector_output(
@@ -5117,6 +5118,7 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output,
                         num_scheduled_tokens_np,
                     )
+                    self._pp_timing("_prepare_inputs exit", scheduler_output.batch_type, True)
 
                     if not num_scheduled_tokens:
                         if (
@@ -5223,6 +5225,7 @@ class NPUModelRunner(GPUModelRunner):
                     cudagraph_mode = cache["cudagraph_mode"]
                     batch_desc = cache["batch_desc"]
                     cudagraph_stats = cache["cudagraph_stats"]
+                    self._pp_timing("_run_input_preparation exit", scheduler_output.batch_type, True)
 
                     logger.debug(
                         "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -5268,6 +5271,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            self._pp_timing("_preprocess exit", scheduler_output.batch_type, True)
             if _fast_path:
                 # _preprocess reads the runner's reusable positions buffer,
                 # which may have been rewritten by an interleaved batch even
@@ -5469,11 +5473,13 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            self._pp_timing("_model_forward enter", scheduler_output.batch_type, True)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
                 inputs_embeds, layer_slice_info=layer_slice_info,
                 **model_kwargs
             )
+            self._pp_timing("_model_forward exit", scheduler_output.batch_type, True)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
