@@ -1390,8 +1390,7 @@ class NPUModelRunner(GPUModelRunner):
         if not pp_timing_enabled():
             return
         if sync_npu and should_pp_timing_sync():
-            # torch.npu.synchronize()
-            torch.npu.current_stream().synchronize()
+            torch.npu.synchronize()
         print(f"[PP_TIMING][{batch_type}][{stage}] {time.perf_counter()}")
 
     def _set_up_drafter(self):
@@ -4189,11 +4188,15 @@ class NPUModelRunner(GPUModelRunner):
         context = self._get_pending_edge_cloud_draft_context(
             scheduler_output
         )
+        self._pp_timing("_get_pending_edge_cloud_draft_context exit", scheduler_output.batch_type, True)
         input_ids, positions, hidden_states, draft_step_idx = (
             self._prepare_edge_cloud_draft_step_inputs(scheduler_output)
         )
+        self._pp_timing("_prepare_edge_cloud_draft_step_inputs exit", scheduler_output.batch_type, True)
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
+        self._pp_timing("draft_segments a enter", scheduler_output.batch_type, True)
         segment = self._edge_cloud_draft_segments["a"]
+        self._pp_timing("draft_segments a exit", scheduler_output.batch_type, True)
         # Independently scheduled draft batches do not enter
         # execute_model(), so they do not inherit its forward context. Keep
         # the draft segments eager until the scheduler path can also preserve
@@ -4347,6 +4350,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens, intermediate_tensors
             )
         )
+        self._pp_timing("_sync_edge_cloud_draft_intermediate_tensors exit.", scheduler_output.batch_type, True)
         segment = self._edge_cloud_draft_segments["e"]
         # DRAFT_LAST is dispatched independently as well, so it needs the
         # same explicit eager context as DRAFT_FIRST.
@@ -4363,10 +4367,12 @@ class NPUModelRunner(GPUModelRunner):
             # see _run_mtp_edge_first_segment): warmup calls segment "e"
             # with only positions + intermediate_tensors, and the last
             # segment (final norm) does not consume spec_step_idx anyway.
+            self._pp_timing("draft_segments e enter", scheduler_output.batch_type, True)
             segment_output = segment(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
             )
+            self._pp_timing("draft_segments e exit", scheduler_output.batch_type, True)
         if self.speculative_config.method == "eagle3":
             if not (
                 isinstance(segment_output, tuple)
@@ -4405,6 +4411,7 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = self._compute_edge_cloud_draft_token_ids(
             logits_hidden_states, draft_step_idx
         )
+        self._pp_timing("_compute_edge_cloud_draft_token_ids exit", scheduler_output.batch_type, True)
         context["last_draft_hidden_states"] = next_hidden_states.clone()
         context["last_draft_positions"] = step_positions.clone()
         context["last_draft_token_ids"] = draft_token_ids.clone()
@@ -6659,7 +6666,6 @@ class NPUModelRunner(GPUModelRunner):
         The worker records (rather than waits for) the cloud->edge send,
         exactly like ``_execute_model_cloud``.
         """
-        torch.npu.synchronize()
         self._pp_timing("_run_edge_cloud_draft_middle_segment enter", scheduler_output.batch_type, True)
         # DRAFT batches bypass execute_model/_update_states on the cloud, so
         # the purge hook there never runs for them.  Consume any piggybacked
@@ -6668,6 +6674,7 @@ class NPUModelRunner(GPUModelRunner):
         self._purge_invalidated_cloud_draft_metadata(
             getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
         )
+        self._pp_timing("_purge_invalidated_cloud_draft_metadata exit", scheduler_output.batch_type, True)
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         # The edge carries rejection-corrected sampling state on the step-0
         # SchedulerOutput. Keeping it on the control plane avoids extra CPU
@@ -6686,6 +6693,7 @@ class NPUModelRunner(GPUModelRunner):
                     "expected step 0",
                     spec_step_idx,
                 )
+        self._pp_timing("_record_cloud_request_corrections exit", scheduler_output.batch_type, True)
 
         token_tensor_key = (
             "input_embeds"
@@ -6702,9 +6710,11 @@ class NPUModelRunner(GPUModelRunner):
         positions = self._reconstruct_cloud_draft_positions(
             scheduler_output, num_tokens
         )
+        self._pp_timing("_reconstruct_cloud_draft_positions exit", scheduler_output.batch_type, True)
         intermediate = self._sync_edge_cloud_draft_intermediate_tensors(
             num_tokens, intermediate_tensors
         )
+        self._pp_timing("_sync_edge_cloud_draft_intermediate_tensors exit", scheduler_output.batch_type, True)
         model_kwargs = {
             "intermediate_tensors": intermediate,
             "positions": positions,
@@ -6727,6 +6737,7 @@ class NPUModelRunner(GPUModelRunner):
         draft_attn_metadata = self._build_edge_cloud_draft_attn_metadata(
             positions, spec_step_idx, scheduler_output
         )
+        self._pp_timing("_build_edge_cloud_draft_attn_metadata exit", scheduler_output.batch_type, True)
 
         if is_forward_context_available():
             forward_context = get_forward_context()
@@ -6751,10 +6762,8 @@ class NPUModelRunner(GPUModelRunner):
             aclgraph_runtime_mode=cudagraph_runtime_mode,
             is_draft_model=True,
         ):
-            torch.npu.synchronize()
             self._pp_timing("draft_segments cloud enter", scheduler_output.batch_type, True)
             output = self._edge_cloud_draft_segments["c"](**model_kwargs)
-            torch.npu.synchronize()
             self._pp_timing("draft_segments cloud exit", scheduler_output.batch_type, True)
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError(
@@ -6780,7 +6789,6 @@ class NPUModelRunner(GPUModelRunner):
             self._eagle3_cloud_aux_hidden_states_by_task.pop(
                 scheduler_output.draft_task_id, None
             )
-        torch.npu.synchronize()
         self._pp_timing("_run_edge_cloud_draft_middle_segment exit", scheduler_output.batch_type, True)
         return output
 
