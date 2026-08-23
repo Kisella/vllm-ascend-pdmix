@@ -4052,6 +4052,32 @@ class NPUModelRunner(GPUModelRunner):
             context["next_token_ids"] = torch.tensor(
                 next_token_list, dtype=torch.long
             )
+        # Pre-build the step-0 draft input ids here (at D尾/P尾 stash time)
+        # instead of inside _prepare_edge_cloud_draft_step_inputs.  The
+        # shifted target-token-id + sampled-next-token construction needs
+        # scheduled_token_ids / sample_row_indices / next_token_ids, all of
+        # which are already available at this point; doing it now fills the
+        # otherwise-idle GPU gap right after the tail forward + sampler, so
+        # step-0 DRAFT_FIRST only runs the head forward (single async H2D).
+        step0_next_token_ids_cpu = context["next_token_ids"].cpu()
+        step0_input_ids = torch.empty(
+            scheduled_token_ids.shape[0], dtype=torch.long
+        )
+        start = 0
+        for req_idx, n in enumerate(num_scheduled):
+            end = start + n
+            if n > 1:
+                step0_input_ids[start : end - 1] = scheduled_token_ids[
+                    start + 1 : end
+                ]
+            # Tail rows past the last accepted row are unused (their KV is
+            # overwritten next round); keep a deterministic shifted id.
+            step0_input_ids[end - 1] = scheduled_token_ids[end - 1]
+            step0_input_ids[int(sample_row_indices[req_idx])] = (
+                step0_next_token_ids_cpu[req_idx]
+            )
+            start = end
+        context["draft_step0_input_ids"] = step0_input_ids
         logger.info(
             "[MTP-DEBUG] pending draft context stashed: task_id=%s, "
             "req_ids=%s, draft_step_idx=%s, pending_contexts=%d",
@@ -4155,39 +4181,13 @@ class NPUModelRunner(GPUModelRunner):
                 draft_step_idx,
             )
 
-        # First speculative step: run the draft model over ALL tokens the
-        # target model just processed.  The draft input ids are the target
-        # token ids shifted left by one within each request, so the draft
-        # layer's KV cache is populated for the whole sequence. The sampled
-        # next token must close each request at the last ACCEPTED row
-        # (sample_row_indices), exactly like the stock drafter's
-        # input_ids[token_indices_to_sample] = next_token_ids -- NOT at the
-        # last scheduled row.  When some verify draft tokens were rejected,
-        # putting it at end-1 instead feeds a rejected token id (and its
-        # embedding/KV) into the row that produces the next draft token,
-        # which makes every decode-round draft miss.
-        num_scheduled = context["num_scheduled_tokens"]
-        scheduled_token_ids = context["scheduled_token_ids"]
-        sample_row_indices = context["sample_row_indices"]
-        next_token_ids = context["next_token_ids"].cpu()
-        total_tokens = scheduled_token_ids.shape[0]
-        input_ids = torch.empty(total_tokens, dtype=torch.long)
-        start = 0
-        for req_idx, n in enumerate(num_scheduled):
-            end = start + n
-            if n > 1:
-                input_ids[start : end - 1] = scheduled_token_ids[
-                    start + 1 : end
-                ]
-            # Tail rows past the last accepted row are unused (their KV is
-            # overwritten next round); keep a deterministic shifted id there
-            # like the stock drafter's buffer does.
-            input_ids[end - 1] = scheduled_token_ids[end - 1]
-            input_ids[int(sample_row_indices[req_idx])] = next_token_ids[
-                req_idx
-            ]
-            start = end
-        input_ids = input_ids.to(self.device, non_blocking=True)
+        # First speculative step: the shifted+closed draft input ids were
+        # already built at stash time (see
+        # _stash_pending_edge_cloud_draft_context), so step-0 DRAFT_FIRST
+        # only uploads them and runs the head forward.
+        input_ids = context["draft_step0_input_ids"].to(
+            self.device, non_blocking=True
+        )
 
         positions = context["positions"]
         hidden_states = context["hidden_states"]
