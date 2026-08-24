@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -258,6 +259,15 @@ class PDSeparatedScheduler(Scheduler):
         self._force_prefill_draft_last: bool = False
         self._force_decode_draft_last: bool = False
 
+        # D尾 由边侧自贴（不依赖云侧 POST_OUT），但实际执行需要等 cloud middle
+        # 的通信返回；D首 后过快调度 D尾 会让 worker 阻塞在 recv。D首 调度后
+        # 启动一个延迟窗口（_decode_last_delay_seconds），窗口内不允许调度 D尾；
+        # 若期间调度了其他任务，说明通信时间已被覆盖，窗口清零并放开 D尾。
+        # 配置：layer_slice_config.yaml 的 decode_last_delay_schedule_ms（ms）。
+        self._decode_last_delay_seconds: float = 0.015
+        self._decode_last_delay_deadline: float | None = None
+        self._load_decode_last_delay_config()
+
         # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
         # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
         self._decode_or_draft_first_only_start_ts: float | None = None
@@ -441,7 +451,88 @@ class PDSeparatedScheduler(Scheduler):
                 self._pending_cloud_draft_invalidations
             )
             self._pending_cloud_draft_invalidations = []
+        # 调度了其他任务：D尾 的 cloud-middle 通信时间已被其执行覆盖，
+        # 窗口清零，放开 D尾（D首/D尾/EMPTY 不清零）。
+        bt = scheduler_output.batch_type
+        if (
+            self._decode_last_delay_deadline is not None
+            and bt not in (
+                BatchType.EMPTY,
+                BatchType.DECODE_FIRST,
+                BatchType.DECODE_LAST,
+            )
+        ):
+            self._clear_decode_last_delay()
         return scheduler_output
+
+    # ------------------------------------------------------------------ #
+    # D首→D尾 延迟调度窗口                                             #
+    # ------------------------------------------------------------------ #
+    def _load_decode_last_delay_config(self) -> None:
+        """Read decode_last_delay_schedule_ms (ms) from layer_slice_config.yaml.
+
+        Shares the cloud-side layer-slice config file: the env override
+        ``VLLM_LAYER_SLICE_CONFIG`` or the module-directory default.
+        """
+        try:
+            import yaml
+            yaml_path = os.environ.get(
+                "VLLM_LAYER_SLICE_CONFIG",
+                os.path.join(
+                    os.path.dirname(__file__), "layer_slice_config.yaml"
+                ),
+            )
+            if not os.path.exists(yaml_path):
+                return
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            if (
+                isinstance(raw, dict)
+                and "decode_last_delay_schedule_ms" in raw
+            ):
+                self._decode_last_delay_seconds = (
+                    float(raw["decode_last_delay_schedule_ms"]) / 1000.0
+                )
+                logger.info(
+                    "[PD] decode_last_delay_schedule_ms=%.1fms loaded from %s",
+                    float(raw["decode_last_delay_schedule_ms"]),
+                    yaml_path,
+                )
+        except (ValueError, TypeError, OSError, ImportError):
+            pass
+
+    def _decode_last_delay_active(self) -> bool:
+        """True while the D首→D尾 delay window is open (D尾 must not dispatch).
+
+        The deadline is consumed once on expiry so a later check sees an
+        open (no-window) state.
+        """
+        deadline = self._decode_last_delay_deadline
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            self._decode_last_delay_deadline = None
+            return False
+        return True
+
+    def _start_decode_last_delay(self) -> None:
+        """Open the window right after a DECODE_FIRST is picked."""
+        self._decode_last_delay_deadline = (
+            time.monotonic() + self._decode_last_delay_seconds
+        )
+
+    def _clear_decode_last_delay(self) -> None:
+        """Close the window (another task covered the cloud-middle comm time)."""
+        self._decode_last_delay_deadline = None
+
+    def _can_schedule_decode_last(self, ready_only: bool = True) -> bool:
+        """D尾 可调度：数据就绪（或 fallback 队列非空）且不在 D首 延迟窗口内。"""
+        if ready_only:
+            if not self._has_actionable_decode_tail():
+                return False
+        elif not self.decodes_last_ready:
+            return False
+        return not self._decode_last_delay_active()
 
     # ------------------------------------------------------------------ #
     # Chunk-prefill-prior helpers                                         #
@@ -980,6 +1071,8 @@ class PDSeparatedScheduler(Scheduler):
                 if tail.head_token == placeholder.head_token:
                     tail.comm_seqno = placeholder.comm_seqno
                     break
+            # Placeholder verify DECODE_FIRST 同样需要 D尾 延迟窗口。
+            self._start_decode_last_delay()
             return placeholder
 
         if ready_only:
@@ -1003,11 +1096,7 @@ class PDSeparatedScheduler(Scheduler):
             if ready_only
             else bool(self.decode_drafts_last_ready)
         )
-        has_dl = (
-            self._has_actionable_decode_tail()
-            if ready_only
-            else bool(self.decodes_last_ready)
-        )
+        has_dl = self._can_schedule_decode_last(ready_only=ready_only)
         has_pl = (
             self._has_actionable_prefill_tail()
             if ready_only
@@ -1139,6 +1228,7 @@ class PDSeparatedScheduler(Scheduler):
             # data is arriving.  The same applies to DL/DRL tails.
             and not self._has_actionable_prefill_tail()
             and not self._has_actionable_decode_tail()
+            and not self._decode_last_delay_active()
             and not self._has_actionable_prefill_draft_tail()
             and not self._has_actionable_decode_draft_tail()
             and not self._can_schedule_prefill_first()
@@ -2634,6 +2724,9 @@ class PDSeparatedScheduler(Scheduler):
                     self.decode_head_inflight_count += 1
                     self._register_pd_flight(scheduler_output)
                     self._force_decode_last = True
+                    # D尾 自贴后仍需等 cloud middle 通信；启动延迟窗口，
+                    # 窗口内不允许调度 D尾（除非期间调度了其他任务）。
+                    self._start_decode_last_delay()
 
                     # === Decode-first self-posting optimization ===
                     # Cloud's _maybe_publish_post_out merely replaces
