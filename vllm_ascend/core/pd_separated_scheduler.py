@@ -261,13 +261,7 @@ class PDSeparatedScheduler(Scheduler):
         # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
         # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
         self._decode_or_draft_first_only_start_ts: float | None = None
-        self._decode_or_draft_first_only_window_ms: int = 20
-        # After scheduling a PREFILL_LAST or a non-final prefill-phase
-        # DRAFT_LAST, briefly reserve the next scheduling opportunity for
-        # prefill-phase DRAFT_FIRST only (keeps the prefill warmup draft
-        # chain continuous without starving the decode lane).
-        self._prefill_draft_first_only_start_ts: float | None = None
-        self._prefill_draft_first_only_window_ms: int = 20
+        self._decode_or_draft_first_only_window_ms: int = 10
         # Rate limiter for the [PD-STALL] empty-schedule probe.
         self._last_stall_log_ts: float = 0.0
 
@@ -916,22 +910,6 @@ class PDSeparatedScheduler(Scheduler):
     def _clear_decode_or_draft_first_only_window(self) -> None:
         self._decode_or_draft_first_only_start_ts = None
 
-    def _prefill_draft_first_only_active(self) -> bool:
-        started_at = self._prefill_draft_first_only_start_ts
-        if started_at is None:
-            return False
-        elapsed_ms = (time.monotonic() - started_at) * 1000
-        if elapsed_ms >= self._prefill_draft_first_only_window_ms:
-            self._prefill_draft_first_only_start_ts = None
-            return False
-        return True
-
-    def _start_prefill_draft_first_only_window(self) -> None:
-        self._prefill_draft_first_only_start_ts = time.monotonic()
-
-    def _clear_prefill_draft_first_only_window(self) -> None:
-        self._prefill_draft_first_only_start_ts = None
-
     def _pick_decode_or_draft_first_only_or_empty(self) -> SchedulerOutput | None:
         if self._has_draft_work():
             # A pending draft chain must not be held back by the
@@ -953,20 +931,6 @@ class PDSeparatedScheduler(Scheduler):
         if self._can_schedule_decode_first():
             self._clear_decode_or_draft_first_only_window()
             return self._pick_decode_first_batch()
-        return self._make_empty_batch()
-
-    def _pick_prefill_draft_first_only_or_empty(
-        self,
-    ) -> SchedulerOutput | None:
-        if not self._prefill_draft_first_only_active():
-            return None
-        # Prefill warmup draft lane: reserve the next turn for its DRAFT_FIRST
-        # so the chain runs back-to-back.  Unlike the decode-lane window, no
-        # `_has_draft_work()` short-circuit: the point is precisely to keep
-        # this chain continuous.
-        if self._can_schedule_prefill_draft_first():
-            self._clear_prefill_draft_first_only_window()
-            return self._pick_draft_first_batch(prefill_phase=True)
         return self._make_empty_batch()
 
     def _pick_by_state(
@@ -1029,11 +993,6 @@ class PDSeparatedScheduler(Scheduler):
             first_only = self._pick_decode_or_draft_first_only_or_empty()
             if first_only is not None:
                 return first_only
-            prefill_first_only = (
-                self._pick_prefill_draft_first_only_or_empty()
-            )
-            if prefill_first_only is not None:
-                return prefill_first_only
 
         # Two-pass readiness semantics: with ready_only=True an unready
         # tail is treated as absent (schedule among data-ready tasks);
@@ -1750,9 +1709,6 @@ class PDSeparatedScheduler(Scheduler):
         # tokens are published to the following target verify batch; the
         # worker uses draft_output_req_ids to discard mid-chunk outputs.
         self._pregenerate_draft_chain(so)
-        # 强制下一轮调度 PrefillDraft首：prefill 完成后立即启动其
-        # prefill-phase warmup draft 链，不被新 P首 抢占。
-        self._start_prefill_draft_first_only_window()
         return so
 
     def _pick_draft_first_batch(self, prefill_phase: bool) -> SchedulerOutput:
@@ -2196,18 +2152,9 @@ class PDSeparatedScheduler(Scheduler):
             # verify placeholder for a dead request.
             if prefill_phase:
                 self._force_prefill_draft_last = False
-                if (
-                    int(scheduler_output.draft_step_idx or 0) + 1
-                    < self.num_spec_tokens
-                ):
-                    # 非最后 PrefillDraft尾：强制下一轮 PrefillDraft首，
-                    # 保持 prefill warmup draft 链连续。
-                    self._start_prefill_draft_first_only_window()
-                else:
-                    self._start_decode_or_draft_first_only_window()
             else:
                 self._force_decode_draft_last = False
-                self._start_decode_or_draft_first_only_window()
+            self._start_decode_or_draft_first_only_window()
             output_req_ids = getattr(
                 scheduler_output,
                 "draft_output_req_ids",
