@@ -3943,21 +3943,34 @@ class NPUModelRunner(GPUModelRunner):
         # unconditionally would feed rejected-token hidden states/positions
         # into the next draft round and drift positions past the real
         # sequence.
+        # GPU 向量化 num_rejected / sample_row_indices，去掉 .tolist() 同步。
+        # 原实现把 sampled_token_ids 的 valid count 用 .tolist() 拉到 CPU，
+        # 会硬性等待 cloud middle -> tail forward -> sampler 整条异步链，
+        # 是 Decode 与 DecodeDraft 之间 gap 线性增长的主因。
+        device = positions.device
+        num_scheduled_t = torch.tensor(
+            num_scheduled, dtype=torch.long, device=device
+        )
+        end_offsets = torch.cumsum(num_scheduled_t, dim=0)
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
-            num_rejected = [0] * num_reqs
-        elif torch.is_tensor(sampled_token_ids):
-            valid_counts = (
-                (sampled_token_ids[:num_reqs] != -1).sum(dim=1).tolist()
+            num_rejected_t = torch.zeros(
+                num_reqs, dtype=torch.long, device=device
             )
-            num_rejected = [
-                max(n - max(int(v), 1), 0)
-                for n, v in zip(num_scheduled, valid_counts)
-            ]
+        elif torch.is_tensor(sampled_token_ids):
+            valid_counts = (sampled_token_ids[:num_reqs] != -1).sum(dim=1)
+            num_rejected_t = (
+                num_scheduled_t - valid_counts.clamp(min=1)
+            ).clamp(min=0)
         else:
-            num_rejected = [
-                max(n - max(len(s), 1), 0)
-                for n, s in zip(num_scheduled, sampled_token_ids)
-            ]
+            num_rejected_t = torch.tensor(
+                [
+                    max(n - max(len(s), 1), 0)
+                    for n, s in zip(num_scheduled, sampled_token_ids)
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        sample_row_indices = end_offsets - 1 - num_rejected_t
         pos_flat = positions[0] if positions.dim() == 2 else positions
         start_offsets = torch.zeros(num_reqs, dtype=torch.long)
         running = 0
@@ -3967,7 +3980,6 @@ class NPUModelRunner(GPUModelRunner):
         total_tokens = running
         start_pos = pos_flat[start_offsets.to(pos_flat.device)].cpu()
         scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
-        sample_row_indices = torch.empty(num_reqs, dtype=torch.long)
         start = 0
         for req_idx, n in enumerate(num_scheduled):
             end = start + n
@@ -3975,7 +3987,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduled_token_ids[start:end] = torch.from_numpy(
                 self.input_batch.token_ids_cpu[req_idx, p0 : p0 + n]
             ).to(torch.long)
-            sample_row_indices[req_idx] = end - 1 - num_rejected[req_idx]
             start = end
 
         # Async scheduled MTP: the scheduler only sent fixed-length -1
@@ -4052,31 +4063,42 @@ class NPUModelRunner(GPUModelRunner):
             context["next_token_ids"] = torch.tensor(
                 next_token_list, dtype=torch.long
             )
-        # Pre-build the step-0 draft input ids here (at D尾/P尾 stash time)
-        # instead of inside _prepare_edge_cloud_draft_step_inputs.  The
-        # shifted target-token-id + sampled-next-token construction needs
-        # scheduled_token_ids / sample_row_indices / next_token_ids, all of
-        # which are already available at this point; doing it now fills the
-        # otherwise-idle GPU gap right after the tail forward + sampler, so
-        # step-0 DRAFT_FIRST only runs the head forward (single async H2D).
-        step0_next_token_ids_cpu = context["next_token_ids"].cpu()
-        step0_input_ids = torch.empty(
-            scheduled_token_ids.shape[0], dtype=torch.long
+        # GPU 向量化构建 step0_input_ids（去掉 CPU 循环与 .cpu() 同步）：
+        #   input_ids[:-1]   = scheduled_token_ids[1:]       (shift left)
+        #   input_ids[end-1] = scheduled_token_ids[end-1]    (close，req 边界)
+        #   input_ids[sample_row_indices] = next_token_ids   (scatter)
+        # NPU 批量 index 算子（aclnnIndexPutImpl / aclnnInplaceIndexCopy）对
+        # 独立 value 不稳定（161002），close 用批量 index_copy_（value 为
+        # gather，已验证通过）；scatter 用 masked_scatter_（无 index 写算子，
+        # scatter_indices 严格递增，mask 升序与 source 顺序一致）。两者都是
+        # 固定次数 kernel launch，避免逐 req 标量循环的线性 launch 开销。
+        scheduled_token_ids_gpu = scheduled_token_ids.to(
+            device, non_blocking=True
         )
-        start = 0
-        for req_idx, n in enumerate(num_scheduled):
-            end = start + n
-            if n > 1:
-                step0_input_ids[start : end - 1] = scheduled_token_ids[
-                    start + 1 : end
-                ]
-            # Tail rows past the last accepted row are unused (their KV is
-            # overwritten next round); keep a deterministic shifted id.
-            step0_input_ids[end - 1] = scheduled_token_ids[end - 1]
-            step0_input_ids[int(sample_row_indices[req_idx])] = (
-                step0_next_token_ids_cpu[req_idx]
-            )
-            start = end
+        step0_input_ids = scheduled_token_ids_gpu.clone()
+        if total_tokens > 1:
+            step0_input_ids[:-1] = scheduled_token_ids_gpu[1:]
+        close_indices = (end_offsets - 1).to(torch.int32)
+        step0_input_ids.index_copy_(
+            0, close_indices, scheduled_token_ids_gpu[close_indices]
+        )
+        next_token_ids_gpu = context["next_token_ids"].to(device)
+        # scatter：NPU 批量 index 写算子（aclnnIndexPutImpl /
+        # aclnnInplaceIndexCopy / aclnnInplaceMaskedScatter）对独立 value 均
+        # 报 161002，改用纯批量读算子组合（无 index 写）：one-hot 矩阵乘
+        # 展开 next_token + torch.where 合并。scatter_indices 严格递增，
+        # one-hot 每列至多一个 1，matmul 结果精确。
+        positions_t = torch.arange(total_tokens, device=device)
+        one_hot = (
+            positions_t.unsqueeze(0) == sample_row_indices.unsqueeze(1)
+        )  # [num_reqs, total_tokens] bool
+        next_tokens_full = (
+            one_hot.to(torch.float32).t()
+            @ next_token_ids_gpu.to(torch.float32)
+        ).to(torch.int64)  # [total_tokens]
+        step0_input_ids = torch.where(
+            one_hot.any(dim=0), next_tokens_full, step0_input_ids
+        )
         context["draft_step0_input_ids"] = step0_input_ids
         logger.info(
             "[MTP-DEBUG] pending draft context stashed: task_id=%s, "
