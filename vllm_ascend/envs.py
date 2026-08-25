@@ -135,6 +135,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP", "1"))
     ),
+    # EXPERIMENT (temporary): disable the edge/cloud scheduler fallback
+    # pass (ready_only=False).  With the fallback disabled, batches whose
+    # data-plane payload has not arrived are never dispatched — unready
+    # heads/tails stay queued until their pre-posted irecv completes.
+    # This isolates whether the fallback's "dispatch regardless" behavior
+    # is the (sufficient) trigger of the long-sequence MTP edge-cloud
+    # deadlock.  Default 0 (fallback enabled).  Set to 1 on BOTH edge and
+    # cloud to run the experiment.
+    "VLLM_ASCEND_PD_DISABLE_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PD_DISABLE_FALLBACK", "0"))
+    ),
 }
 
 # end-env-vars-definition

@@ -26,6 +26,7 @@ from vllm import envs
 from vllm.logger import logger
 from vllm.v1.core.sched.output import BatchType, SchedulerOutput
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.edge_cloud_comm.scheduler_link import (
     is_irecv_complete,
 )
@@ -627,14 +628,22 @@ class PassiveScheduler:
         """
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             batch = self._schedule_expect_alternation(ready_only=True)
-            if batch.is_empty() and (
-                self.ready_prefills or self.ready_decodes
-                or self.ready_prefill_drafts or self.ready_decode_drafts
+            if (
+                not ascend_envs.VLLM_ASCEND_PD_DISABLE_FALLBACK
+                and batch.is_empty()
+                and (
+                    self.ready_prefills or self.ready_decodes
+                    or self.ready_prefill_drafts or self.ready_decode_drafts
+                )
             ):
                 # Nothing is data-ready but work is queued: fall back to
                 # the original priority order and dispatch anyway — the
                 # payload wait happens device-side (wait_event on the
                 # pre-posted recv), never a host block.
+                #
+                # EXPERIMENT: with VLLM_ASCEND_PD_DISABLE_FALLBACK=1 this
+                # pass is skipped — unready heads stay queued until their
+                # pre-posted irecv completes (watermark advances).
                 batch = self._schedule_expect_alternation(ready_only=False)
             self._log_stall_if_blocked(batch)
             return batch
@@ -644,8 +653,11 @@ class PassiveScheduler:
             if not batch.is_empty():
                 return batch
         if (
-            self.ready_prefills or self.ready_decodes
-            or self.ready_prefill_drafts or self.ready_decode_drafts
+            not ascend_envs.VLLM_ASCEND_PD_DISABLE_FALLBACK
+            and (
+                self.ready_prefills or self.ready_decodes
+                or self.ready_prefill_drafts or self.ready_decode_drafts
+            )
         ):
             for queue_name in self._POLICY_ORDER[self.dispatch_policy]:
                 batch = self._schedule_from_queue(

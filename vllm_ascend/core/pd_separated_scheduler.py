@@ -21,6 +21,7 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.edge_cloud_comm.scheduler_link import (
     is_irecv_complete,
 )
@@ -878,17 +879,25 @@ class PDSeparatedScheduler(Scheduler):
     def _schedule_pd_separated(self) -> SchedulerOutput:
         state = self._prefill_state()
         scheduler_output = self._pick_by_state(state, ready_only=True)
-        if scheduler_output.batch_type == BatchType.EMPTY and (
-            self.prefills_last_ready
-            or self.decodes_last_ready
-            or self.prefill_drafts_last_ready
-            or self.decode_drafts_last_ready
+        if (
+            not ascend_envs.VLLM_ASCEND_PD_DISABLE_FALLBACK
+            and scheduler_output.batch_type == BatchType.EMPTY
+            and (
+                self.prefills_last_ready
+                or self.decodes_last_ready
+                or self.prefill_drafts_last_ready
+                or self.decode_drafts_last_ready
+            )
         ):
             # Nothing is data-ready but tails are in flight: fall back to
             # the original priority order and dispatch anyway — the payload
             # wait happens device-side (wait_event on the pre-posted recv),
             # never a host block.  This keeps single-stream latency off the
             # report->drain->dispatch confirmation chain.
+            #
+            # EXPERIMENT: with VLLM_ASCEND_PD_DISABLE_FALLBACK=1 this pass
+            # is skipped entirely — unready batches stay queued until their
+            # pre-posted irecv completes (watermark advances).
             scheduler_output = self._pick_by_state(state, ready_only=False)
         has_work = scheduler_output.total_num_scheduled_tokens > 0
         is_tail = scheduler_output.batch_type in (
