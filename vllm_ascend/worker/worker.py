@@ -1227,6 +1227,7 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge head segment (PF/DF): segment_a -> isend -> suspend -> return EMPTY."""
+        logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # logger.info(
         #     "[PD-TIMING] edge head enter batch_type=%s ts=%.4f",
         #     scheduler_output.batch_type,
@@ -1245,9 +1246,11 @@ class NPUWorker(WorkerBase):
             layer_slice_info is None or layer_slice_info.is_last_slice
         )
         if not is_last_slice:
+            logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
             return None
 
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1321,6 +1324,7 @@ class NPUWorker(WorkerBase):
         # scheduler can correlate the batch, but contains no sampled tokens
         # because sampling happens in the tail segment (PL/DL).
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
@@ -1333,6 +1337,7 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         edge_sp = enable_sp()
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
+        logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # logger.info(
         #     "[PD-TIMING] edge tail enter batch_type=%s ts=%.4f",
         #     scheduler_output.batch_type,
@@ -1364,7 +1369,7 @@ class NPUWorker(WorkerBase):
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
-
+        logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
         )
@@ -1381,14 +1386,14 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Cloud middle segment: recv -> segment_b/c -> isend -> return."""
-        # logger.info(
-        #     f"Execute model, batch_type: {scheduler_output.batch_type}, " + (
-        #         f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
-        #         f"layers: [{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
-        #         if layer_slice_info is not None
-        #         else ""
-        #     )
-        # )
+        logger.info(
+            f"Execute model, batch_type: {scheduler_output.batch_type}, " + (
+                f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
+                f"layers: [{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
+                if layer_slice_info is not None
+                else ""
+            )
+        )
         intermediate_tensors = None
         is_first_slice = (
             layer_slice_info is None or layer_slice_info.is_first_slice
