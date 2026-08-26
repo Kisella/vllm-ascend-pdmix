@@ -3963,21 +3963,38 @@ class NPUModelRunner(GPUModelRunner):
         # unconditionally would feed rejected-token hidden states/positions
         # into the next draft round and drift positions past the real
         # sequence.
+        #
+        # GPU 向量化 num_rejected / sample_row_indices：原实现用
+        # .tolist() 把 valid count 拉到 CPU，是 D2H 同步——若 NPU 流上
+        # 还有未完成的大张量 isend/forward（如 8192-token prefill draft
+        # 正在 WAN 传输），worker 会冻结数秒，拖死整条链路（507057）。
+        # sample_row_indices 保持 GPU 张量；消费方 _get_pending_edge_
+        # cloud_draft_context 在链 step0 执行时（NPU 流已排空）用
+        # int()/index_select，同步开销可忽略。
+        device = positions.device
+        num_scheduled_t = torch.tensor(
+            num_scheduled, dtype=torch.long, device=device
+        )
+        end_offsets = torch.cumsum(num_scheduled_t, dim=0)
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
-            num_rejected = [0] * num_reqs
-        elif torch.is_tensor(sampled_token_ids):
-            valid_counts = (
-                (sampled_token_ids[:num_reqs] != -1).sum(dim=1).tolist()
+            num_rejected_t = torch.zeros(
+                num_reqs, dtype=torch.long, device=device
             )
-            num_rejected = [
-                max(n - max(int(v), 1), 0)
-                for n, v in zip(num_scheduled, valid_counts)
-            ]
+        elif torch.is_tensor(sampled_token_ids):
+            valid_counts = (sampled_token_ids[:num_reqs] != -1).sum(dim=1)
+            num_rejected_t = (
+                num_scheduled_t - valid_counts.clamp(min=1)
+            ).clamp(min=0)
         else:
-            num_rejected = [
-                max(n - max(len(s), 1), 0)
-                for n, s in zip(num_scheduled, sampled_token_ids)
-            ]
+            num_rejected_t = torch.tensor(
+                [
+                    max(n - max(len(s), 1), 0)
+                    for n, s in zip(num_scheduled, sampled_token_ids)
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        sample_row_indices = end_offsets - 1 - num_rejected_t
         running = 0
         for n in num_scheduled:
             running += n
@@ -3992,7 +4009,6 @@ class NPUModelRunner(GPUModelRunner):
         # 链路（507057）。stash 在 _update_states_after_model_execute
         # 之前执行，CPU 值仍是本次调度前的起始位置。
         scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
-        sample_row_indices = torch.empty(num_reqs, dtype=torch.long)
         start = 0
         for req_idx, n in enumerate(num_scheduled):
             end = start + n
@@ -4000,7 +4016,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduled_token_ids[start:end] = torch.from_numpy(
                 self.input_batch.token_ids_cpu[req_idx, p0 : p0 + n]
             ).to(torch.long)
-            sample_row_indices[req_idx] = end - 1 - num_rejected[req_idx]
             start = end
 
         # Async scheduled MTP: the scheduler only sent fixed-length -1
