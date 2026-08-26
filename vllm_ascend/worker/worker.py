@@ -261,6 +261,10 @@ class NPUWorker(WorkerBase):
         # the registry is bounded by the scheduler's in-flight window.
         self._early_recv_futures: dict[tuple[CommChannelType, int], CommFuture] = {}
         self._early_recv_lock = threading.Lock()
+        # (channel, seqno) -> monotonic submit time, for diagnosing how
+        # long a pre-posted / consume-point irecv stays pending (a pending
+        # recv whose data never arrives is the deadlock signature).
+        self._early_recv_submit_ts: dict[tuple[CommChannelType, int], float] = {}
         # (channel, seqno) keys already consumed by busy_loop
         # (get_or_post_early_recv).  Prevents the comm thread from
         # submitting a duplicate (orphan) recv when its hint arrives after
@@ -951,6 +955,25 @@ class NPUWorker(WorkerBase):
                 if key not in self._early_recv_reported
             ]
         for (channel, seqno), future in entries:
+            # [diag] A recv that stays pending far beyond the normal WAN
+            # round trip is the deadlock smoking gun: log its age so we can
+            # pinpoint WHICH (channel, seqno) the sender never delivered.
+            _sub_ts = self._early_recv_submit_ts.get((channel, seqno))
+            if _sub_ts is not None:
+                _age = time.monotonic() - _sub_ts
+                if _age > 10.0:
+                    logger.warning(
+                        "[early-irecv] recv pending >10s channel=%s seqno=%d "
+                        "age=%.1fs num_tokens=%s",
+                        channel.value,
+                        seqno,
+                        _age,
+                        getattr(
+                            self._early_recv_futures.get((channel, seqno)),
+                            "num_tokens",
+                            "?",
+                        ),
+                    )
             try:
                 completed = future.done()
             except Exception:
@@ -973,16 +996,28 @@ class NPUWorker(WorkerBase):
                     seqno,
                 )
                 continue
+            # [diag] Submit -> completion latency per recv.  A huge value
+            # here means the sender took that long to actually transmit
+            # (WAN queueing) or the recv was posted long before the data
+            # plane sent anything (pre-posted recv without a sender).
+            _wait_ms = (
+                (time.monotonic() - _sub_ts) * 1000.0
+                if _sub_ts is not None
+                else -1.0
+            )
             logger.info(
-                "[early-irecv] completion reported channel=%s seqno=%d",
+                "[early-irecv] completion reported channel=%s seqno=%d "
+                "wait_ms=%.1f",
                 channel.value,
                 seqno,
+                _wait_ms,
             )
             with self._early_recv_lock:
                 key = (channel, seqno)
                 self._early_recv_reported.add(key)
                 if key in self._early_recv_consumed:
                     self._early_recv_futures.pop(key, None)
+                    self._early_recv_submit_ts.pop(key, None)
                     self._early_recv_reported.discard(key)
                     self._early_recv_consumed.discard(key)
 
@@ -1064,6 +1099,18 @@ class NPUWorker(WorkerBase):
             future = get_comm_service().submit_recv(request)
             _dt_ms = (time.monotonic() - _t0) * 1000
             self._early_recv_futures[key] = future  # cache for busy_loop
+            self._early_recv_submit_ts[key] = _t0  # [diag] for wait_ms
+        # [diag] INFO-level submit record: tells us a recv was pre-posted
+        # (hint) at this moment, so a later "completion reported wait_ms"
+        # isolates the exact hang window per (channel, seqno).
+        logger.info(
+            "[early-irecv] hint submitted channel=%s seqno=%d "
+            "num_tokens=%d bt=%s",
+            channel.value,
+            seqno,
+            request.num_tokens,
+            batch_type,
+        )
         if _dt_ms > 5.0:
             logger.info(
                 "[early-irecv] submit_recv took %.1f ms channel=%s seqno=%d",
@@ -1119,11 +1166,29 @@ class NPUWorker(WorkerBase):
                     # Completion already reported: consumption ends the
                     # entry's lifecycle.
                     self._early_recv_futures.pop(key, None)
+                    self._early_recv_submit_ts.pop(key, None)
                     self._early_recv_reported.discard(key)
                     self._early_recv_consumed.discard(key)
+                # [diag] consume point reached: tells us the tail execution
+                # is now waiting on this recv (vs. still queued behind an
+                # earlier batch in the worker FIFO).
+                logger.info(
+                    "[early-irecv] consume channel=%s seqno=%d posted=True",
+                    request.channel.value,
+                    request.seqno,
+                )
                 return future
+            # [diag] hint miss: no pre-posted recv existed at consume time.
+            logger.info(
+                "[early-irecv] consume channel=%s seqno=%d posted=False "
+                "(hint miss, submitting now)",
+                request.channel.value,
+                request.seqno,
+            )
+            _t0 = time.monotonic()
             future = get_comm_service().submit_recv(request)
             self._early_recv_futures[key] = future
+            self._early_recv_submit_ts[key] = _t0  # [diag] for wait_ms
             return future
 
     @staticmethod
@@ -1373,10 +1438,38 @@ class NPUWorker(WorkerBase):
                 include_mrope=False,
             ))
 
+        # [diag] tail recv wait: the moment busy_loop starts blocking on
+        # the cloud reply.  A long "recv wait start -> recv wait done"
+        # gap for e.g. decode_down seqno=N pinpoints WHICH tail is being
+        # held by WHICH missing reply.
+        _t_recv = time.monotonic()
+        logger.info(
+            "[EDGE-TAIL] recv wait start bt=%s seqno=%s ch=%s",
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "comm_seqno", None),
+            channel_for(scheduler_output.batch_type, _kind).value,
+        )
         intermediate_tensors = recv_future.as_intermediate_tensors()
+        logger.info(
+            "[EDGE-TAIL] recv wait done bt=%s seqno=%s wait_ms=%.1f",
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "comm_seqno", None),
+            (time.monotonic() - _t_recv) * 1000.0,
+        )
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
+        )
+        # [diag] tail output dependency chain: async output means the
+        # runner's future (sampling / deferred draft verify) completes
+        # LATER, so EngineCore's future.result() may block beyond the
+        # recv wait -- this line separates "stuck on recv" from "stuck
+        # on runner-side async completion".
+        logger.info(
+            "[EDGE-TAIL] executed bt=%s seqno=%s async=%s",
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "comm_seqno", None),
+            isinstance(output, AsyncModelRunnerOutput),
         )
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
         is_last_slice = (
