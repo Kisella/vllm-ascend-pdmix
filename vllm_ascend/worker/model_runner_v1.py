@@ -3882,6 +3882,29 @@ class NPUModelRunner(GPUModelRunner):
         if not draft_rows:
             return
 
+        # [R2] 流忙保护：下面的 .cpu()（D2H）会在 NPU 流上存在未完成
+        # isend（云侧断供/慢时 HCCL 发送不完成）时永久阻塞 worker
+        # （08-26 16:10 卡死：DL stash 卡在 torch.stack(draft_rows)
+        # .detach().cpu()）。用非阻塞 stream.query() 判断流状态：
+        #   - 流忙（有未完成发送）→ 跳过 verified-rows patch（保留占位符，
+        #     链的 DRAFT_LAST 执行时会写真实 rows），仅本轮投机失效、
+        #     不死锁；
+        #   - 流空闲 → 正常 patch（.cpu() 立即完成，draft 质量保持）。
+        # query() 不可用（getattr 兜底）时走正常 patch（保持原行为）。
+        _stream_query = getattr(torch.npu.current_stream(), "query", None)
+        if _stream_query is not None and not _stream_query():
+            _last = getattr(self, "_last_patch_skip_log_ts", 0.0)
+            _now = time.monotonic()
+            if _now - _last > 5.0:
+                self._last_patch_skip_log_ts = _now
+                logger.warning(
+                    "Deferred draft patch skipped (NPU stream busy with "
+                    "pending sends); keeping spec placeholders: "
+                    "task_id=%s",
+                    scheduler_output.head_token,
+                )
+            return
+
         draft_token_ids_cpu = torch.stack(draft_rows).detach().cpu()
         draft_row_by_req = {
             req_id: row for row, req_id in enumerate(draft_req_ids)
