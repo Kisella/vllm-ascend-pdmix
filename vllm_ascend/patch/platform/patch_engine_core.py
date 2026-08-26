@@ -915,19 +915,6 @@ def _patched_step(self):
     # [ascend insert] Forward head-segment batches on the PRE_OUT
     # (edge → cloud) channel.
     self._maybe_publish_pre_out(scheduler_output)
-    if scheduler_output.batch_type in (
-        BatchType.PREFILL_FIRST,
-        BatchType.DECODE_FIRST,
-        BatchType.PREFILL_DRAFT_FIRST,
-        BatchType.DECODE_DRAFT_FIRST,
-    ):
-        # [diag] publish timestamp (single-batch step path), see
-        # _patched_step_with_batch_queue.
-        vllm_logger.info(
-            "[PD-PUB] published %s seqno=%s",
-            scheduler_output.batch_type.value,
-            getattr(scheduler_output, "comm_seqno", None),
-        )
 
     if scheduler_output.batch_type == BatchType.EMPTY:
         return self._finish_empty_batch(scheduler_output)
@@ -1027,15 +1014,6 @@ def _patched_step_with_batch_queue(self):
             BatchType.DECODE_DRAFT_FIRST,
         ):
             self._maybe_publish_pre_out(scheduler_output)
-            # [diag] publish timestamp: paired with the cloud's
-            # "watermark advanced" / "arrival" logs it measures the
-            # SO+data plane WAN latency per seqno (the 13s-class delays
-            # observed in the stuck runs).
-            vllm_logger.info(
-                "[PD-PUB] published %s seqno=%s",
-                scheduler_output.batch_type.value,
-                getattr(scheduler_output, "comm_seqno", None),
-            )
 
         if scheduler_output.batch_type == BatchType.EMPTY:
             if batch_queue:
@@ -1105,17 +1083,6 @@ def _patched_step_with_batch_queue(self):
 
     # Block until the next result is available.
     future, scheduler_output, exec_model_fut = batch_queue.pop()
-    # [diag] collect point: which batch's output future is EngineCore
-    # about to block on, and what remains in the FIFO.  A long
-    # collecting->collected gap for a DECODE_LAST/DRAFT_LAST pins the
-    # tail whose async output is not completing.
-    _t_collect = _time.monotonic()
-    vllm_logger.info(
-        "[BATCH_QUEUE] collecting %s seqno=%s queue_remaining=%s",
-        scheduler_output.batch_type.value,
-        getattr(scheduler_output, "comm_seqno", None),
-        [so.batch_type.value for _, so, _ in batch_queue],
-    )
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -1129,12 +1096,6 @@ def _patched_step_with_batch_queue(self):
                 scheduler_output.batch_type.value,
                 _time.monotonic(),
             )
-        vllm_logger.info(
-            "[BATCH_QUEUE] collected %s seqno=%s wait_ms=%.1f",
-            scheduler_output.batch_type.value,
-            getattr(scheduler_output, "comm_seqno", None),
-            (_time.monotonic() - _t_collect) * 1000.0,
-        )
         if model_output is None:
             exec_model_fut.result()
             raise RuntimeError("unexpected error")
