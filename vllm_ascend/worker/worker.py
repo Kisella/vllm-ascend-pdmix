@@ -1321,13 +1321,25 @@ class NPUWorker(WorkerBase):
             )
         if get_pp_group().world_size == 2:
             _kind = kind_for_batch_type(scheduler_output.batch_type)
+            _seqno = self._require_comm_seqno(scheduler_output)
+            logger.info(
+                "[EDGE-ISEND] channel=%s seqno=%d num_tokens=%d "
+                "batch_type=%s task=%s step=%s reqs=%d",
+                channel_for(scheduler_output.batch_type, _kind).value,
+                _seqno,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "draft_task_id", None),
+                getattr(scheduler_output, "draft_step_idx", None),
+                len(scheduler_output.num_scheduled_tokens),
+            )
             get_comm_service().submit_send(
                 CommRequest(
                     channel=channel_for(scheduler_output.batch_type, _kind),
                     op="send",
                     kind=_kind,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    seqno=self._require_comm_seqno(scheduler_output),
+                    seqno=_seqno,
                     tensor_dict=_gathered,
                     include_mrope=include_mrope,
                 ))
@@ -1364,13 +1376,26 @@ class NPUWorker(WorkerBase):
         # Attach the comm thread's pre-posted recv (hinted when the
         # matching FIRST batch was published), or submit the recv now with
         # the same seqno on a hint miss.
+        _recv_channel = channel_for(scheduler_output.batch_type, _kind)
+        _seqno = self._require_comm_seqno(scheduler_output)
+        logger.info(
+            "[EDGE-IRECV] channel=%s seqno=%d num_tokens=%d "
+            "batch_type=%s task=%s step=%s reqs=%d",
+            _recv_channel.value,
+            _seqno,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "draft_task_id", None),
+            getattr(scheduler_output, "draft_step_idx", None),
+            len(scheduler_output.num_scheduled_tokens),
+        )
         recv_future = self.get_or_post_early_recv(
             CommRequest(
-                channel=channel_for(scheduler_output.batch_type, _kind),
+                channel=_recv_channel,
                 op="recv",
                 kind=_kind,
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
-                seqno=self._require_comm_seqno(scheduler_output),
+                seqno=_seqno,
                 sp_chunk=edge_sp,
                 include_mrope=False,
             ))
@@ -1462,13 +1487,26 @@ class NPUWorker(WorkerBase):
             # resolves to the implicit "previous PP rank" which IS the edge.
             _recv_src = 0 if self.parallel_config.is_shared_model_edge else None
             _kind = kind_for_batch_type(scheduler_output.batch_type)
+            _seqno = self._require_comm_seqno(scheduler_output)
+            _recv_channel = channel_for(scheduler_output.batch_type, _kind)
+            logger.info(
+                "[CLOUD-IRECV] channel=%s seqno=%d num_tokens=%d "
+                "batch_type=%s task=%s step=%s reqs=%d",
+                _recv_channel.value,
+                _seqno,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "draft_task_id", None),
+                getattr(scheduler_output, "draft_step_idx", None),
+                len(scheduler_output.num_scheduled_tokens),
+            )
             recv_future = self.get_or_post_early_recv(
                 CommRequest(
-                    channel=channel_for(scheduler_output.batch_type, _kind),
+                    channel=_recv_channel,
                     op="recv",
                     kind=_kind,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    seqno=self._require_comm_seqno(scheduler_output),
+                    seqno=_seqno,
                     sp_chunk=do_sp_chunk,
                     src_dst=_recv_src,
                     include_mrope=_cloud_include_mrope,
@@ -1516,15 +1554,28 @@ class NPUWorker(WorkerBase):
         if get_pp_group().world_size > 1:
             _send_dst = 0 if self.parallel_config.is_shared_model_edge else None
             _kind = kind_for_batch_type(scheduler_output.batch_type)
+            _seqno = self._require_comm_seqno(scheduler_output)
+            _down_channel = channel_for_direction(_kind, up=False)
+            logger.info(
+                "[CLOUD-ISEND] channel=%s seqno=%d num_tokens=%d "
+                "batch_type=%s task=%s step=%s reqs=%d",
+                _down_channel.value,
+                _seqno,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "draft_task_id", None),
+                getattr(scheduler_output, "draft_step_idx", None),
+                len(scheduler_output.num_scheduled_tokens),
+            )
             get_comm_service().submit_send(
                 CommRequest(
                     # The batch arrived on the UP wire; the reply travels on
                     # the DOWN wire of the same family.
-                    channel=channel_for_direction(_kind, up=False),
+                    channel=_down_channel,
                     op="send",
                     kind=_kind,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    seqno=self._require_comm_seqno(scheduler_output),
+                    seqno=_seqno,
                     tensor_dict=_gathered,
                     src_dst=_send_dst,
                 ))
@@ -1607,9 +1658,21 @@ class NPUWorker(WorkerBase):
         )
         # Attach the comm thread's pre-posted recv (hinted when the parent
         # batch arrived), or submit the recv now with the same seqno.
+        _recv_channel = channel_for(scheduler_output.batch_type, _kind)
+        logger.info(
+            "[CLOUD-IRECV] channel=%s seqno=%d num_tokens=%d "
+            "batch_type=%s task=%s step=%s reqs=%d",
+            _recv_channel.value,
+            _seqno,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "draft_task_id", None),
+            getattr(scheduler_output, "draft_step_idx", None),
+            len(scheduler_output.num_scheduled_tokens),
+        )
         recv_future = self.get_or_post_early_recv(
             CommRequest(
-                channel=channel_for(scheduler_output.batch_type, _kind),
+                channel=_recv_channel,
                 op="recv",
                 kind=_kind,
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -1634,9 +1697,21 @@ class NPUWorker(WorkerBase):
                 scheduler_output,
                 "c2e",
             )
+            _down_channel = channel_for_direction(_kind, up=False)
+            logger.info(
+                "[CLOUD-ISEND] channel=%s seqno=%d num_tokens=%d "
+                "batch_type=%s task=%s step=%s reqs=%d",
+                _down_channel.value,
+                _seqno,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "draft_task_id", None),
+                getattr(scheduler_output, "draft_step_idx", None),
+                len(scheduler_output.num_scheduled_tokens),
+            )
             get_comm_service().submit_send(
                 CommRequest(
-                    channel=channel_for_direction(_kind, up=False),
+                    channel=_down_channel,
                     op="send",
                     kind=_kind,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -1646,7 +1721,7 @@ class NPUWorker(WorkerBase):
                 ))
             logger.info(
                 "Send intermediate tensors to edge, "
-                f"hidden_channel: {channel_for_direction(_kind, up=False).value}"
+                f"hidden_channel: {_down_channel.value}"
             )
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, after."
@@ -1713,13 +1788,25 @@ class NPUWorker(WorkerBase):
             # Prefill-phase draft chains travel on the PREFILL_DRAFT
             # channel pair, decode-phase chains on the DECODE pair.
             _kind = kind_for_batch_type(scheduler_output.batch_type)
+            _seqno = self._require_comm_seqno(scheduler_output)
+            logger.info(
+                "[EDGE-ISEND] channel=%s seqno=%d num_tokens=%d "
+                "batch_type=%s task=%s step=%s reqs=%d",
+                channel_for(scheduler_output.batch_type, _kind).value,
+                _seqno,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "draft_task_id", None),
+                getattr(scheduler_output, "draft_step_idx", None),
+                len(scheduler_output.num_scheduled_tokens),
+            )
             get_comm_service().submit_send(
                 CommRequest(
                     channel=channel_for(scheduler_output.batch_type, _kind),
                     op="send",
                     kind=_kind,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    seqno=self._require_comm_seqno(scheduler_output),
+                    seqno=_seqno,
                     tensor_dict=tensor_dict,
                     draft_meta=send_tensor_meta,
                 ))
@@ -1748,13 +1835,26 @@ class NPUWorker(WorkerBase):
         )
         # Attach the comm thread's pre-posted recv (hinted when the parent
         # batch was published), or submit the recv now with the same seqno.
+        _recv_channel = channel_for(scheduler_output.batch_type, _kind)
+        _seqno = self._require_comm_seqno(scheduler_output)
+        logger.info(
+            "[EDGE-IRECV] channel=%s seqno=%d num_tokens=%d "
+            "batch_type=%s task=%s step=%s reqs=%d",
+            _recv_channel.value,
+            _seqno,
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "draft_task_id", None),
+            getattr(scheduler_output, "draft_step_idx", None),
+            len(scheduler_output.num_scheduled_tokens),
+        )
         recv_future = self.get_or_post_early_recv(
             CommRequest(
-                channel=channel_for(scheduler_output.batch_type, _kind),
+                channel=_recv_channel,
                 op="recv",
                 kind=_kind,
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
-                seqno=self._require_comm_seqno(scheduler_output),
+                seqno=_seqno,
                 draft_meta=recv_tensor_meta,
             ))
         logger.info(
