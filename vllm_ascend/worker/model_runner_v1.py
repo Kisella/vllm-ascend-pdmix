@@ -6205,6 +6205,14 @@ class NPUModelRunner(GPUModelRunner):
                 stale_task_id,
             )
         task_cache[task_id] = (frozen_metadata, num_reqs)
+        logger.info(
+            "[CLOUD-META-CACHE] write task_id=%s num_reqs=%d "
+            "cache_size=%d max=%d",
+            task_id,
+            num_reqs,
+            len(task_cache),
+            self._cloud_spec_decode_metadata_cache_max,
+        )
         # Freeze the verify step's scheduler_output alongside the metadata.
         # The draft task that consumes it is scheduled independently, so the
         # global _last_scheduler_output may already have moved on.
@@ -6277,10 +6285,24 @@ class NPUModelRunner(GPUModelRunner):
         task_cache = self._cloud_spec_decode_metadata_by_task
         cached = task_cache.get(task_id)
         if cached is None:
+            logger.error(
+                "[CLOUD-META-CACHE] MISS task_id=%s cache_size=%d "
+                "max=%d keys=%s",
+                task_id,
+                len(task_cache),
+                self._cloud_spec_decode_metadata_cache_max,
+                list(task_cache.keys())[-8:],
+            )
             raise RuntimeError(
                 "DRAFT has no matching target attention metadata: "
                 f"task_id={task_id}"
             )
+        logger.info(
+            "[CLOUD-META-CACHE] hit task_id=%s num_reqs=%d cache_size=%d",
+            task_id,
+            cached[1],
+            len(task_cache),
+        )
         return cached
 
     def _reconstruct_cloud_draft_positions(
@@ -6538,6 +6560,39 @@ class NPUModelRunner(GPUModelRunner):
             # split_decodes_and_prefills) ends up matching the
             # first-pass num_actual_tokens instead of batch_size.
             device = common_attn_metadata.seq_lens.device
+            _seq_lens = common_attn_metadata.seq_lens
+            _block_tbl = common_attn_metadata.block_table_tensor
+            logger.info(
+                "[CLOUD-DRAFT-META] task=%s step=%d batch_size=%d "
+                "positions_shape=%s seq_lens_len=%d block_table=%s "
+                "pos_max=%s block_size=%s max_model_len=%d",
+                getattr(scheduler_output, "draft_task_id", None),
+                spec_step_idx,
+                batch_size,
+                tuple(positions.shape) if positions is not None else None,
+                len(_seq_lens) if _seq_lens is not None else None,
+                (
+                    tuple(_block_tbl.shape)
+                    if _block_tbl is not None
+                    else None
+                ),
+                (
+                    int(
+                        (positions[0] if positions.dim() > 1 else positions)
+                        [:batch_size].max().item()
+                    )
+                    if positions is not None
+                    and positions.numel() > 0
+                    else None
+                ),
+                (
+                    self.drafter.kernel_block_size
+                    if self.drafter is not None
+                    and hasattr(self.drafter, "kernel_block_size")
+                    else None
+                ),
+                self.model_config.max_model_len,
+            )
             new_query_start_loc_cpu = torch.arange(
                 batch_size + 1, dtype=torch.int32, device="cpu"
             )
@@ -6567,6 +6622,21 @@ class NPUModelRunner(GPUModelRunner):
                 exceeds = pos_flat >= self.model_config.max_model_len
                 clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
                 block_numbers = clamped // block_size
+                if block_numbers.numel() > 0:
+                    _bn_max = int(block_numbers.max().item())
+                    _tbl_cols = block_table_tensor.shape[1]
+                    if _bn_max >= _tbl_cols:
+                        logger.error(
+                            "[CLOUD-DRAFT-META] BLOCK-TABLE OVERFLOW task=%s "
+                            "step=%d block_number_max=%d block_table_cols=%d "
+                            "pos_max=%d block_size=%d",
+                            getattr(scheduler_output, "draft_task_id", None),
+                            spec_step_idx,
+                            _bn_max,
+                            _tbl_cols,
+                            int(pos_flat.max().item()),
+                            block_size,
+                        )
                 block_ids = block_table_tensor[:batch_size].gather(
                     dim=1, index=block_numbers.view(-1, 1).long()
                 ).view(-1)
