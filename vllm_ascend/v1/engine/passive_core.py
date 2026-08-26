@@ -631,8 +631,17 @@ class PassiveEngineCoreProc:
           1. this batch's head payload (same comm_seqno, UP channel of
              the pair), and
           2. one DRAFT_FIRST head payload per speculative step of the
-             draft chain that follows the batch — the chain's reserved
-             seqno range rides on the SO as ``draft_seqno_base``.
+             draft chain that follows the batch.
+
+        Draft recvs are posted when the DRAFT_FIRST SO actually arrives,
+        NOT when the parent PF/DF arrives: a chain may go dynamic (edge
+        pre-generation skipped when the lane was busy), in which case
+        step-0 is only enqueued after the parent tail completes — an
+        arrival-time pre-post from the parent would hold that recv across
+        a full WAN round trip and trip the HCCL remote-suspect watchdog
+        (observed 507057 SUSPECT REMOTE ERROR / ERR00100 on two
+        consecutive long sequences).  Posting at step arrival bounds the
+        recv wait to the actual wire delivery time.
 
         Posting at arrival (instead of at dispatch time) maximizes
         the compute/transfer overlap and lets the passive scheduler gate
@@ -645,6 +654,13 @@ class PassiveEngineCoreProc:
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
             ):
+                # DRAFT_FIRST handled below; tails/EMPTY carry no head
+                # payload.
+                if bt in (
+                    BatchType.PREFILL_DRAFT_FIRST,
+                    BatchType.DECODE_DRAFT_FIRST,
+                ):
+                    self._post_irecv_hint_for_draft_first(so)
                 continue
             seqno = getattr(so, "comm_seqno", None)
             if seqno is None:
@@ -659,30 +675,40 @@ class PassiveEngineCoreProc:
                 "has_mrope": bool(getattr(so, "has_mrope", True)),
                 "draft_step_idx": None,
             })
-            base = getattr(so, "draft_seqno_base", None)
-            if base is None:
-                continue
-            prefill_phase = bt == BatchType.PREFILL_FIRST
-            num_spec = self._num_scheduled_spec_tokens()
-            # Draft step shapes (mirrors the worker's meta derivation):
-            # step 0 runs over the parent batch's full token count,
-            # later steps over one token per request.
-            num_reqs = len(so.num_scheduled_tokens)
-            for step_idx in range(num_spec):
-                post_irecv_hint({
-                    "batch_type": (
-                        BatchType.PREFILL_DRAFT_FIRST
-                        if prefill_phase
-                        else BatchType.DECODE_DRAFT_FIRST
-                    ),
-                    "draft_prefill_phase": prefill_phase,
-                    "seqno": base + step_idx,
-                    "num_tokens": (
-                        total_tokens if step_idx == 0 else num_reqs
-                    ),
-                    "has_mrope": False,
-                    "draft_step_idx": step_idx,
-                })
+
+    def _post_irecv_hint_for_draft_first(self, so) -> None:
+        """Pre-post the cloud-side recv for one arriving DRAFT_FIRST step.
+
+        The step's comm_seqno is already stamped by the edge scheduler
+        (reserved base + step_idx).  Posting here — at the step's own
+        arrival — keeps the recv wait bounded to the data-plane delivery
+        time even for dynamic chains whose step-0 is enqueued only after
+        the parent tail completes.
+
+        num_tokens mirrors ``NPUWorker._scheduled_draft_tensor_meta``
+        (step 0 over the parent's full token count, later steps over one
+        token per request): the hint's draft_meta builds the recv buffer,
+        so it must match the sender's wire shape exactly.
+        """
+        seqno = getattr(so, "comm_seqno", None)
+        if seqno is None:
+            return
+        step_idx = int(getattr(so, "draft_step_idx", 0) or 0)
+        num_tokens = (
+            so.total_num_scheduled_tokens
+            if step_idx == 0
+            else len(so.num_scheduled_tokens)
+        )
+        post_irecv_hint({
+            "batch_type": so.batch_type,
+            "draft_prefill_phase": bool(
+                getattr(so, "draft_prefill_phase", False)
+            ),
+            "seqno": seqno,
+            "num_tokens": num_tokens,
+            "has_mrope": False,
+            "draft_step_idx": step_idx,
+        })
 
     def _drain_irecv_completions(self) -> None:
         """Drain worker completion reports into the per-channel

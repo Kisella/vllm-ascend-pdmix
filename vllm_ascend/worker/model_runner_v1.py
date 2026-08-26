@@ -3971,19 +3971,26 @@ class NPUModelRunner(GPUModelRunner):
                 device=device,
             )
         sample_row_indices = end_offsets - 1 - num_rejected_t
-        pos_flat = positions[0] if positions.dim() == 2 else positions
-        start_offsets = torch.zeros(num_reqs, dtype=torch.long)
+        start_offsets = np.zeros(num_reqs, dtype=np.int64)
         running = 0
         for req_idx, n in enumerate(num_scheduled):
             start_offsets[req_idx] = running
             running += n
         total_tokens = running
-        start_pos = pos_flat[start_offsets.to(pos_flat.device)].cpu()
+        # p0 语义 = 该 req 本次调度的起始 position。positions 由
+        # _prepare_inputs 从 num_computed_tokens_cpu + 批内偏移生成，
+        # 故起始 position 就是 num_computed_tokens_cpu[req_idx]
+        # （与 _prepare_inputs 的 start_pos 取法一致，2665 行附近）。
+        # 直接用 CPU 值避免原实现 pos_flat[...].cpu() 的 D2H 同步——
+        # 若紧邻的大张量 isend（如 8184-token prefill draft）仍在 WAN
+        # 上传输，worker 会冻结数秒，拖死整条链路。stash 在
+        # _update_states_after_model_execute 之前执行，CPU 值仍是本次
+        # 调度前的起始位置。
         scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
         start = 0
         for req_idx, n in enumerate(num_scheduled):
             end = start + n
-            p0 = int(start_pos[req_idx])
+            p0 = int(self.input_batch.num_computed_tokens_cpu[req_idx])
             scheduled_token_ids[start:end] = torch.from_numpy(
                 self.input_batch.token_ids_cpu[req_idx, p0 : p0 + n]
             ).to(torch.long)
@@ -6562,10 +6569,15 @@ class NPUModelRunner(GPUModelRunner):
             device = common_attn_metadata.seq_lens.device
             _seq_lens = common_attn_metadata.seq_lens
             _block_tbl = common_attn_metadata.block_table_tensor
+            # NOTE: no .max().item() / .item() inside this log's f-string —
+            # a D2H sync here blocks the NPU stream and, right behind a
+            # large prefill slice (e.g. a long-sequence chunk), stalls the
+            # draft forward for seconds, colliding with the HCCL
+            # remote-suspect watchdog (observed 507057 / ERR00100).
             logger.info(
                 "[CLOUD-DRAFT-META] task=%s step=%d batch_size=%d "
                 "positions_shape=%s seq_lens_len=%d block_table=%s "
-                "pos_max=%s block_size=%s max_model_len=%d",
+                "block_size=%s max_model_len=%d",
                 getattr(scheduler_output, "draft_task_id", None),
                 spec_step_idx,
                 batch_size,
@@ -6574,15 +6586,6 @@ class NPUModelRunner(GPUModelRunner):
                 (
                     tuple(_block_tbl.shape)
                     if _block_tbl is not None
-                    else None
-                ),
-                (
-                    int(
-                        (positions[0] if positions.dim() > 1 else positions)
-                        [:batch_size].max().item()
-                    )
-                    if positions is not None
-                    and positions.numel() > 0
                     else None
                 ),
                 (
@@ -6622,21 +6625,15 @@ class NPUModelRunner(GPUModelRunner):
                 exceeds = pos_flat >= self.model_config.max_model_len
                 clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
                 block_numbers = clamped // block_size
-                if block_numbers.numel() > 0:
-                    _bn_max = int(block_numbers.max().item())
-                    _tbl_cols = block_table_tensor.shape[1]
-                    if _bn_max >= _tbl_cols:
-                        logger.error(
-                            "[CLOUD-DRAFT-META] BLOCK-TABLE OVERFLOW task=%s "
-                            "step=%d block_number_max=%d block_table_cols=%d "
-                            "pos_max=%d block_size=%d",
-                            getattr(scheduler_output, "draft_task_id", None),
-                            spec_step_idx,
-                            _bn_max,
-                            _tbl_cols,
-                            int(pos_flat.max().item()),
-                            block_size,
-                        )
+                # Overflow guard WITHOUT a per-step .item() D2H sync: the
+                # clamped block_numbers can never reach block_table_tensor
+                # columns (pos < max_model_len implies
+                # block_number < max_model_len // block_size, and the block
+                # table is sized for max_model_len), so the gather below is
+                # always in bounds.  A host-side max() here would block the
+                # NPU stream right behind a large prefill slice and stall
+                # the draft forward for seconds (observed 507057 /
+                # ERR00100 on two consecutive long sequences).
                 block_ids = block_table_tensor[:batch_size].gather(
                     dim=1, index=block_numbers.view(-1, 1).long()
                 ).view(-1)

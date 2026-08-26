@@ -2084,9 +2084,17 @@ class PDSeparatedScheduler(Scheduler):
         scheduling invariants (no decode-channel consumer may interleave
         an active/queued draft chain) guarantee its steps will occupy
         exactly ``[base, base + num_spec_tokens)`` on the phase's channel
-        pair.  Reserving now lets both peers pre-post all n draft recv
-        requests the moment the parent is published, via
-        ``draft_seqno_base`` on the SO.
+        pair.  Reserving now keeps the per-channel counter dense and lets
+        both peers pre-post draft recv requests the moment the chain's
+        step-0 DRAFT_FIRST actually arrives (see the DRAFT_FIRST branch
+        of ``PassiveEngineCore._post_irecv_hints_for_arrivals``) — the
+        base is deliberately NOT written to ``draft_seqno_base`` on the
+        SO: a chain may go dynamic (pre-generation skipped when the lane
+        is busy), in which case step-0 is only enqueued after the parent
+        tail completes, and an arrival-time pre-post from the parent
+        would hold the recv across a full WAN round trip and trip the
+        HCCL remote-suspect watchdog.  Pre-posting at step-0 arrival
+        bounds the recv wait to the actual wire delivery time.
         """
         if not self._check_scheduled_edge_cloud_draft():
             return
@@ -2102,7 +2110,6 @@ class PDSeparatedScheduler(Scheduler):
             base = self._decode_comm_seqno
             self._decode_comm_seqno += self.num_spec_tokens
         self._reserved_draft_seqno_base[head_token] = base
-        scheduler_output.draft_seqno_base = base
 
     def _uses_async_scheduled_mtp_placeholders(self) -> bool:
         """Whether scheduled MTP can use native async placeholder semantics."""

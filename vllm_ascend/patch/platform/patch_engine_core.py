@@ -309,8 +309,15 @@ def _post_irecv_hints_for_first_batch(
       1. this batch's tail-segment payload (same comm_seqno on the DOWN
          channel of the same pair), and
       2. one DRAFT_LAST payload per speculative step of the draft chain
-         that follows the batch — the chain's seqno range was reserved
-         at pick time and rides on the SO as ``draft_seqno_base``.
+         that follows the batch.
+
+    The DRAFT_LAST recvs are posted when each DRAFT_FIRST step is
+    published (see ``_post_irecv_hint_for_draft_last``), NOT here: a
+    chain may go dynamic (edge pre-generation skipped when the lane was
+    busy), in which case step-0 is only enqueued after the parent tail
+    completes — pre-posting at PF/DF publish time would hold those recvs
+    across a full WAN round trip and trip the HCCL remote-suspect
+    watchdog (observed 507057 SUSPECT REMOTE ERROR / ERR00100).
 
     Posting the irecvs at dispatch-decision time decouples the data
     plane from worker execution: tail segments attach an
@@ -336,28 +343,54 @@ def _post_irecv_hints_for_first_batch(
         "has_mrope": False,
         "draft_step_idx": None,
     })
-    base = scheduler_output.draft_seqno_base
-    if base is None:
+
+
+def _post_irecv_hint_for_draft_last(
+    self, scheduler_output: SchedulerOutput
+) -> None:
+    """Pre-post the edge-side irecv for one just-published DRAFT_FIRST.
+
+    The matching DRAFT_LAST travels cloud -> edge on the same channel
+    pair with the SAME comm_seqno (the edge self-posts it in
+    ``_pick_draft_first_batch``).  Posting at the step's own publish time
+    keeps the recv wait bounded to the data-plane delivery time even for
+    dynamic chains.
+    """
+    if scheduler_output.batch_type not in (
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
+    ):
         return
-    prefill_phase = bt == BatchType.PREFILL_FIRST
-    num_spec = int(getattr(self.scheduler, "num_spec_tokens", 0) or 0)
-    # Draft step shapes (mirrors the worker's meta derivation): step 0
-    # runs over the parent batch's full token count, later steps over
-    # one token per request.
-    num_reqs = len(scheduler_output.num_scheduled_tokens)
-    for step_idx in range(num_spec):
-        post_irecv_hint({
-            "batch_type": (
-                BatchType.PREFILL_DRAFT_LAST
-                if prefill_phase
-                else BatchType.DECODE_DRAFT_LAST
-            ),
-            "draft_prefill_phase": prefill_phase,
-            "seqno": base + step_idx,
-            "num_tokens": total_tokens if step_idx == 0 else num_reqs,
-            "has_mrope": False,
-            "draft_step_idx": step_idx,
-        })
+    seqno = scheduler_output.comm_seqno
+    if seqno is None:
+        return
+    prefill_phase = bool(
+        getattr(scheduler_output, "draft_prefill_phase", False)
+    )
+    # num_tokens mirrors NPUWorker._scheduled_draft_tensor_meta (step 0
+    # over the parent's full token count, later steps over one token per
+    # request): the hint's draft_meta builds the recv buffer, so it must
+    # match the sender's wire shape exactly.
+    step_idx = int(
+        getattr(scheduler_output, "draft_step_idx", 0) or 0
+    )
+    num_tokens = (
+        scheduler_output.total_num_scheduled_tokens
+        if step_idx == 0
+        else len(scheduler_output.num_scheduled_tokens)
+    )
+    post_irecv_hint({
+        "batch_type": (
+            BatchType.PREFILL_DRAFT_LAST
+            if prefill_phase
+            else BatchType.DECODE_DRAFT_LAST
+        ),
+        "draft_prefill_phase": prefill_phase,
+        "seqno": seqno,
+        "num_tokens": num_tokens,
+        "has_mrope": False,
+        "draft_step_idx": step_idx,
+    })
 
 
 def _drain_irecv_completions(self) -> None:
@@ -399,6 +432,7 @@ def _maybe_publish_pre_out(
             # produces none): publish immediately so the cloud runs the
             # middle and the channel seqno sequence stays intact.
             self._publish_to_cloud(scheduler_output)
+            self._post_irecv_hint_for_draft_last(scheduler_output)
             return
         is_pregenerated = getattr(
             self.scheduler, "is_pre_generated_draft", lambda _so: False
@@ -426,13 +460,21 @@ def _maybe_publish_pre_out(
                 deferred.setdefault(task_id, []).append(scheduler_output)
                 return
         self._publish_to_cloud(scheduler_output)
+        # The matching DRAFT_LAST (cloud -> edge, same comm_seqno) is
+        # self-posted by the scheduler; pre-post its recv now so the
+        # worker never blocks on the wire.  Posted at step publish time,
+        # not at PF/DF publish time, so dynamic chains (whose step-0 is
+        # enqueued only after the parent tail completes) do not hold the
+        # recv across a WAN round trip (HCCL remote-suspect watchdog).
+        self._post_irecv_hint_for_draft_last(scheduler_output)
     elif bt in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
     ):
         self._publish_to_cloud(scheduler_output)
         # Right after the SO goes out: pre-post the local irecvs for
-        # this batch's tail payload and its n draft tail payloads.
+        # this batch's tail payload (draft-tail recvs are posted per
+        # DRAFT_FIRST step in _maybe_publish_pre_out).
         self._post_irecv_hints_for_first_batch(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
@@ -466,6 +508,11 @@ def _release_deferred_draft_pre_out(
         return
     for scheduler_output in queued:
         self._publish_to_cloud(scheduler_output)
+        if scheduler_output.batch_type in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        ):
+            self._post_irecv_hint_for_draft_last(scheduler_output)
     if queued:
         logger.info(
             "[PRE_OUT] released %d async draft controls task_id=%s",
@@ -1283,6 +1330,9 @@ def install() -> None:
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._post_irecv_hints_for_first_batch = (
         _post_irecv_hints_for_first_batch
+    )
+    EngineCore._post_irecv_hint_for_draft_last = (
+        _post_irecv_hint_for_draft_last
     )
     EngineCore._release_deferred_draft_pre_out = (
         _release_deferred_draft_pre_out
