@@ -203,6 +203,15 @@ class PDSeparatedScheduler(Scheduler):
         # base + draft_step_idx at pick time.
         self._reserved_draft_seqno_base: dict[str, int] = {}
 
+        # Global dispatch-order sequence number stamped on every FIRST
+        # batch at schedule (dispatch) time.  It rides the SO to the
+        # cloud, whose passive scheduler orders prefill/decode/draft
+        # heads by it: seqno order == edge dispatch order == data-plane
+        # send order, so the cloud's dispatch order matches the wire even
+        # if the control plane arrives out of order or publication is
+        # deferred (pre-generated step-0 scalar patching).
+        self._pd_so_seqno: int = 0
+
         # Buffer queue: requests whose P-first segment is done but P-last
         # segment has not yet returned from the cloud.  Not eligible for
         # decode scheduling until PL completes and they are moved to running.
@@ -476,6 +485,19 @@ class PDSeparatedScheduler(Scheduler):
             )
         ):
             self._clear_decode_last_delay()
+        # Stamp the edge dispatch-order seqno on every FIRST batch at
+        # dispatch time (== data-plane send order).  The cloud orders
+        # its head queues by this value, so dispatch order there matches
+        # the wire even when the control plane arrives out of order or
+        # publication is deferred.
+        if bt in (
+            BatchType.PREFILL_FIRST,
+            BatchType.DECODE_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        ):
+            self._pd_so_seqno += 1
+            scheduler_output.edge_so_seqno = self._pd_so_seqno
         return scheduler_output
 
     # ------------------------------------------------------------------ #

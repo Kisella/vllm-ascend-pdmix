@@ -378,6 +378,20 @@ class PassiveScheduler:
         seq = getattr(scheduler_output, self._ARRIVAL_SEQ_ATTR, None)
         return seq if isinstance(seq, int) else None
 
+    def _dispatch_seq(self, scheduler_output: SchedulerOutput) -> int | None:
+        """Ordering key for cross-queue dispatch decisions.
+
+        Prefers the edge-stamped dispatch-order seqno (``edge_so_seqno``,
+        stamped at edge dispatch time == data-plane send order), falling
+        back to the local arrival order.  Ordering by this value makes
+        the cloud's dispatch order match the wire even when the control
+        plane arrives out of order or publication is deferred.
+        """
+        seq = getattr(scheduler_output, "edge_so_seqno", None)
+        if isinstance(seq, int):
+            return seq
+        return self._arrival_seq(scheduler_output)
+
     def _drain_subscriber_inline(self) -> None:
         """Used only when the subscriber thread is disabled (e.g. tests)."""
         new_outputs = self.pp_subscriber.consume_new_outputs()
@@ -864,14 +878,22 @@ class PassiveScheduler:
         self, ready_only: bool = True
     ) -> ScheduledBatch:
         """Pick among the head decode / decode-draft / prefill-draft by
-        arrival order.
+        edge dispatch order.
+
+        The ordering key is the edge-stamped ``edge_so_seqno`` (stamped
+        at edge dispatch time == data-plane send order; falls back to
+        local arrival order when absent) — the prefill/decode draft
+        queues stay separate but are NOT prioritized against each other:
+        the earliest-dispatched head wins, so the cloud's dispatch order
+        matches the wire even if the control plane arrives out of order
+        or publication is deferred.
 
         Only data-ready heads participate: with pre-posted irecvs the
         recv order is fixed at SO arrival time, so dispatch order no
         longer affects channel pairing — the old cross-side deadlock
         (cloud posting a recv for one payload while the edge's next
         in-flight message is another) cannot occur once every candidate
-        is gated on irecv completion.  Arrival order remains as the
+        is gated on irecv completion.  Dispatch-order remains as the
         priority tie-breaker among ready heads.
 
         Caller must ensure at least one of the three queues is non-empty.
@@ -892,7 +914,7 @@ class PassiveScheduler:
         candidates: list[tuple[float, Callable[[], ScheduledBatch]]] = []
 
         def _seq_of(so: SchedulerOutput) -> float:
-            seq = self._arrival_seq(so)
+            seq = self._dispatch_seq(so)
             return float(seq) if seq is not None else math.inf
 
         if has_decode:
@@ -941,12 +963,12 @@ class PassiveScheduler:
         )
         has_draft = has_decode_draft or has_prefill_draft
         prefill_seq = (
-            self._arrival_seq(self.ready_prefills[0])
+            self._dispatch_seq(self.ready_prefills[0])
             if has_prefill
             else None
         )
         decode_seq = (
-            self._arrival_seq(self.ready_decodes[0])
+            self._dispatch_seq(self.ready_decodes[0])
             if has_decode
             else None
         )
@@ -954,12 +976,12 @@ class PassiveScheduler:
             seq
             for seq in (
                 (
-                    self._arrival_seq(self.ready_decode_drafts[0])
+                    self._dispatch_seq(self.ready_decode_drafts[0])
                     if has_decode_draft
                     else None
                 ),
                 (
-                    self._arrival_seq(self.ready_prefill_drafts[0])
+                    self._dispatch_seq(self.ready_prefill_drafts[0])
                     if has_prefill_draft
                     else None
                 ),
@@ -1062,20 +1084,20 @@ class PassiveScheduler:
                 # 即固定，不再取决于派发顺序），此处仅在“被超越的 prefill
                 # 本身已就绪”时记录，作为状态机优先级的纯观测日志。
                 if self.ready_prefills and self._prefill_head_data_ready():
-                    _pf_seq = self._arrival_seq(self.ready_prefills[0])
+                    _pf_seq = self._dispatch_seq(self.ready_prefills[0])
                     _dc_seq = (
-                        self._arrival_seq(self.ready_decodes[0])
+                        self._dispatch_seq(self.ready_decodes[0])
                         if self.ready_decodes else None
                     )
                     _dr_seqs = [
                         seq
                         for seq in (
                             (
-                                self._arrival_seq(self.ready_decode_drafts[0])
+                                self._dispatch_seq(self.ready_decode_drafts[0])
                                 if self.ready_decode_drafts else None
                             ),
                             (
-                                self._arrival_seq(self.ready_prefill_drafts[0])
+                                self._dispatch_seq(self.ready_prefill_drafts[0])
                                 if self.ready_prefill_drafts else None
                             ),
                         )
