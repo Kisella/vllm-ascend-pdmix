@@ -1061,6 +1061,13 @@ class NPUWorker(WorkerBase):
             if key in self._early_recv_consumed:
                 return  # busy_loop already consumed (submitted its own)
             _t0 = time.monotonic()
+            logger.info(
+                "[IRECV-HINT] channel=%s seqno=%s num_tokens=%s kind=%s",
+                channel.value,
+                seqno,
+                num_tokens,
+                kind.value if kind is not None else None,
+            )
             future = get_comm_service().submit_recv(request)
             _dt_ms = (time.monotonic() - _t0) * 1000
             self._early_recv_futures[key] = future  # cache for busy_loop
@@ -1115,6 +1122,16 @@ class NPUWorker(WorkerBase):
             self._early_recv_consumed.add(key)
             future = self._early_recv_futures.get(key)
             if future is not None:
+                # Hint-pre-posted recv hit: same (channel, seqno) was
+                # already submitted (by the comm thread's hint handling or
+                # an earlier consume point) — idempotent reuse.
+                logger.info(
+                    "[IRECV-REUSE] channel=%s seqno=%s num_tokens=%s kind=%s",
+                    request.channel.value,
+                    request.seqno,
+                    request.num_tokens,
+                    request.kind.value if request.kind is not None else None,
+                )
                 if key in self._early_recv_reported:
                     # Completion already reported: consumption ends the
                     # entry's lifecycle.
@@ -1122,6 +1139,19 @@ class NPUWorker(WorkerBase):
                     self._early_recv_reported.discard(key)
                     self._early_recv_consumed.discard(key)
                 return future
+            # No pre-posted recv for this (channel, seqno): submit a fresh
+            # one.  A SECOND [IRECV-NEW] for the same (channel, seqno)
+            # means the earlier entry was consumed+reported and dropped —
+            # i.e. the same batch was dispatched/executed twice (or the
+            # recv lifecycle raced), which is the duplicate-dispatch
+            # signature to watch for.
+            logger.info(
+                "[IRECV-NEW] channel=%s seqno=%s num_tokens=%s kind=%s",
+                request.channel.value,
+                request.seqno,
+                request.num_tokens,
+                request.kind.value if request.kind is not None else None,
+            )
             future = get_comm_service().submit_recv(request)
             self._early_recv_futures[key] = future
             return future

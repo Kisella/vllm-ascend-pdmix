@@ -394,36 +394,38 @@ def _maybe_publish_pre_out(
         BatchType.PREFILL_DRAFT_FIRST,
         BatchType.DECODE_DRAFT_FIRST,
     ):
-        # STRICT CONTROL-PLANE ORDERING: every draft SO enters ONE global
-        # publish queue in dispatch order; publication happens strictly in
-        # that order.  A pre-generated step-0 whose accepted-token scalars
-        # are not yet patched (its parent tail has not completed) blocks
-        # the ready prefix until _release_deferred_draft_pre_out marks it
-        # open — later-dispatched SOs never overtake earlier ones, so the
-        # cloud's arrival order equals the edge's dispatch order (the
-        # precondition for the cloud's single draft FIFO to see exactly
-        # the edge's dispatch sequence).
-        task_id = scheduler_output.draft_task_id
-        assert task_id is not None
-        opened = getattr(self, "_pd_draft_pre_out_open_tasks", None)
-        if opened is None:
-            opened = set()
-            self._pd_draft_pre_out_open_tasks = opened
-        order = getattr(self, "_pd_draft_pre_out_order", None)
-        if order is None:
-            order = []
-            self._pd_draft_pre_out_order = order
-        deferred = getattr(self, "_pd_deferred_draft_pre_out", None)
-        if deferred is None:
-            deferred = {}
-            self._pd_deferred_draft_pre_out = deferred
-        if task_id not in order:
-            order.append(task_id)
-        deferred.setdefault(task_id, []).append(scheduler_output)
-        # Publish whatever ready prefix exists (this SO may already be
-        # ready — dynamic chains / later steps carry their scalars).
-        self._flush_ready_draft_pre_out()
-        return
+        if scheduler_output.draft_chain_dead:
+            # Dead chains never wait for scalar patching (their parent
+            # produces none): publish immediately so the cloud runs the
+            # middle and the channel seqno sequence stays intact.
+            self._publish_to_cloud(scheduler_output)
+            return
+        is_pregenerated = getattr(
+            self.scheduler, "is_pre_generated_draft", lambda _so: False
+        )(scheduler_output)
+        if is_pregenerated:
+            task_id = scheduler_output.draft_task_id
+            assert task_id is not None
+            opened = getattr(
+                self, "_pd_draft_pre_out_open_tasks", None
+            )
+            if opened is None:
+                opened = set()
+                self._pd_draft_pre_out_open_tasks = opened
+            if task_id not in opened:
+                # Edge dispatch is intentionally independent of cloud
+                # readiness. Queue every cloud control in task order so later
+                # placeholder steps cannot overtake step 0 while its
+                # accepted-token scalars are still being finalized.
+                deferred = getattr(
+                    self, "_pd_deferred_draft_pre_out", None
+                )
+                if deferred is None:
+                    deferred = {}
+                    self._pd_deferred_draft_pre_out = deferred
+                deferred.setdefault(task_id, []).append(scheduler_output)
+                return
+        self._publish_to_cloud(scheduler_output)
     elif bt in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
@@ -447,67 +449,29 @@ def _maybe_publish_pre_out(
         )
 
 
-def _flush_ready_draft_pre_out(self) -> None:
-    """Publish the ready prefix of the global draft-SO publish order.
-
-    The publish order is the dispatch order (``_pd_draft_pre_out_order``,
-    FIFO).  The prefix is published while the head task is ready; a
-    pre-generated step-0 still waiting for its accepted-token scalars
-    (task not yet in ``_pd_draft_pre_out_open_tasks``) blocks everything
-    behind it, preserving strict arrival order at the cloud.
-    """
-    channel = getattr(self, "_pp_pd_channel", None)
-    if channel is None:
-        return
-    opened = getattr(self, "_pd_draft_pre_out_open_tasks", None)
-    order = getattr(self, "_pd_draft_pre_out_order", None)
-    deferred = getattr(self, "_pd_deferred_draft_pre_out", None)
-    if opened is None or order is None or deferred is None:
-        return
-    while order:
-        tid = order[0]
-        queued = deferred.get(tid)
-        if not queued:
-            # Already fully published (or cleaned up): advance.
-            order.pop(0)
-            deferred.pop(tid, None)
-            continue
-        head = queued[0]
-        is_pregenerated = getattr(
-            self.scheduler, "is_pre_generated_draft", lambda _so: False
-        )(head)
-        step_idx = int(getattr(head, "draft_step_idx", 0) or 0)
-        if is_pregenerated and step_idx == 0 and tid not in opened:
-            # Step-0 scalars not yet patched: strict order blocks here.
-            return
-        order.pop(0)
-        for so in queued:
-            self._publish_to_cloud(so)
-        deferred.pop(tid, None)
-        logger.info(
-            "[PRE_OUT] released %d async draft controls task_id=%s",
-            len(queued),
-            tid,
-        )
-
-
 def _release_deferred_draft_pre_out(
     self, draft_task_id: str
 ) -> None:
-    """Open one cloud draft control stream and flush the ready prefix.
-
-    Marks the task as scalars-ready (its step-0 accepted-token scalars
-    are patched), then publishes the ready prefix of the global
-    draft-SO publish order — later-dispatched tasks never overtake
-    earlier ones, so the cloud's arrival order equals the edge's
-    dispatch order.
-    """
+    """Open one cloud draft control stream and flush it in FIFO order."""
     opened = getattr(self, "_pd_draft_pre_out_open_tasks", None)
     if opened is None:
         opened = set()
         self._pd_draft_pre_out_open_tasks = opened
     opened.add(draft_task_id)
-    self._flush_ready_draft_pre_out()
+
+    deferred = getattr(self, "_pd_deferred_draft_pre_out", None)
+    queued = [] if deferred is None else deferred.pop(draft_task_id, [])
+    channel = getattr(self, "_pp_pd_channel", None)
+    if channel is None:
+        return
+    for scheduler_output in queued:
+        self._publish_to_cloud(scheduler_output)
+    if queued:
+        logger.info(
+            "[PRE_OUT] released %d async draft controls task_id=%s",
+            len(queued),
+            draft_task_id,
+        )
 
 
 def _close_draft_pre_out(self, draft_task_id: str | None) -> None:
@@ -519,11 +483,6 @@ def _close_draft_pre_out(self, draft_task_id: str | None) -> None:
     deferred = getattr(self, "_pd_deferred_draft_pre_out", None)
     if deferred is not None:
         deferred.pop(draft_task_id, None)
-    order = getattr(self, "_pd_draft_pre_out_order", None)
-    if order is not None and draft_task_id in order:
-        # Defensive: the chain closed before its SOs were published
-        # (abnormal path) — drop it so the strict-order flush can advance.
-        order.remove(draft_task_id)
 
 
 def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
@@ -1328,7 +1287,6 @@ def install() -> None:
     EngineCore._release_deferred_draft_pre_out = (
         _release_deferred_draft_pre_out
     )
-    EngineCore._flush_ready_draft_pre_out = _flush_ready_draft_pre_out
     EngineCore._release_dead_chain_pre_out = _release_dead_chain_pre_out
     EngineCore._close_draft_pre_out = _close_draft_pre_out
     EngineCore._ensure_pd_head_token = _ensure_pd_head_token
