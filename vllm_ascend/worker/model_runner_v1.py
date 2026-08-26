@@ -1281,7 +1281,17 @@ class NPUModelRunner(GPUModelRunner):
         # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
         # cloud never sends the DRAFT_LAST response, deadlocking the edge's
         # matching recv on the shared DECODE channel.
-        self._cloud_spec_decode_metadata_cache_max: int = 32
+        # 256: the long-sequence benchmark (50 reqs, up to 3 prefill chunks
+        # each, plus per-round decode chains) can legitimately hold
+        # 150-200 half-finished chains in the cache when the cloud worker
+        # lags; 32 was routinely exceeded and evicted in-flight prefill
+        # chains (observed 08-26: "evicting unconsumed task_id" -> edge
+        # PREFILL_DRAFT_LAST recv never completes -> p_chains slots stuck ->
+        # 135 ready PDraft heads starved).  Entries are still released as
+        # soon as a chain's final DRAFT step executes (see
+        # _run_edge_cloud_draft_middle_segment pop), so 256 only widens the
+        # lag window, it does not leak.
+        self._cloud_spec_decode_metadata_cache_max: int = 256
         # Same per-task treatment for the verify step's scheduler_output. The
         # independently scheduled draft records request-keyed accepted-token
         # corrections after unrelated work may have replaced the latest
