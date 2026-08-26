@@ -264,12 +264,15 @@ class PDSeparatedScheduler(Scheduler):
         # D首 调度后置 True，D尾 调度后置 False。
         # True 时禁止调度 D首，严格保证 DF -> DL 交替时序。
         self._force_decode_last: bool = False
-        # Per-lane DRAFT_FIRST -> DRAFT_LAST alternation flags.  Set when a
-        # lane's DRAFT_FIRST is picked, cleared when its matching DRAFT_LAST
-        # is picked; while set, no new DRAFT_FIRST of the SAME lane may be
-        # picked.  The two lanes alternate independently.
-        self._force_prefill_draft_last: bool = False
-        self._force_decode_draft_last: bool = False
+        # Per-chain DRAFT_FIRST -> DRAFT_LAST alternation locks: a
+        # DRAFT_FIRST of chain X adds X's task_id here, and only X's
+        # DRAFT_LAST pick removes it.  Independent chains (e.g. the
+        # PDraft chains of two different chunks / batches under 2P or
+        # long sequences) therefore dispatch DRAFT_FIRSTs concurrently,
+        # while every chain individually keeps the strict
+        # F -> L -> F -> L alternation.
+        self._force_prefill_draft_last_task_ids: set[str] = set()
+        self._force_decode_draft_last_task_ids: set[str] = set()
 
         # After scheduling a DECODE_LAST or DRAFT_LAST, briefly reserve the
         # next scheduling opportunity for DECODE_FIRST or DRAFT_FIRST only.
@@ -888,8 +891,8 @@ class PDSeparatedScheduler(Scheduler):
             self.prefill_draft_remote_pending_count,
             self.decode_draft_remote_pending_count,
             self._force_decode_last,
-            self._force_prefill_draft_last,
-            self._force_decode_draft_last,
+            len(self._force_prefill_draft_last_task_ids),
+            len(self._force_decode_draft_last_task_ids),
             len(self.prefills_last_ready),
             len(self.decodes_first_ready),
             len(self.decodes_last_ready),
@@ -1203,30 +1206,58 @@ class PDSeparatedScheduler(Scheduler):
             and not self.decode_drafts_last_ready
             and not self.decodes_first_ready
             and not self._force_decode_last
-            and not self._force_decode_draft_last
+            and not self._force_decode_draft_last_task_ids
         )
 
     def _can_schedule_prefill_draft_first(self) -> bool:
         if not self.prefill_drafts_first_ready:
             return False
-        next_output = self.prefill_drafts_first_ready[0]
-        is_pregenerated = (
-            next_output.draft_task_id in self._pregenerated_draft_task_ids
-        )
+        # Per-chain alternation: scan the whole ready queue, not just
+        # [0].  The head entry may belong to a chain whose own
+        # DRAFT_LAST is still ready / in flight (locked), while a later
+        # entry of an independent chain is free — that independent
+        # chain's DRAFT_FIRST must be dispatchable now (cross-chain
+        # concurrency for 2P / long sequences).
+        for candidate in self.prefill_drafts_first_ready:
+            if self._prefill_draft_first_dispatchable(candidate):
+                return True
+        return False
+
+    @staticmethod
+    def _same_chain_tail_ready(draft_first, last_ready) -> bool:
+        """True when THIS chain's own DRAFT_LAST sits in the ready queue.
+
+        Cross-chain concurrency: tails of other chains never block this
+        chain's DRAFT_FIRST; only the same task_id's tail (self-posted
+        at the previous DRAFT_FIRST pick) enforces the intra-chain
+        F -> L -> F alternation.
+        """
+        task_id = draft_first.draft_task_id
+        if task_id is None:
+            return bool(last_ready)
+        return any(so.draft_task_id == task_id for so in last_ready)
+
+    def _prefill_draft_first_dispatchable(self, so) -> bool:
+        task_id = so.draft_task_id
         # Prefill-phase chains travel on the dedicated PREFILL_DRAFT channel
         # pair, so no gating on DECODE-stream state (decode_head_inflight /
         # _force_decode_last / decode_or_draft_inflight) is needed here.
-        if is_pregenerated:
-            # `not self._force_prefill_draft_last` enforces the lane-local
-            # DRAFT_FIRST -> DRAFT_LAST alternation invariant; the
-            # remote-pending credit bounds intra-chain pipelining: a second
-            # DRAFT_FIRST of this lane may be dispatched while the previous
-            # DRAFT_LAST is still in flight.
+        if task_id in self._pregenerated_draft_task_ids:
+            # The remote-pending credit bounds intra-chain pipelining: a
+            # second DRAFT_FIRST of this chain may be dispatched while the
+            # previous DRAFT_LAST is still in flight.  The per-chain
+            # tail/force checks keep F -> L alternation local to each
+            # chain, so other chains are never blocked by it.
             return bool(
                 self.prefill_draft_remote_pending_count
                 < self._draft_remote_pending_limit
-                and not self.prefill_drafts_last_ready
-                and not self._force_prefill_draft_last
+                and not self._same_chain_tail_ready(
+                    so, self.prefill_drafts_last_ready
+                )
+                and (
+                    task_id is None
+                    or task_id not in self._force_prefill_draft_last_task_ids
+                )
             )
         # Dynamic (non-pre-generated) chains: recvs are not pre-posted for
         # every step, so keep the strict serialization — do not start
@@ -1235,27 +1266,22 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.prefill_draft_remote_pending_count == 0
             and not self.prefill_drafts_last_ready
-            and not self._force_prefill_draft_last
+            and (
+                task_id is None
+                or task_id not in self._force_prefill_draft_last_task_ids
+            )
         )
 
-    def _can_schedule_decode_draft_first(self) -> bool:
-        if not self.decode_drafts_first_ready:
-            return False
-        next_output = self.decode_drafts_first_ready[0]
-        is_pregenerated = (
-            next_output.draft_task_id in self._pregenerated_draft_task_ids
-        )
-        if is_pregenerated:
+    def _decode_draft_first_dispatchable(self, so) -> bool:
+        task_id = so.draft_task_id
+        if task_id in self._pregenerated_draft_task_ids:
             # The edge and cloud workers consume the pre-generated chain in
             # strict FIFO order.  Do not wait for a DRAFT_FIRST result merely
             # to decrement draft_inflight_count; bound the amount of queued
             # work using the remote-pending credit instead.
-            # `not self._force_decode_draft_last` enforces the DRAFT_FIRST ->
-            # DRAFT_LAST alternation invariant the same way the legacy
-            # branch does: once a DRAFT_FIRST is picked, the next draft head
-            # may not be picked until its DRAFT_LAST is picked (which clears
-            # the flag).  Without it, a DRAFT_LAST dropped/drained without
-            # clearing the flag would let a second DRAFT_FIRST through.
+            # The per-chain tail/force checks keep DRAFT_FIRST ->
+            # DRAFT_LAST alternation local to each chain (same rationale
+            # as _prefill_draft_first_dispatchable).
             # `decode_head_inflight_count == 0` (not total inflight == 0)
             # gates only on DECODE_FIRST heads: a DRAFT_FIRST is an
             # edge->cloud send while a DRAFT_LAST is a cloud->edge recv, so
@@ -1269,9 +1295,14 @@ class PDSeparatedScheduler(Scheduler):
                 self.decode_head_inflight_count == 0
                 and self.decode_draft_remote_pending_count
                 < self._draft_remote_pending_limit
-                and not self.decode_drafts_last_ready
+                and not self._same_chain_tail_ready(
+                    so, self.decode_drafts_last_ready
+                )
                 and not self._force_decode_last
-                and not self._force_decode_draft_last
+                and (
+                    task_id is None
+                    or task_id not in self._force_decode_draft_last_task_ids
+                )
             )
 
         # Scheduled draft head/tail payloads share the DECODE channel.
@@ -1283,8 +1314,19 @@ class PDSeparatedScheduler(Scheduler):
             and self.decode_draft_remote_pending_count == 0
             and not self.decode_drafts_last_ready
             and not self._force_decode_last
-            and not self._force_decode_draft_last
+            and (
+                task_id is None
+                or task_id not in self._force_decode_draft_last_task_ids
+            )
         )
+
+    def _can_schedule_decode_draft_first(self) -> bool:
+        if not self.decode_drafts_first_ready:
+            return False
+        for candidate in self.decode_drafts_first_ready:
+            if self._decode_draft_first_dispatchable(candidate):
+                return True
+        return False
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
         self._step_counter += 1
@@ -1724,9 +1766,24 @@ class PDSeparatedScheduler(Scheduler):
         else:
             first_ready = self.decode_drafts_first_ready
             last_ready = self.decode_drafts_last_ready
-        while first_ready:
-            scheduler_output = first_ready.popleft()
-            if self._is_stale_draft_output(scheduler_output):
+        # Per-chain dispatch (mirrors _can_schedule_*_draft_first): pick the
+        # first ready entry that is dispatchable — stale entries are drained
+        # (never skipped), and entries whose own chain's DRAFT_LAST is still
+        # ready / in flight are skipped so an independent chain's
+        # DRAFT_FIRST can go out (cross-chain concurrency).
+        scheduler_output = None
+        for candidate in first_ready:
+            if self._is_stale_draft_output(candidate) or (
+                self._prefill_draft_first_dispatchable(candidate)
+                if prefill_phase
+                else self._decode_draft_first_dispatchable(candidate)
+            ):
+                scheduler_output = candidate
+                first_ready.remove(candidate)
+                break
+        if scheduler_output is None:
+            return self._make_empty_batch()
+        if self._is_stale_draft_output(scheduler_output):
                 # Never drop a stale DRAFT_FIRST: its comm seqno was
                 # reserved and its recvs were pre-posted when the parent
                 # batch was published, so dropping it would leave a hole
@@ -1760,9 +1817,6 @@ class PDSeparatedScheduler(Scheduler):
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
-            break
-        else:
-            return self._make_empty_batch()
 
         task_id = scheduler_output.draft_task_id
         if (
@@ -1839,11 +1893,13 @@ class PDSeparatedScheduler(Scheduler):
             # Prefill-phase drafts use the dedicated PREFILL_DRAFT stream
             # and never touch the decode-lane in-flight counter.
             self.prefill_draft_remote_pending_count += 1
-            self._force_prefill_draft_last = True
+            if task_id is not None:
+                self._force_prefill_draft_last_task_ids.add(task_id)
         else:
             self.decode_or_draft_inflight_count += 1
             self.decode_draft_remote_pending_count += 1
-            self._force_decode_draft_last = True
+            if task_id is not None:
+                self._force_decode_draft_last_task_ids.add(task_id)
 
         logger.info(
             "[MTP-DEBUG] scheduler picked DRAFT_FIRST: task_id=%s, "
@@ -2177,9 +2233,15 @@ class PDSeparatedScheduler(Scheduler):
             # _run_edge_cloud_draft_last_segment); we also must not spawn a
             # verify placeholder for a dead request.
             if prefill_phase:
-                self._force_prefill_draft_last = False
+                if scheduler_output.draft_task_id is not None:
+                    self._force_prefill_draft_last_task_ids.discard(
+                        scheduler_output.draft_task_id
+                    )
             else:
-                self._force_decode_draft_last = False
+                if scheduler_output.draft_task_id is not None:
+                    self._force_decode_draft_last_task_ids.discard(
+                        scheduler_output.draft_task_id
+                    )
             self._start_decode_or_draft_first_only_window()
             output_req_ids = getattr(
                 scheduler_output,
