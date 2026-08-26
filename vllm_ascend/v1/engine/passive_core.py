@@ -597,32 +597,6 @@ class PassiveEngineCoreProc:
                 # )
                 self._maybe_publish_post_out(scheduler_output)
 
-    def _num_scheduled_spec_tokens(self) -> int:
-        """num_spec_tokens when scheduled edge-cloud draft is active.
-
-        Mirrors the edge-side ``_uses_scheduled_edge_cloud_draft`` method
-        gating: only the scheduled-draft methods (eagle3 / mtp-family on
-        qwen) produce a draft chain after every PF/DF batch, hence only
-        they need the n pre-posted draft irecvs.
-        """
-        spec = getattr(self.vllm_config, "speculative_config", None)
-        if spec is None:
-            return 0
-        method = getattr(spec, "method", None)
-        if method == "eagle3" or method in ("qwen3_5_mtp", "qwen_mtp"):
-            pass
-        elif method == "mtp":
-            hf_config = getattr(
-                self.vllm_config.model_config, "hf_config", None
-            )
-            if "qwen" not in str(
-                getattr(hf_config, "model_type", "")
-            ).lower():
-                return 0
-        else:
-            return 0
-        return int(getattr(spec, "num_speculative_tokens", 0) or 0)
-
     def _post_irecv_hints_for_arrivals(self, arrivals) -> None:
         """Pre-post cloud-side irecvs the moment an edge SO arrives.
 
@@ -631,8 +605,19 @@ class PassiveEngineCoreProc:
           1. this batch's head payload (same comm_seqno, UP channel of
              the pair), and
           2. one DRAFT_FIRST head payload per speculative step of the
-             draft chain that follows the batch — the chain's reserved
-             seqno range rides on the SO as ``draft_seqno_base``.
+             draft chain that follows the batch.
+
+        Draft recvs are posted when the DRAFT_FIRST SO actually arrives
+        (see ``_post_irecv_hint_for_draft_first``), NOT when the parent
+        PF/DF arrives: the chain's step-0 may be enqueued (and sent)
+        much later than the parent — e.g. a dynamic chain waiting for the
+        parent tail to complete, or the edge worker momentarily stalled
+        behind another tail's recv.  Pre-posting the whole chain from
+        the parent would hold those recvs across a full WAN round trip
+        and trip the HCCL remote-suspect watchdog (observed 507057
+        SUSPECT REMOTE ERROR / ERR00100: cloud's pre-posted
+        ``prefill_draft_up seqno=N`` never arrives, watchdog fires, HCCL
+        goes down, and even already-sent tails fail to deliver).
 
         Posting at arrival (instead of at dispatch time) maximizes
         the compute/transfer overlap and lets the passive scheduler gate
@@ -641,6 +626,15 @@ class PassiveEngineCoreProc:
         """
         for _seq, so in arrivals:
             bt = so.batch_type
+            if bt in (
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
+            ):
+                # 链的 step 真正到达时才预贴该 step 的 recv —— 把 recv
+                # 挂起窗口从"父批次到达→step 发送"缩到"step 到达→数据
+                # 面交付"（见函数 docstring 的 507057 说明）。
+                self._post_irecv_hint_for_draft_first(so)
+                continue
             if bt not in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
@@ -659,30 +653,39 @@ class PassiveEngineCoreProc:
                 "has_mrope": bool(getattr(so, "has_mrope", True)),
                 "draft_step_idx": None,
             })
-            base = getattr(so, "draft_seqno_base", None)
-            if base is None:
-                continue
-            prefill_phase = bt == BatchType.PREFILL_FIRST
-            num_spec = self._num_scheduled_spec_tokens()
-            # Draft step shapes (mirrors the worker's meta derivation):
-            # step 0 runs over the parent batch's full token count,
-            # later steps over one token per request.
-            num_reqs = len(so.num_scheduled_tokens)
-            for step_idx in range(num_spec):
-                post_irecv_hint({
-                    "batch_type": (
-                        BatchType.PREFILL_DRAFT_FIRST
-                        if prefill_phase
-                        else BatchType.DECODE_DRAFT_FIRST
-                    ),
-                    "draft_prefill_phase": prefill_phase,
-                    "seqno": base + step_idx,
-                    "num_tokens": (
-                        total_tokens if step_idx == 0 else num_reqs
-                    ),
-                    "has_mrope": False,
-                    "draft_step_idx": step_idx,
-                })
+
+    def _post_irecv_hint_for_draft_first(self, so) -> None:
+        """Pre-post the cloud-side recv for one arriving DRAFT_FIRST step.
+
+        The step's comm_seqno is already stamped by the edge scheduler
+        (reserved base + step_idx).  Posting here — at the step's own
+        arrival — keeps the recv wait bounded to the data-plane delivery
+        time even when the step was enqueued/sent long after the parent
+        batch (dynamic chains, edge worker stalls).  num_tokens mirrors
+        ``NPUWorker._scheduled_draft_tensor_meta`` (step 0 over the
+        parent's full token count, later steps over one token per
+        request): the hint's draft_meta builds the recv buffer, so it
+        must match the sender's wire shape exactly.
+        """
+        seqno = getattr(so, "comm_seqno", None)
+        if seqno is None:
+            return
+        step_idx = int(getattr(so, "draft_step_idx", 0) or 0)
+        num_tokens = (
+            so.total_num_scheduled_tokens
+            if step_idx == 0
+            else len(so.num_scheduled_tokens)
+        )
+        post_irecv_hint({
+            "batch_type": so.batch_type,
+            "draft_prefill_phase": bool(
+                getattr(so, "draft_prefill_phase", False)
+            ),
+            "seqno": seqno,
+            "num_tokens": num_tokens,
+            "has_mrope": False,
+            "draft_step_idx": step_idx,
+        })
 
     def _drain_irecv_completions(self) -> None:
         """Drain worker completion reports into the per-channel
