@@ -1081,8 +1081,33 @@ def _patched_step_with_batch_queue(self):
         # happen while waiting for a remote prefill tail.
         return None, model_executed
 
-    # Block until the next result is available.
-    future, scheduler_output, exec_model_fut = batch_queue.pop()
+    # R1 非阻塞收集：优先取"输出已完成"的 batch。Tail（PL/DL/DRL）
+    # 的输出依赖云侧回传，可能仍在等待 —— 跳过它（留在队列），先
+    # 收集已完成的（FIRST 的 isend 后即完成），让边侧持续发送 up
+    # 数据、云侧不断供，打破"单个 tail 输出未完成 → future.result()
+    # 阻塞 → 不再调度 → 发送停摆 → 云侧断供 → 回传不来"的冻结环。
+    # 仅当队列里所有输出都未完成（全部 tail 在等回传）时才阻塞等最老。
+    future = None
+    scheduler_output = None
+    exec_model_fut = None
+    for _i, (_fut, _so, _efut) in enumerate(batch_queue):
+        if _fut.done():
+            future, scheduler_output, exec_model_fut = _fut, _so, _efut
+            if _i > 0:
+                # 跳过了队首的 pending tail（等云侧回传）。
+                _skipped = batch_queue[0]
+                vllm_logger.info(
+                    "[BATCH_QUEUE] skipped pending tail %s seqno=%s -> "
+                    "collect %s seqno=%s",
+                    _skipped[1].batch_type.value,
+                    getattr(_skipped[1], "comm_seqno", None),
+                    scheduler_output.batch_type.value,
+                    getattr(scheduler_output, "comm_seqno", None),
+                )
+            del batch_queue[_i]
+            break
+    if future is None:
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
