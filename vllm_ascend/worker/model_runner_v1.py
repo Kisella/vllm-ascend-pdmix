@@ -3790,11 +3790,16 @@ class NPUModelRunner(GPUModelRunner):
                 verified_rows[req_id] = draft_row
             else:
                 # Compatibility fallback for a row handled entirely by the
-                # upstream native scatter.
-                end = int(cu_num_tokens[req_idx])
-                verified_rows[req_id] = self.input_ids.gpu[
-                    end - draft_len : end
-                ].clone()
+                # upstream native scatter.  With scheduled edge-cloud drafts
+                # this branch only triggers when the chain has NOT executed
+                # yet (pre-generated placeholder verify): input_ids.gpu's
+                # spec region still holds -1 placeholders, so patching it is
+                # a no-op AND the GPU slice would force a D2H sync inside
+                # _patch_deferred_draft_token_ids (torch.stack(...).cpu()),
+                # freezing the worker behind a busy NPU stream (observed
+                # 507057 SUSPECT REMOTE ERROR).  Skip instead — the chain's
+                # DRAFT_LAST writes the real rows when it runs.
+                continue
 
         if verified_rows:
             self._verified_draft_token_ids_by_head[
@@ -3845,11 +3850,22 @@ class NPUModelRunner(GPUModelRunner):
                         req_id,
                     )
             if draft_row is None:
-                raise RuntimeError(
-                    "Deferred draft context has no verified draft tokens: "
-                    f"task_id={scheduler_output.head_token}, "
-                    f"req_id={req_id}"
+                # 预生成链的占位符 verify 尾（DECODE_LAST）先于其链首
+                # 派发（D首→D尾→链首 的 _force_decode_last 交替设计），
+                # stash 时链尚未执行，verified rows 与
+                # _worker_draft_token_ids_by_req 都没有本链的 draft rows。
+                # 此时无法把占位符 spec tokens 替换为真实 draft ids ——
+                # 跳过该 req（scheduled_token_ids 保留占位符），链的
+                # DRAFT_LAST 执行时会写入真实 rows 供后续 verify 消费。
+                # 绝不能 raise：那会让 worker 冻结、边侧停发，云侧挂起
+                # recv 超时（507057 SUSPECT REMOTE ERROR）。
+                logger.warning(
+                    "Deferred draft rows not ready (chain not executed); "
+                    "keeping spec placeholders: task_id=%s, req_id=%s",
+                    scheduler_output.head_token,
+                    req_id,
                 )
+                continue
             draft_rows.append(draft_row)
             draft_req_ids.append(req_id)
 
@@ -3873,9 +3889,13 @@ class NPUModelRunner(GPUModelRunner):
                         f"req_id={req_id}, draft_len={draft_len}, "
                         f"scheduled={scheduled}"
                     )
-                draft_row = draft_token_ids_cpu[
-                    draft_row_by_req[req_id]
-                ]
+                row_idx = draft_row_by_req.get(req_id)
+                if row_idx is None:
+                    # Request skipped above (chain not executed yet): its
+                    # spec placeholder region stays as-is.
+                    start = end
+                    continue
+                draft_row = draft_token_ids_cpu[row_idx]
                 if draft_row.shape[0] < draft_len:
                     raise RuntimeError(
                         "Verified draft row is shorter than the scheduled "
@@ -3958,20 +3978,25 @@ class NPUModelRunner(GPUModelRunner):
                 max(n - max(len(s), 1), 0)
                 for n, s in zip(num_scheduled, sampled_token_ids)
             ]
-        pos_flat = positions[0] if positions.dim() == 2 else positions
-        start_offsets = torch.zeros(num_reqs, dtype=torch.long)
         running = 0
-        for req_idx, n in enumerate(num_scheduled):
-            start_offsets[req_idx] = running
+        for n in num_scheduled:
             running += n
         total_tokens = running
-        start_pos = pos_flat[start_offsets.to(pos_flat.device)].cpu()
+        # p0 语义 = 该 req 本次调度的起始 position。positions 由
+        # _prepare_inputs 从 num_computed_tokens_cpu + 批内偏移生成，故
+        # 起始 position 就是 num_computed_tokens_cpu[req_idx]（与
+        # _prepare_inputs 的 start_pos 取法一致）。直接用 CPU 值，避免
+        # 原实现 pos_flat[start_offsets.to(pos_flat.device)].cpu() 的
+        # GPU gather + D2H 同步——若紧邻的大张量 isend（如 8192-token
+        # prefill draft）仍在 WAN 上传输，worker 会冻结数秒，拖死整条
+        # 链路（507057）。stash 在 _update_states_after_model_execute
+        # 之前执行，CPU 值仍是本次调度前的起始位置。
         scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
         sample_row_indices = torch.empty(num_reqs, dtype=torch.long)
         start = 0
         for req_idx, n in enumerate(num_scheduled):
             end = start + n
-            p0 = int(start_pos[req_idx])
+            p0 = int(self.input_batch.num_computed_tokens_cpu[req_idx])
             scheduled_token_ids[start:end] = torch.from_numpy(
                 self.input_batch.token_ids_cpu[req_idx, p0 : p0 + n]
             ).to(torch.long)
