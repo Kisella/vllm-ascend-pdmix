@@ -7,7 +7,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 
 import numpy as np
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 from uuid import uuid4
 
@@ -498,6 +498,11 @@ class PDSeparatedScheduler(Scheduler):
         ):
             self._pd_so_seqno += 1
             scheduler_output.edge_so_seqno = self._pd_so_seqno
+            # The self-posted tail copies were replace()d from this head
+            # *before* the stamp existed, so propagate it now (matched by
+            # head_token, the FIRST/LAST pairing key).  The fallback tail
+            # dispatch orders D尾/DDraft尾/PDraft尾 by this value.
+            self._stamp_self_posted_tail_seqnos(scheduler_output)
         return scheduler_output
 
     # ------------------------------------------------------------------ #
@@ -1059,6 +1064,69 @@ class PDSeparatedScheduler(Scheduler):
             return self._pick_decode_first_batch()
         return self._make_empty_batch()
 
+    def _stamp_self_posted_tail_seqnos(self, head: SchedulerOutput) -> None:
+        """Propagate the head's just-stamped ``edge_so_seqno`` to its
+        self-posted tail copies (matched by ``head_token``, the FIRST/LAST
+        pairing key).
+
+        The tails were ``dataclasses.replace()``d from the head *before*
+        ``schedule()`` stamped the seqno, so even as a dataclass field they
+        carry ``None`` at creation.  The fallback tail dispatch orders
+        D尾/DDraft尾/PDraft尾 by this value, so every queued tail must
+        receive it as soon as its head is dispatched.
+        """
+        seqno = head.edge_so_seqno
+        if seqno is None or not head.head_token:
+            return
+        for tail_queue in (
+            self.decodes_last_ready,
+            self.prefill_drafts_last_ready,
+            self.decode_drafts_last_ready,
+        ):
+            for tail in tail_queue:
+                if tail.head_token == head.head_token:
+                    tail.edge_so_seqno = seqno
+
+    def _pick_earliest_tail_by_seqno(self) -> SchedulerOutput | None:
+        """Fallback tail dispatch: D尾/DDraft尾/PDraft尾 share one priority
+        and are dispatched in edge dispatch order (smallest
+        ``edge_so_seqno`` first), so the worker consumes tails in the same
+        order the data plane delivers them.
+
+        Returns the picked tail, or ``None`` when no tail carries a seqno
+        (the caller then falls back to the original fixed priority table).
+        D尾 keeps its delay-window and placeholder-head guards.
+        """
+        candidates: list[tuple[int, Callable[[], SchedulerOutput]]] = []
+        if (
+            self.decodes_last_ready
+            and not self.decodes_first_ready
+            and not self._decode_last_delay_active()
+        ):
+            seqno = self.decodes_last_ready[0].edge_so_seqno
+            if isinstance(seqno, int):
+                candidates.append(
+                    (seqno, self._pick_decode_last_batch)
+                )
+        if self.decode_drafts_last_ready:
+            seqno = self.decode_drafts_last_ready[0].edge_so_seqno
+            if isinstance(seqno, int):
+                candidates.append(
+                    (seqno,
+                     lambda: self._pick_draft_last_batch(prefill_phase=False))
+                )
+        if self.prefill_drafts_last_ready:
+            seqno = self.prefill_drafts_last_ready[0].edge_so_seqno
+            if isinstance(seqno, int):
+                candidates.append(
+                    (seqno,
+                     lambda: self._pick_draft_last_batch(prefill_phase=True))
+                )
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0])
+        return candidates[0][1]()
+
     def _pick_by_state(
         self, state: PrefillState, ready_only: bool = True
     ) -> SchedulerOutput:
@@ -1158,6 +1226,14 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            # Fallback pass: D尾/DDraft尾/PDraft尾 share one priority and
+            # are dispatched in edge dispatch order (edge_so_seqno), so the
+            # worker consumes tails in data-plane order.  Ready pass keeps
+            # the fixed DDraft尾 > Decode尾 > PDraft尾 table below.
+            if not ready_only:
+                tail = self._pick_earliest_tail_by_seqno()
+                if tail is not None:
+                    return tail
             if has_ddrl:
                 return self._pick_draft_last_batch(prefill_phase=False)
             if self._can_schedule_prefill_draft_first():
@@ -1190,6 +1266,14 @@ class PDSeparatedScheduler(Scheduler):
             # prefill chain can form before the PF (PL ranks below it),
             # and the decode lane's next round starts at DL/DF, which
             # also rank below it.
+            # Fallback pass: D尾/DDraft尾/PDraft尾 share one priority and
+            # are dispatched in edge dispatch order (edge_so_seqno), so the
+            # worker consumes tails in data-plane order.  Ready pass keeps
+            # the fixed DDraft尾 > Decode尾 > PDraft尾 table below.
+            if not ready_only:
+                tail = self._pick_earliest_tail_by_seqno()
+                if tail is not None:
+                    return tail
             if has_ddrl:
                 return self._pick_draft_last_batch(prefill_phase=False)
             if self._can_schedule_prefill_draft_first():
@@ -1231,6 +1315,14 @@ class PDSeparatedScheduler(Scheduler):
         # > Empty — no P首 slot left.
         if self._has_actionable_prefill_tail():
             return self._pick_prefill_last_batch(ready_only=ready_only)
+        # Fallback pass: D尾/DDraft尾/PDraft尾 share one priority and
+        # are dispatched in edge dispatch order (edge_so_seqno), so the
+        # worker consumes tails in data-plane order.  Ready pass keeps
+        # the fixed DDraft尾 > Decode尾 > PDraft尾 table below.
+        if not ready_only:
+            tail = self._pick_earliest_tail_by_seqno()
+            if tail is not None:
+                return tail
         if has_ddrl:
             return self._pick_draft_last_batch(prefill_phase=False)
         if self._can_schedule_prefill_draft_first():
