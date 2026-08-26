@@ -1002,13 +1002,15 @@ class PDSeparatedScheduler(Scheduler):
         # tail is treated as absent (schedule among data-ready tasks);
         # the fallback pass (ready_only=False, taken only when nothing
         # was ready) dispatches the highest-priority pending tail by the
-        # original order — its payload wait is covered device-side by
-        # wait_event on the pre-posted recv, never a host block.
-        has_pdrl = (
-            self._has_actionable_prefill_draft_tail()
-            if ready_only
-            else bool(self.prefill_drafts_last_ready)
-        )
+        # original order.  PDraft尾 除外：fallback 也禁止下发未就绪的
+        # PDraft尾 —— 其数据（prefill_draft_down）由云侧执行对应的
+        # DRAFT_FIRST 后回传，未就绪时下发会让边侧 worker 在
+        # DRAFT_LAST 尾段的同步等待（.tolist()/recv）上冻结，导致边侧
+        # 停发、云侧挂起 recv 超时（507057 SUSPECT REMOTE ERROR）。
+        # 未就绪的 PDraft尾 留在队列，等 watermark 推进（云侧回传）
+        # 后由 ready pass 派发；云侧执行 DRAFT_FIRST 不依赖边侧，故
+        # 数据最终必达，不会死锁。
+        has_pdrl = self._has_actionable_prefill_draft_tail()
         has_ddrl = (
             self._has_actionable_decode_draft_tail()
             if ready_only

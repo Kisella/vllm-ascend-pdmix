@@ -870,8 +870,15 @@ class PassiveScheduler:
         has_decode_draft = bool(self.ready_decode_drafts) and (
             not ready_only or self._decode_draft_head_data_ready()
         )
-        has_prefill_draft = bool(self.ready_prefill_drafts) and (
-            not ready_only or self._prefill_draft_head_data_ready()
+        # PDraft 例外：fallback 也禁止下发未就绪的 PDraft —— 其数据
+        # （prefill_draft_up）在 WAN 上传输，未就绪时下发会让云侧
+        # worker 在 DRAFT_FIRST 执行时同步等待 recv（并在
+        # _reconstruct_cloud_draft_positions 等路径冻结），导致云侧
+        # 停发、边侧挂起 recv 超时（507057 SUSPECT REMOTE ERROR）。
+        # 数据由边侧派发 DRAFT_FIRST 时发送，最终必达，故不会死锁。
+        has_prefill_draft = (
+            bool(self.ready_prefill_drafts)
+            and self._prefill_draft_head_data_ready()
         )
         # (arrival_seq, pick) candidates; the lowest seq wins.  The lambda
         # order breaks the (impossible-in-practice) seq tie deterministically.
@@ -924,8 +931,11 @@ class PassiveScheduler:
         has_decode_draft = bool(self.ready_decode_drafts) and (
             not ready_only or self._decode_draft_head_data_ready()
         )
-        has_prefill_draft = bool(self.ready_prefill_drafts) and (
-            not ready_only or self._prefill_draft_head_data_ready()
+        # PDraft 例外：fallback 也禁止下发未就绪的 PDraft（见
+        # _pick_decode_or_draft_by_arrival 的说明）。
+        has_prefill_draft = (
+            bool(self.ready_prefill_drafts)
+            and self._prefill_draft_head_data_ready()
         )
         has_draft = has_decode_draft or has_prefill_draft
         prefill_seq = (
@@ -1007,12 +1017,14 @@ class PassiveScheduler:
         has_decode = bool(self.ready_decodes) and (
             not ready_only or self._decode_head_data_ready()
         )
+        # PDraft 例外：fallback 也禁止下发未就绪的 PDraft（见
+        # _pick_decode_or_draft_by_arrival 的说明）。
         has_draft = (
             bool(self.ready_decode_drafts)
             and (not ready_only or self._decode_draft_head_data_ready())
         ) or (
             bool(self.ready_prefill_drafts)
-            and (not ready_only or self._prefill_draft_head_data_ready())
+            and self._prefill_draft_head_data_ready()
         )
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
@@ -1143,8 +1155,11 @@ class PassiveScheduler:
                 return self._pick_decode_batch()
             return ScheduledBatch.empty()
         if queue_name == "ready_prefill_drafts":
-            if self.ready_prefill_drafts and (
-                not ready_only or self._prefill_draft_head_data_ready()
+            # PDraft 例外：fallback 也禁止下发未就绪的 PDraft（见
+            # _pick_decode_or_draft_by_arrival 的说明）。
+            if (
+                self.ready_prefill_drafts
+                and self._prefill_draft_head_data_ready()
             ):
                 return self._pick_prefill_draft_batch()
             return ScheduledBatch.empty()
